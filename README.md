@@ -15,7 +15,7 @@ Repository: https://github.com/Memberoffoxhound/Deckscord
 - Checks for and installs **Vesktop** (the reliable native Discord client for Linux/Game Mode) if it is missing
 - Creates a systemd user service that keeps Discord alive and minimized in Game Mode across reboots
 - Installs a **Decky Loader** plugin that surfaces everything in the Quick Access Menu (QAM)
-- Gives you:
+- Gives you the foundation for:
   - Full server / DM / channel list
   - Join and leave voice channels
   - Master + per-user input/output volume and local mute
@@ -80,29 +80,31 @@ After install, reboot into Game Mode (or just return to Game Mode). Open the QAM
 bash <(curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/uninstall.sh)
 ```
 
-Or from the local copy:
+Or from the local copy after install:
 
 ```bash
 ~/.local/share/deckscord/uninstall.sh
 ```
 
-## Status
+## Current status (v0.1)
 
-- [x] One-stop Bazzite / SteamOS installer
+- [x] One-stop Bazzite / SteamOS installer (informative, SteamOS-language)
 - [x] Vesktop auto-install + Game Mode systemd service + linger
 - [x] Decky plugin skeleton with Voice / Text / Settings tabs
-- [x] Per-user volume + local mute hooks
-- [x] Speaking overlay toggle
-- [x] Toast + join/leave voice notifications
-- [ ] Full CDP-driven rich client (in progress — architecture matches proven Vesktop + CDP approach)
+- [x] Backend hooks for join/leave, per-user volume, local mute, settings, toasts
+- [x] Speaking overlay + join/leave notification flags
+- [ ] Live channel / member list driven by Chrome DevTools Protocol against Vesktop (next major milestone)
+- [ ] Full rich text composer + media
 - [ ] Native Go Live screen share + PiP (nice-to-have)
 
-## Architecture notes
+The architecture is the proven Vesktop + CDP + Decky pattern used by the strongest existing Game Mode Discord plugins. The installer and service layer already give you a persistent, Game-Mode-friendly Discord. The QAM surface and backend API are ready for the live data layer.
 
-Deckscord drives **Vesktop** (a real Electron Discord client with Vencord) over the Chrome DevTools Protocol. The Decky frontend talks to a small Python backend that owns the Vesktop process and injects the control surface. This is the same high-level approach used by the best existing Game Mode Discord plugins, but under your name and with a single-command installer that matches the GameModeLEDs / Dialdeck style.
+## Architecture
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
 MIT
 
-Built for the Bazzite / Universal Blue / SteamOS community.
+Built for the Bazzite / Universal Blue / SteamOS community. Same spirit as GameModeLEDs and Dialdeck.
