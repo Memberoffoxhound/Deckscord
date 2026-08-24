@@ -1,0 +1,10 @@
+{
+  "name": "Deckscord",
+  "author": "Memberoffoxhound",
+  "flags": ["debug"],
+  "publish": {
+    "tags": ["discord", "voice", "overlay", "bazzite", "steamOS"],
+    "description": "Full Discord companion for Game Mode — voice, text, per-user volume, speaking overlay, toasts. One-stop with Vesktop.",
+    "image": "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/assets/icon.png"
+  }
+}
