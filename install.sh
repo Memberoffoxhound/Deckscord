@@ -4,6 +4,9 @@ set -euo pipefail
 # Deckscord installer
 # One-stop Discord companion for SteamOS / Bazzite Game Mode
 # https://github.com/Memberoffoxhound/Deckscord
+#
+# Safe to run as:  curl -fsSL .../install.sh | bash
+# Prompts always go to the real terminal via /dev/tty so the pipe is not consumed.
 
 REPO_RAW="https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main"
 PLUGIN_DIR="${HOME}/homebrew/plugins/Deckscord"
@@ -15,6 +18,20 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# Prompt helper that always talks to the real terminal (works with curl | bash)
+prompt() {
+  local msg="$1"
+  local reply=""
+  if [[ -r /dev/tty ]]; then
+    # Force prompt to the controlling terminal so stdin (the pipe) is not eaten
+    read -r -p "$msg" reply < /dev/tty || true
+  else
+    # No tty (rare) — default to yes
+    reply="y"
+  fi
+  printf '%s' "$reply"
+}
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -36,7 +53,8 @@ echo
 echo "After this you will be able to do everything the PS5 and Xbox"
 echo "Discord apps can do, but from the Steam Quick Access Menu."
 echo
-read -r -p "Continue? [Y/n] " reply
+
+reply=$(prompt "Continue? [Y/n] ")
 if [[ "${reply,,}" =~ ^n ]]; then
   echo "Aborted."
   exit 0
@@ -49,6 +67,7 @@ mkdir -p "${HOME}/.config/systemd/user"
 echo
 echo -e "${BLUE}[1/7] Detecting environment...${NC}"
 if [[ -f /etc/os-release ]]; then
+  # shellcheck source=/dev/null
   . /etc/os-release
   echo "  Distro: ${NAME:-unknown} ${VERSION_ID:-}"
 fi
@@ -144,7 +163,7 @@ if [[ -d "${HOME}/homebrew" ]] || command -v decky >/dev/null 2>&1; then
   echo "  Decky appears to be present."
 else
   echo "  Decky Loader not detected."
-  read -r -p "  Install Decky Loader now? (recommended) [Y/n] " dreply
+  dreply=$(prompt "  Install Decky Loader now? (recommended) [Y/n] ")
   if [[ ! "${dreply,,}" =~ ^n ]]; then
     echo "  Fetching official Decky installer..."
     curl -L https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh | sh
