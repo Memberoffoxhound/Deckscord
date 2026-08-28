@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Piped installs ignore the shebang. SteamOS /bin/sh is often bash in POSIX
+# mode, which rejects arrays and ${var,,} — that shows up as
+# "syntax error near unexpected token" around the Flatpak override block.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "Deckscord installer needs bash (not sh/dash)." >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/install.sh | bash" >&2
+  exit 1
+fi
+set +o posix 2>/dev/null || true
 set -euo pipefail
 
 # Deckscord installer — Discord in Steam Game Mode (QAM), Xbox/PS5 style.
@@ -49,7 +58,8 @@ need_sudo() {
 }
 
 have_vesktop() {
-  flatpak list --app 2>/dev/null | grep -qi "${FLATPAK_ID}\\|vesktop" && return 0
+  flatpak list --app 2>/dev/null | grep -Fqi "${FLATPAK_ID}" && return 0
+  flatpak list --app 2>/dev/null | grep -Fqi vesktop && return 0
   command -v vesktop >/dev/null 2>&1 && return 0
   return 1
 }
@@ -127,25 +137,29 @@ echo -e "  ${GREEN}Vesktop OK${NC}"
 
 # Permissions Vesktop needs in Game Mode: mic, speakers, X11 (gamescope Wayland
 # SIGSEGVs Electron), home (session).
-if flatpak list --app 2>/dev/null | grep -qi "${FLATPAK_ID}"; then
-  echo "  Applying Flatpak overrides (X11, PipeWire, devices)…"
-  override=(
-    --socket=x11
-    --socket=fallback-x11
-    --socket=wayland
-    --socket=pulseaudio
-    --socket=session-bus
-    --device=all
-    --share=network
-    --share=ipc
-    --filesystem=home
-    --filesystem=xdg-run/pipewire-0:ro
-  )
-  if flatpak list --app --user 2>/dev/null | grep -qi "${FLATPAK_ID}"; then
-    flatpak override --user "${override[@]}" "${FLATPAK_ID}" || true
+# No bash arrays here — SteamOS often runs this via `sh` (POSIX bash).
+if flatpak list --app 2>/dev/null | grep -Fqi "${FLATPAK_ID}"; then
+  echo "  Applying Flatpak overrides (X11, PipeWire, devices)..."
+  apply_overrides() {
+    # shellcheck disable=SC2068
+    "$@" \
+      --socket=x11 \
+      --socket=fallback-x11 \
+      --socket=wayland \
+      --socket=pulseaudio \
+      --socket=session-bus \
+      --device=all \
+      --share=network \
+      --share=ipc \
+      --filesystem=home \
+      --filesystem=xdg-run/pipewire-0:ro \
+      "${FLATPAK_ID}" || true
+  }
+  if flatpak list --app --user 2>/dev/null | grep -Fqi "${FLATPAK_ID}"; then
+    apply_overrides flatpak override --user
   else
     need_sudo "Flatpak override"
-    sudo flatpak override "${override[@]}" "${FLATPAK_ID}" || true
+    apply_overrides sudo flatpak override
   fi
 fi
 
