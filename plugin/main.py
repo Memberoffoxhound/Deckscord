@@ -249,7 +249,7 @@ class Plugin:
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
-        await self._ensure_vesktop()
+        await self._ensure_vesktop(wait=True)
         try:
             await self._ensure_cdp()
         except Exception as e:
@@ -258,16 +258,22 @@ class Plugin:
     async def _unload(self) -> None:
         await self.cdp.close()
 
-    async def _ensure_vesktop(self) -> dict[str, Any]:
+    async def _ensure_vesktop(self, wait: bool = False) -> dict[str, Any]:
         try:
             r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
-            if r.stdout.strip() != "active":
+            state = (r.stdout or "").strip() or "inactive"
+            if state not in ("active", "activating"):
                 _run(["systemctl", "--user", "start", SERVICE], timeout=10)
+                r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+                state = (r.stdout or "").strip() or "inactive"
+            if wait and state != "active":
                 await asyncio.sleep(2)
-            return {"running": _run(["systemctl", "--user", "is-active", SERVICE], timeout=5).stdout.strip() == "active"}
+                r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+                state = (r.stdout or "").strip() or "inactive"
+            return {"running": state == "active", "state": state}
         except Exception as e:
             decky.logger.error(f"vesktop service: {e}")
-            return {"running": False, "error": str(e)}
+            return {"running": False, "state": "failed", "error": str(e)}
 
     async def _ensure_cdp(self) -> None:
         if self.cdp.connected:
@@ -325,7 +331,7 @@ class Plugin:
         return val
 
     async def _bridge(self, call: str) -> Any:
-        await self._ensure_vesktop()
+        await self._ensure_vesktop(wait=False)
         await self._ensure_cdp()
         await self._inject_bridge()
         return await self._eval(f"window.__deckscord.{call}")
@@ -333,26 +339,67 @@ class Plugin:
     # ---- Decky-callable -------------------------------------------------
 
     async def get_status(self) -> dict[str, Any]:
-        svc = await self._ensure_vesktop()
+        svc = await self._ensure_vesktop(wait=False)
+        running = bool(svc.get("running"))
+        state = svc.get("state") or "inactive"
         out: dict[str, Any] = {
-            "vesktop_running": bool(svc.get("running")),
+            "vesktop_running": running,
+            "vesktop_state": state,
             "cdp": False,
             "logged_in": False,
             "ready": False,
+            "phase": "starting",
+            "phase_label": "Starting Discord…",
         }
+        if state == "activating" or (not running and state != "failed"):
+            out["phase"] = "loading"
+            out["phase_label"] = "Discord is loading…"
+            return out
+        if not running:
+            out["phase"] = "starting"
+            out["phase_label"] = "Starting Discord…"
+            if svc.get("error"):
+                out["error"] = svc["error"]
+            return out
+
         try:
             targets = _cdp_targets()
-            out["cdp"] = True
-            blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
-            if "first-launch" in blob or "vesktop://static" in blob:
-                out["error"] = "Finish Vesktop setup and log into Discord. Desktop Mode is easiest; the session is saved after that."
-                return out
+        except Exception:
+            out["phase"] = "loading"
+            out["phase_label"] = "Discord is loading…"
+            return out
+
+        out["cdp"] = True
+        blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
+        if "first-launch" in blob or "vesktop://static" in blob:
+            out["phase"] = "login"
+            out["phase_label"] = "Log into Discord"
+            out["error"] = "Finish Vesktop setup and log into Discord. Desktop Mode is easiest; the session is saved after that."
+            return out
+
+        try:
             snap = await self._bridge("snapshot()")
-            if isinstance(snap, dict):
-                out.update(snap)
-                out["cdp"] = True
         except Exception as e:
+            out["phase"] = "loading"
+            out["phase_label"] = "Discord is loading…"
             out["error"] = str(e)
+            return out
+
+        if isinstance(snap, dict):
+            out.update(snap)
+            out["cdp"] = True
+        if out.get("logged_in") and out.get("ok") is not False:
+            out["ready"] = True
+            out["phase"] = "ready"
+            name = ""
+            user = out.get("user") or {}
+            if isinstance(user, dict):
+                name = user.get("name") or user.get("username") or ""
+            out["phase_label"] = f"Ready{(' · ' + name) if name else ''}"
+        else:
+            out["ready"] = False
+            out["phase"] = "login"
+            out["phase_label"] = "Log into Discord"
         return out
 
     async def join_voice(self, channel_id: str, channel_name: str = "") -> dict[str, Any]:
@@ -384,4 +431,4 @@ class Plugin:
         return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
     async def start_vesktop(self) -> dict[str, Any]:
-        return await self._ensure_vesktop()
+        return await self._ensure_vesktop(wait=True)

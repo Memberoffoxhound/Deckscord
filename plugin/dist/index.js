@@ -35,6 +35,54 @@ const startVesktop = callable("start_vesktop");
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback } = window.SP_REACT;
 
+function phaseOf(status) {
+  if (!status) return "loading";
+  return status.phase || (status.ready ? "ready" : status.logged_in ? "loading" : "loading");
+}
+
+function Light({ phase, label }) {
+  const color =
+    phase === "ready" ? "#3ddc84" : phase === "login" ? "#ffb020" : "#8b919a";
+  const title = phase === "ready" ? "Ready" : label || "Discord is loading…";
+  return e(
+    "div",
+    {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "6px 0 10px",
+      },
+    },
+    [
+      e("span", {
+        key: "dot",
+        style: {
+          width: 14,
+          height: 14,
+          borderRadius: 14,
+          flexShrink: 0,
+          background: color,
+          boxShadow: phase === "ready" ? "0 0 10px rgba(61,220,132,0.85)" : "none",
+        },
+      }),
+      e(
+        "span",
+        {
+          key: "lbl",
+          style: {
+            fontSize: 18,
+            fontWeight: 650,
+            letterSpacing: 0.2,
+            color: phase === "ready" ? "#3ddc84" : "#fff",
+          },
+        },
+        title
+      ),
+    ]
+  );
+}
+
 function App() {
   const [tab, setTab] = useState("voice");
   const [status, setStatus] = useState(null);
@@ -45,26 +93,33 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [dmMode, setDmMode] = useState(false);
+  const [tick, setTick] = useState(0);
 
   const refresh = useCallback(async () => {
     try {
       const s = await getStatus();
-      setStatus(s);
-      if (s && s.error) setError(s.error);
+      setStatus(s || { phase: "loading", phase_label: "Discord is loading…" });
+      if (s && s.ready) setError("");
+      else if (s && s.phase === "login" && s.error) setError(s.error);
       else setError("");
     } catch (err) {
+      setStatus({ phase: "loading", phase_label: "Discord is loading…", vesktop_running: false });
       setError(String(err && err.message ? err.message : err));
     }
   }, []);
 
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, 2500);
-    return () => clearInterval(id);
-  }, [refresh]);
+  }, [refresh, tick]);
 
   useEffect(() => {
-    if (tab !== "text" || !textId) return;
+    const ready = !!(status && status.ready);
+    const id = setInterval(() => setTick((n) => n + 1), ready ? 2500 : 1000);
+    return () => clearInterval(id);
+  }, [status && status.ready]);
+
+  useEffect(() => {
+    if (!(status && status.ready) || tab !== "text" || !textId) return;
     let stop = false;
     const pull = async () => {
       try {
@@ -81,6 +136,8 @@ function App() {
   }, [tab, textId]);
 
   const act = async (label, fn) => {
+    const okNow = !!(status && status.ready);
+    if (!okNow && label !== "Starting Discord") return;
     setBusy(label);
     setError("");
     try {
@@ -93,6 +150,8 @@ function App() {
     setBusy("");
   };
 
+  const phase = phaseOf(status);
+  const ready = phase === "ready";
   const loggedIn = !!(status && status.logged_in);
   const userName = (status && status.user && (status.user.name || status.user.username)) || "";
   const voice = (status && status.voice) || null;
@@ -100,6 +159,10 @@ function App() {
   const dms = (status && status.dms) || [];
   const guild = guilds.find((g) => g.id === guildId) || guilds[0];
   const currentGuildId = guild ? guild.id : null;
+  const waitHint =
+    phase === "login"
+      ? "Open Vesktop in Desktop Mode, log in once, then come back. The light turns green when Deckscord can chat and join calls."
+      : "Wait for the green Ready light. Discord is still starting — joining or sending now will do nothing.";
 
   const tabBar = e("div", { style: { display: "flex", gap: "8px", marginBottom: "8px" } }, [
     e(
@@ -114,26 +177,40 @@ function App() {
     ),
   ]);
 
-  const statusLine = e("div", {
-    style: { opacity: 0.85, fontSize: "13px", marginBottom: "8px", lineHeight: 1.35 },
-  }, [
-    !status && "Connecting…",
-    status && !status.vesktop_running && "Vesktop is not running.",
-    status && status.vesktop_running && !loggedIn && "Open Vesktop and log into Discord once. Session is saved after that.",
-    loggedIn && `${userName}${status.muted ? "  ·  muted" : ""}${status.deafened ? "  ·  deafened" : ""}${voice ? "  ·  " + voice.name : "  ·  not in voice"}`,
-    error && e("div", { key: "err", style: { color: "#ff8b8b", marginTop: 4 } }, error),
-    busy && e("div", { key: "busy", style: { opacity: 0.7 } }, busy + "…"),
+  const statusLine = e("div", { style: { width: "100%" } }, [
+    e(Light, {
+      key: "light",
+      phase,
+      label: (status && status.phase_label) || (ready ? "Ready" : "Discord is loading…"),
+    }),
+    ready &&
+      e(
+        "div",
+        { key: "meta", style: { opacity: 0.8, fontSize: 13, marginTop: -4, marginBottom: 8 } },
+        `${userName}${status.muted ? "  ·  muted" : ""}${status.deafened ? "  ·  deafened" : ""}${voice ? "  ·  " + voice.name : "  ·  not in voice"}`
+      ),
+    !ready &&
+      e("div", { key: "wait", style: { opacity: 0.8, fontSize: 13, lineHeight: 1.4, marginBottom: 8 } }, waitHint),
+    error && phase === "login" && e("div", { key: "err", style: { color: "#ffb020", fontSize: 13, marginBottom: 8 } }, error),
+    busy && e("div", { key: "busy", style: { opacity: 0.7, fontSize: 13 } }, busy + "…"),
   ]);
 
-  const startRow = (!status || !status.vesktop_running || !loggedIn)
-    ? e(DFL.PanelSectionRow, null,
-        e(DFL.ButtonItem, { layout: "below", onClick: () => act("Starting Discord", () => startVesktop()) }, "Start Discord")
-      )
-    : null;
+  const startRow =
+    phase === "starting" || (status && status.vesktop_state === "failed")
+      ? e(DFL.PanelSectionRow, null,
+          e(DFL.ButtonItem, { layout: "below", onClick: () => act("Starting Discord", () => startVesktop()) }, "Start Discord")
+        )
+      : null;
 
   let body = null;
 
-  if (tab === "voice") {
+  if (!ready) {
+    body = e(DFL.PanelSection, { title: phase === "login" ? "Sign in" : "Please wait" }, [
+      e(DFL.PanelSectionRow, null,
+        e("div", { style: { opacity: 0.8, fontSize: 14, lineHeight: 1.45 } }, waitHint)
+      ),
+    ]);
+  } else if (tab === "voice") {
     const memberList = (voice && voice.members && voice.members.length)
       ? voice.members.map((m) =>
           e("div", { key: m.id, style: { padding: "4px 0", opacity: m.self ? 1 : 0.9 } },
@@ -253,7 +330,7 @@ function App() {
   return e("div", null, [
     e(DFL.PanelSection, { title: "Deckscord" }, [
       e(DFL.PanelSectionRow, null, statusLine),
-      e(DFL.PanelSectionRow, null, tabBar),
+      ready ? e(DFL.PanelSectionRow, null, tabBar) : null,
       startRow,
     ]),
     body,
