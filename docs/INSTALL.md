@@ -22,7 +22,18 @@ From a git checkout (what you want while developing):
 | `~/.config/systemd/user/deckscord-vesktop.service` | Keeps Vesktop up, CDP on port 9222 |
 | `~/homebrew/plugins/Deckscord/` | Decky plugin (`main.py`, `bridge.js`, `dist/index.js`) |
 
-If the QAM tile is missing: Decky → Developer Mode, then `sudo systemctl restart plugin_loader`.
+If the QAM tile is missing: Decky → Developer Mode, then reopen the QAM. `sudo systemctl restart plugin_loader` only if the plugin still does not appear.
+
+## Updates (no sudo)
+
+Older installs `chown`’d the plugin to root, which is why `update.sh` asked for a password. The plugin dir is now **yours**. After a one-time `sudo chown -R "$USER" ~/homebrew/plugins/Deckscord` if it is still root-owned:
+
+```bash
+./update.sh          # git pull + copy
+./update.sh --local  # copy this working tree (uncommitted diffs too)
+```
+
+QAM → **Update from GitHub** does the same `git pull` + copy. Close and reopen Deckscord.
 
 ## First login
 

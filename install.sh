@@ -234,36 +234,58 @@ echo -e "${BLUE}[4/6] Deckscord Decky plugin${NC}"
 SRC=""
 if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/plugin/main.py" ]]; then
   SRC="${SCRIPT_DIR}/plugin"
+  if [[ -d "${SCRIPT_DIR}/.git" ]]; then
+    mkdir -p "${DATA_DIR}"
+    if [[ ! -d "${DATA_DIR}/src/.git" ]]; then
+      echo "  Keeping a user-owned clone at ${DATA_DIR}/src for sudo-less updates"
+      git clone "${SCRIPT_DIR}" "${DATA_DIR}/src" 2>/dev/null || git clone "${REPO}" "${DATA_DIR}/src"
+    fi
+  fi
 else
-  tmp="$(mktemp -d)"
-  echo "  Cloning plugin from GitHub…"
-  git clone --depth 1 "${REPO}" "${tmp}/repo"
-  SRC="${tmp}/repo/plugin"
+  echo "  Cloning plugin from GitHub into ${DATA_DIR}/src…"
+  mkdir -p "${DATA_DIR}"
+  if [[ -d "${DATA_DIR}/src/.git" ]]; then
+    git -C "${DATA_DIR}/src" fetch --prune origin
+    git -C "${DATA_DIR}/src" merge --ff-only origin/main || true
+  else
+    git clone "${REPO}" "${DATA_DIR}/src"
+  fi
+  SRC="${DATA_DIR}/src/plugin"
 fi
 
-need_sudo "install plugin into ${PLUGIN_DIR}"
-sudo mkdir -p "${PLUGIN_DIR}"
+# Own the plugin dir as the user so later updates are git pull + rsync, not sudo.
+# (Older installs did `chown root:root`, which is why update asked for a password.)
+if [[ ! -d "${PLUGIN_DIR}" ]]; then
+  if mkdir -p "${PLUGIN_DIR}" 2>/dev/null; then
+    :
+  else
+    need_sudo "create ${PLUGIN_DIR} (then it stays yours)"
+    sudo mkdir -p "${PLUGIN_DIR}"
+    sudo chown -R "$(id -u):$(id -g)" "${PLUGIN_DIR}"
+  fi
+elif [[ ! -w "${PLUGIN_DIR}/." ]]; then
+  need_sudo "take ownership of ${PLUGIN_DIR} (one-time; leftover root files)"
+  sudo chown -R "$(id -u):$(id -g)" "${PLUGIN_DIR}"
+fi
 if command -v rsync >/dev/null 2>&1; then
-  sudo rsync -a --delete \
+  rsync -a --delete \
     --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' \
     "${SRC}/" "${PLUGIN_DIR}/"
 else
-  sudo find "${PLUGIN_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  sudo cp -a "${SRC}/." "${PLUGIN_DIR}/"
+  find "${PLUGIN_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  cp -a "${SRC}/." "${PLUGIN_DIR}/"
 fi
-sudo chown -R root:root "${PLUGIN_DIR}" 2>/dev/null || true
-echo "  Installed ${PLUGIN_DIR}"
-
-if [[ -n "${tmp:-}" && -d "${tmp:-}" ]]; then
-  rm -rf "${tmp}"
-fi
+echo "  Installed ${PLUGIN_DIR} (user-owned)"
 
 echo
 echo -e "${BLUE}[5/6] Restart Decky Loader${NC}"
-need_sudo "restart plugin_loader"
-sudo systemctl restart plugin_loader 2>/dev/null || sudo systemctl restart plugin_loader.service || true
-sleep 1
-echo -e "  ${GREEN}plugin_loader restarted${NC}"
+if sudo -n systemctl restart plugin_loader 2>/dev/null || sudo -n systemctl restart plugin_loader.service 2>/dev/null; then
+  sleep 1
+  echo -e "  ${GREEN}plugin_loader restarted${NC}"
+else
+  echo -e "  ${YELLOW}Skipped plugin_loader restart (no passwordless sudo).${NC}"
+  echo "  Reopen the QAM, or once: sudo systemctl restart plugin_loader"
+fi
 
 echo
 echo -e "${BLUE}[6/6] Verify${NC}"
@@ -306,9 +328,9 @@ echo "  3. Quick Access Menu → Deckscord."
 echo "  4. Voice tab: pick a server, join a call, mute/deafen."
 echo "     Text tab: pick a channel, read and send messages."
 echo
-echo "Update (until the Decky store listing):"
+echo "Update (git pull + copy, no sudo):"
 echo "  bash ${DATA_DIR}/update.sh"
-echo "  or:  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/update.sh | bash"
+echo "  or from a checkout: ./update.sh --local"
 echo "Uninstall:"
 echo "  bash ${DATA_DIR}/uninstall.sh"
 echo "  or:  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/uninstall.sh | bash"

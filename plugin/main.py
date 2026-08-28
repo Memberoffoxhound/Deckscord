@@ -23,7 +23,28 @@ CDP_PORT = int(os.environ.get("DECKSCORD_CDP_PORT", "9222"))
 SERVICE = "deckscord-vesktop.service"
 PLUGIN_DIR = Path(getattr(decky, "DECKY_PLUGIN_DIR", Path(__file__).parent))
 BRIDGE_PATH = PLUGIN_DIR / "bridge.js"
-DATA_DIR = Path.home() / ".local" / "share" / "deckscord"
+REPO_URL = os.environ.get(
+    "DECKSCORD_REPO", "https://github.com/Memberoffoxhound/Deckscord.git"
+)
+
+
+def _login_home() -> Path:
+    """Home of the desktop user, even when PluginLoader runs as root."""
+    for attr in ("DECKY_USER_HOME", "DECKY_HOME"):
+        v = getattr(decky, attr, None) or os.environ.get(attr)
+        if v:
+            return Path(v)
+    plugin = PLUGIN_DIR.resolve()
+    for p in [plugin, *plugin.parents]:
+        if p.name == "homebrew":
+            return p.parent
+    h = Path.home()
+    if str(h) not in ("/root", "/"):
+        return h
+    return Path("/var/home/bazzite")
+
+
+DATA_DIR = _login_home() / ".local" / "share" / "deckscord"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # PluginLoader is a PyInstaller binary. Child plugin processes inherit
@@ -1323,43 +1344,89 @@ class Plugin:
         return await self._ensure_vesktop(wait=True)
 
     async def update_from_github(self) -> dict[str, Any]:
-        """Re-run the GitHub installer in a detached session so plugin_loader
-        restart does not kill the update. Until the Decky store hosts us."""
+        """git pull + copy plugin files. No sudo, no full reinstall."""
+        home = _login_home()
+        src = Path(os.environ.get("DECKSCORD_SRC") or (DATA_DIR / "src"))
+        dst = home / "homebrew" / "plugins" / "Deckscord"
         log = DATA_DIR / "update.log"
-        script = DATA_DIR / "update.sh"
-        url = "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/update.sh"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = [f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---"]
+
+        def note(msg: str) -> None:
+            lines.append(msg)
+            decky.logger.info(f"update: {msg}")
+
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Deckscord-updater"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                script.write_bytes(resp.read())
-            script.chmod(0o755)
-        except Exception as e:
-            decky.logger.warning(f"update fetch: {e}")
-            if not script.is_file():
-                return {"ok": False, "error": f"could not download updater: {e}"}
-        env = _subprocess_env()
-        env["DECKSCORD_NONINTERACTIVE"] = "1"
-        log_f = open(log, "ab")
-        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
-        log_f.flush()
-        try:
-            subprocess.Popen(
-                ["/bin/bash", str(script)],
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                env=env,
-                start_new_session=True,
-                close_fds=True,
+            if (src / ".git").is_dir():
+                r = _run(["git", "-C", str(src), "fetch", "--prune", "origin"], timeout=60)
+                if r.returncode != 0:
+                    return {"ok": False, "error": (r.stderr or r.stdout or "git fetch failed").strip()}
+                r = _run(["git", "-C", str(src), "merge", "--ff-only", "origin/main"], timeout=30)
+                if r.returncode != 0:
+                    r = _run(["git", "-C", str(src), "pull", "--ff-only"], timeout=30)
+                if r.returncode != 0:
+                    return {"ok": False, "error": (r.stderr or r.stdout or "git pull failed").strip()}
+                note(f"pulled {src}")
+            else:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                r = _run(["git", "clone", "--depth", "1", REPO_URL, str(src)], timeout=120)
+                if r.returncode != 0:
+                    return {"ok": False, "error": (r.stderr or r.stdout or "git clone failed").strip()}
+                note(f"cloned {REPO_URL}")
+            head = _run(["git", "-C", str(src), "log", "-1", "--oneline"], timeout=5)
+            note((head.stdout or "").strip() or "ok")
+            plugin_src = src / "plugin"
+            if not (plugin_src / "main.py").is_file():
+                return {"ok": False, "error": f"no plugin in {plugin_src}"}
+            dst.mkdir(parents=True, exist_ok=True)
+            rsync = _run(
+                [
+                    "rsync",
+                    "-a",
+                    "--delete",
+                    "--exclude=__pycache__",
+                    "--exclude=*.pyc",
+                    "--exclude=node_modules",
+                    str(plugin_src) + "/",
+                    str(dst) + "/",
+                ],
+                timeout=30,
             )
+            if rsync.returncode != 0:
+                import shutil
+
+                for child in dst.iterdir():
+                    if child.name in (".git",):
+                        continue
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                shutil.copytree(plugin_src, dst, dirs_exist_ok=True)
+            uid, gid = home.stat().st_uid, home.stat().st_gid
+            for tree in (dst, src, DATA_DIR):
+                for root, dirs, files in os.walk(tree):
+                    try:
+                        os.chown(root, uid, gid)
+                    except OSError:
+                        pass
+                    for name in dirs + files:
+                        try:
+                            os.chown(os.path.join(root, name), uid, gid)
+                        except OSError:
+                            pass
+            try:
+                log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            self._bridge_hash = ""
+            return {
+                "ok": True,
+                "started": True,
+                "head": (head.stdout or "").strip(),
+                "log": str(log),
+                "message": "Updated from git. Close and reopen Deckscord in the QAM.",
+            }
         except Exception as e:
-            log_f.close()
-            decky.logger.error(f"update spawn: {e}")
+            decky.logger.error(f"update_from_github: {e}")
             return {"ok": False, "error": str(e)}
-        decky.logger.info("update_from_github spawned")
-        return {
-            "ok": True,
-            "started": True,
-            "log": str(log),
-            "message": "Update started. The QAM will reload in a few seconds.",
-        }

@@ -866,7 +866,7 @@ function App() {
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "Reinstall latest from GitHub until this is in the Decky store",
+            description: "git pull + copy files (no sudo)",
             onClick: () =>
               tap(() =>
                 act("Updating", async () => {
