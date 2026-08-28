@@ -50,6 +50,7 @@ const focusAudio = backend("focus_audio");
 const focusStream = backend("focus_stream");
 const clearAudioFocus = backend("clear_audio_focus");
 const updateFromGithub = backend("update_from_github");
+const getUpdateStatus = backend("get_update_status");
 const startGoLive = backend("start_go_live");
 const stopGoLive = backend("stop_go_live");
 
@@ -634,6 +635,7 @@ function App() {
   const [volLocal, setVolLocal] = useState({});
   const [frames, setFrames] = useState([]);
   const [speakingIds, setSpeakingIds] = useState({});
+  const [updateProg, setUpdateProg] = useState(null);
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const volTimer = useRef(null);
@@ -673,6 +675,7 @@ function App() {
     try {
       const s = await getStatus();
       setStatus(s || { phase: "loading", phase_label: "Discord is loading…" });
+      if (s && s.update && s.update.phase && s.update.phase !== "idle") setUpdateProg(s.update);
       if (s && s.ready) setError("");
       else if (s && s.error) setError(s.error);
       else setError("");
@@ -687,6 +690,34 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh, tick]);
+
+  const updatePhase = updateProg && updateProg.phase;
+  useEffect(() => {
+    if (!updatePhase || updatePhase === "idle" || updatePhase === "error" || updatePhase === "done") return;
+    let stop = false;
+    const pull = async () => {
+      try {
+        const r = await getUpdateStatus();
+        if (!stop && r) setUpdateProg(r);
+      } catch (_) {
+        if (!stop) {
+          setUpdateProg((p) => ({
+            phase: "restart",
+            percent: 96,
+            message: "Decky is reloading…",
+            ok: true,
+            head: (p && p.head) || "",
+          }));
+        }
+      }
+    };
+    pull();
+    const id = setInterval(pull, 280);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [updatePhase]);
 
   useEffect(() => {
     const ready = !!(status && status.ready);
@@ -866,17 +897,74 @@ function App() {
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "git pull + copy files (no sudo)",
+            disabled: !!(updateProg && updateProg.phase && updateProg.phase !== "idle" && updateProg.phase !== "error" && updateProg.phase !== "done"),
+            description: "git pull, copy files, restart Decky",
             onClick: () =>
               tap(() =>
                 act("Updating", async () => {
                   const r = await updateFromGithub();
-                  if (r && r.ok) setBusy("Update started — QAM will reload…");
-                  return r;
+                  if (r && r.ok === false) return r;
+                  setUpdateProg(r && r.phase ? r : { phase: "starting", percent: 4, message: "Starting update…" });
+                  return { ok: true };
                 })
               ),
           },
           "Update from GitHub"
+        )
+      ),
+    view.page === "home" &&
+      updateProg &&
+      updateProg.phase &&
+      updateProg.phase !== "idle" &&
+      e(
+        DFL.PanelSectionRow,
+        { key: "updbar" },
+        e(
+          "div",
+          { style: FILL },
+          [
+            e(
+              "div",
+              { key: "m", style: { fontSize: 13, lineHeight: 1.35, marginBottom: 6 } },
+              (updateProg.message || updateProg.phase) +
+                (updateProg.head ? " · " + updateProg.head : "")
+            ),
+            DFL.ProgressBar
+              ? e(DFL.ProgressBar, {
+                  key: "p",
+                  nProgress: Math.max(0, Math.min(100, Number(updateProg.percent) || 0)),
+                  nTransitionSec: 0.25,
+                  focusable: false,
+                })
+              : e(
+                  "div",
+                  {
+                    key: "p",
+                    style: {
+                      height: 8,
+                      borderRadius: 4,
+                      background: "rgba(255,255,255,0.12)",
+                      overflow: "hidden",
+                    },
+                  },
+                  e("div", {
+                    style: {
+                      width: Math.max(0, Math.min(100, Number(updateProg.percent) || 0)) + "%",
+                      height: "100%",
+                      background: updateProg.ok === false ? "#c44" : "#1a9fff",
+                      borderRadius: 4,
+                    },
+                  })
+                ),
+            e(
+              "div",
+              { key: "pct", style: { fontSize: 12, opacity: 0.7, marginTop: 4 } },
+              (updateProg.ok === false ? "Failed · " : "") +
+                Math.round(Number(updateProg.percent) || 0) +
+                "%" +
+                (updateProg.phase === "restart" ? " · Decky is reloading" : "")
+            ),
+          ]
         )
       ),
   ]);

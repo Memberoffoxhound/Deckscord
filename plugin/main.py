@@ -534,6 +534,8 @@ class Plugin:
         self._grab_log_at = 0.0
         self._audio_hygiene_at = 0.0
         self._portal_proc: Optional[subprocess.Popen] = None
+        self._update: dict[str, Any] = {"phase": "idle", "percent": 0, "message": ""}
+        self._update_task: Optional[asyncio.Task] = None
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -796,6 +798,7 @@ class Plugin:
             "phase": "starting",
             "phase_label": "Starting Discord…",
             "videoEnabled": bool(self._video_enabled),
+            "update": dict(self._update),
         }
 
         targets: Optional[list] = None
@@ -1343,8 +1346,61 @@ class Plugin:
     async def start_vesktop(self) -> dict[str, Any]:
         return await self._ensure_vesktop(wait=True)
 
+    def _set_update(self, phase: str, percent: int, message: str, **extra: Any) -> None:
+        blob: dict[str, Any] = {
+            "phase": phase,
+            "percent": int(percent),
+            "message": message,
+            "ok": extra.get("ok", True),
+            "error": extra.get("error") or "",
+            "head": extra.get("head") or self._update.get("head") or "",
+            "ts": time.time(),
+        }
+        self._update = blob
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            (DATA_DIR / "update.status").write_text(json.dumps(blob), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _restart_plugin_loader(self) -> None:
+        """Detach so restarting plugin_loader does not kill this process first."""
+        env = _subprocess_env()
+        log = DATA_DIR / "update.log"
+        cmd = (
+            "sleep 1; "
+            "systemctl restart plugin_loader.service >/dev/null 2>&1 || "
+            "systemctl restart plugin_loader >/dev/null 2>&1 || "
+            "sudo -n systemctl restart plugin_loader.service >/dev/null 2>&1 || "
+            "sudo -n systemctl restart plugin_loader >/dev/null 2>&1 || "
+            "true"
+        )
+        log_f = open(log, "ab")
+        log_f.write(b"restarting plugin_loader\n")
+        log_f.flush()
+        subprocess.Popen(
+            ["/bin/bash", "-c", cmd],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    async def get_update_status(self) -> dict[str, Any]:
+        return {"ok": True, **self._update}
+
     async def update_from_github(self) -> dict[str, Any]:
-        """git pull + copy plugin files. No sudo, no full reinstall."""
+        """Start git pull + copy in the background; poll get_update_status."""
+        task = self._update_task
+        if task is not None and not task.done():
+            return {"ok": True, "started": True, "already": True, **self._update}
+        self._set_update("starting", 4, "Starting update…")
+        self._update_task = asyncio.create_task(self._run_update())
+        return {"ok": True, "started": True, **self._update}
+
+    async def _run_update(self) -> None:
         home = _login_home()
         src = Path(os.environ.get("DECKSCORD_SRC") or (DATA_DIR / "src"))
         dst = home / "homebrew" / "plugins" / "Deckscord"
@@ -1357,29 +1413,52 @@ class Plugin:
             decky.logger.info(f"update: {msg}")
 
         try:
+            self._set_update("fetch", 12, "Fetching from GitHub…")
             if (src / ".git").is_dir():
-                r = _run(["git", "-C", str(src), "fetch", "--prune", "origin"], timeout=60)
+                r = await asyncio.to_thread(
+                    _run, ["git", "-C", str(src), "fetch", "--prune", "origin"], 90
+                )
                 if r.returncode != 0:
-                    return {"ok": False, "error": (r.stderr or r.stdout or "git fetch failed").strip()}
-                r = _run(["git", "-C", str(src), "merge", "--ff-only", "origin/main"], timeout=30)
+                    err = (r.stderr or r.stdout or "git fetch failed").strip()
+                    self._set_update("error", 12, err, ok=False, error=err)
+                    return
+                self._set_update("merge", 40, "Applying commits…")
+                r = await asyncio.to_thread(
+                    _run, ["git", "-C", str(src), "merge", "--ff-only", "origin/main"], 30
+                )
                 if r.returncode != 0:
-                    r = _run(["git", "-C", str(src), "pull", "--ff-only"], timeout=30)
+                    r = await asyncio.to_thread(
+                        _run, ["git", "-C", str(src), "pull", "--ff-only"], 30
+                    )
                 if r.returncode != 0:
-                    return {"ok": False, "error": (r.stderr or r.stdout or "git pull failed").strip()}
+                    err = (r.stderr or r.stdout or "git pull failed").strip()
+                    self._set_update("error", 40, err, ok=False, error=err)
+                    return
                 note(f"pulled {src}")
             else:
                 src.parent.mkdir(parents=True, exist_ok=True)
-                r = _run(["git", "clone", "--depth", "1", REPO_URL, str(src)], timeout=120)
+                self._set_update("clone", 20, "Cloning repository…")
+                r = await asyncio.to_thread(
+                    _run, ["git", "clone", "--depth", "1", REPO_URL, str(src)], 120
+                )
                 if r.returncode != 0:
-                    return {"ok": False, "error": (r.stderr or r.stdout or "git clone failed").strip()}
+                    err = (r.stderr or r.stdout or "git clone failed").strip()
+                    self._set_update("error", 20, err, ok=False, error=err)
+                    return
                 note(f"cloned {REPO_URL}")
-            head = _run(["git", "-C", str(src), "log", "-1", "--oneline"], timeout=5)
-            note((head.stdout or "").strip() or "ok")
+            head = await asyncio.to_thread(
+                _run, ["git", "-C", str(src), "log", "-1", "--oneline"], 5
+            )
+            head_s = (head.stdout or "").strip() or "ok"
+            note(head_s)
+            self._set_update("copy", 70, "Copying plugin files…", head=head_s)
             plugin_src = src / "plugin"
             if not (plugin_src / "main.py").is_file():
-                return {"ok": False, "error": f"no plugin in {plugin_src}"}
+                self._set_update("error", 70, "no plugin in repo", ok=False, error="no plugin")
+                return
             dst.mkdir(parents=True, exist_ok=True)
-            rsync = _run(
+            rsync = await asyncio.to_thread(
+                _run,
                 [
                     "rsync",
                     "-a",
@@ -1390,7 +1469,7 @@ class Plugin:
                     str(plugin_src) + "/",
                     str(dst) + "/",
                 ],
-                timeout=30,
+                30,
             )
             if rsync.returncode != 0:
                 import shutil
@@ -1420,13 +1499,8 @@ class Plugin:
             except OSError:
                 pass
             self._bridge_hash = ""
-            return {
-                "ok": True,
-                "started": True,
-                "head": (head.stdout or "").strip(),
-                "log": str(log),
-                "message": "Updated from git. Close and reopen Deckscord in the QAM.",
-            }
+            self._set_update("restart", 90, "Restarting Decky…", head=head_s)
+            self._restart_plugin_loader()
         except Exception as e:
             decky.logger.error(f"update_from_github: {e}")
-            return {"ok": False, "error": str(e)}
+            self._set_update("error", int(self._update.get("percent") or 0), str(e), ok=False, error=str(e))

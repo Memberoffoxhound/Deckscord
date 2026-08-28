@@ -71,7 +71,7 @@ Or from a previous install:
 bash ~/.local/share/deckscord/update.sh
 ```
 
-In Game Mode: QAM → Deckscord → **Update from GitHub**. That git-pulls and copies files; close and reopen the plugin. No sudo.
+In Game Mode: QAM → Deckscord → **Update from GitHub**. Progress shows in the QAM; Decky restarts when the copy is done.
 
 Once Deckscord is listed in the Decky Plugin Store, use the store’s Update button instead.
 

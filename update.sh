@@ -27,6 +27,23 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+bar() {
+  local pct="$1"
+  local msg="$2"
+  local filled=$((pct / 5))
+  local i out="["
+  i=1
+  while [[ "$i" -le 20 ]]; do
+    if [[ "$i" -le "$filled" ]]; then
+      out="${out}="
+    else
+      out="${out} "
+    fi
+    i=$((i + 1))
+  done
+  printf '\r%s\n' "${out}] ${pct}%  ${msg}"
+}
+
 ensure_plugin_writable() {
   if [[ -d "${PLUGIN_DIR}" && -w "${PLUGIN_DIR}/." ]]; then
     return 0
@@ -47,6 +64,7 @@ ensure_plugin_writable() {
 }
 
 sync_plugin() {
+  bar 70 "Copying plugin files…"
   local src="$1"
   if [[ ! -f "${src}/main.py" ]]; then
     echo -e "${RED}No plugin at ${src}${NC}" >&2
@@ -78,12 +96,14 @@ pull_repo() {
   local dir="$1"
   mkdir -p "$(dirname "${dir}")"
   if [[ -d "${dir}/.git" ]]; then
+    bar 15 "Fetching from GitHub…"
     echo "git fetch ${dir}"
     git -C "${dir}" fetch --prune origin
     local branch
     branch="$(git -C "${dir}" rev-parse --abbrev-ref HEAD)"
     git -C "${dir}" merge --ff-only "origin/${branch}" || git -C "${dir}" merge --ff-only origin/main
   else
+    bar 15 "Cloning repository…"
     echo "git clone ${REPO}"
     git clone --depth 1 "${REPO}" "${dir}"
   fi
@@ -91,6 +111,7 @@ pull_repo() {
 }
 
 echo "Deckscord update (git, no reinstall)"
+bar 4 "Starting…"
 
 if [[ "${LOCAL_ONLY}" -eq 1 ]]; then
   if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/plugin/main.py" ]]; then
@@ -111,12 +132,24 @@ else
   fi
 fi
 
-echo -e "${GREEN}Files copied to ${PLUGIN_DIR}${NC}"
-echo "bridge.js reloads on the next QAM action. Close and reopen Deckscord for the menu."
+bar 90 "Restarting Decky…"
 
-if sudo -n systemctl restart plugin_loader 2>/dev/null; then
-  echo "plugin_loader restarted (passwordless sudo)."
+restarted=0
+if systemctl restart plugin_loader.service 2>/dev/null || systemctl restart plugin_loader 2>/dev/null; then
+  restarted=1
+elif sudo -n systemctl restart plugin_loader.service 2>/dev/null || sudo -n systemctl restart plugin_loader 2>/dev/null; then
+  restarted=1
 else
-  echo "Decky was not restarted (no sudo). That is fine for most updates."
-  echo "If the QAM still looks old: close it, or once: sudo systemctl restart plugin_loader"
+  echo "Need sudo once to relaunch Decky so the new plugin loads."
+  if sudo systemctl restart plugin_loader.service 2>/dev/null || sudo systemctl restart plugin_loader 2>/dev/null; then
+    restarted=1
+  fi
+fi
+if [[ "${restarted}" -eq 1 ]]; then
+  bar 100 "Decky relaunched"
+  echo
+  echo -e "${GREEN}Update complete.${NC}"
+else
+  echo -e "${YELLOW}Files copied, but Decky did not restart.${NC}"
+  echo "  sudo systemctl restart plugin_loader"
 fi

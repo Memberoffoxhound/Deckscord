@@ -33,7 +33,7 @@ Older installs `chown`’d the plugin to root, which is why `update.sh` asked fo
 ./update.sh --local  # copy this working tree (uncommitted diffs too)
 ```
 
-QAM → **Update from GitHub** does the same `git pull` + copy. Close and reopen Deckscord.
+QAM → **Update from GitHub** git-pulls, shows a progress bar, copies files, then restarts Decky so the new plugin loads.
 
 ## First login
 
