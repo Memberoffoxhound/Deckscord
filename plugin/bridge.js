@@ -1034,6 +1034,64 @@
       }
     },
 
+    ensureVoiceProcessing: function () {
+      try {
+        var applied = [];
+        function go(name, value) {
+          var fn = findFn(name);
+          if (!fn) return;
+          try {
+            fn(value);
+            applied.push(name);
+          } catch (e) {}
+        }
+        go("setEchoCancellation", true);
+        go("setNoiseSuppression", true);
+        go("setNoiseCancellation", true);
+        go("setAutomaticGainControl", true);
+        go("setLoopback", false);
+        go("setBypassSystemInputProcessing", false);
+        go("setKrispSuppressionLevel", 100);
+        var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+        var inputs = [];
+        try {
+          if (MediaEngineStore && MediaEngineStore.getInputDevices) {
+            var map = MediaEngineStore.getInputDevices() || {};
+            if (Array.isArray(map)) inputs = map;
+            else Object.keys(map).forEach(function (id) { inputs.push(map[id] || { id: id }); });
+          }
+        } catch (eIn) {}
+        var cur = MediaEngineStore && MediaEngineStore.getInputDeviceId && MediaEngineStore.getInputDeviceId();
+        function isMon(d) {
+          var n = String((d && (d.name || d.label || d.id)) || "").toLowerCase();
+          return n.indexOf("monitor") !== -1 || n.indexOf("loopback") !== -1 || n.indexOf("stereo mix") !== -1;
+        }
+        var curDev = null;
+        for (var i = 0; i < inputs.length; i++) {
+          if (String(inputs[i].id) === String(cur)) curDev = inputs[i];
+        }
+        if (curDev && isMon(curDev)) {
+          var setIn = findFn("setInputDevice");
+          var pick = null;
+          for (var j = 0; j < inputs.length; j++) {
+            if (!isMon(inputs[j]) && String(inputs[j].id) !== "default") { pick = inputs[j]; break; }
+          }
+          if (!pick) {
+            for (var k = 0; k < inputs.length; k++) {
+              if (!isMon(inputs[k])) { pick = inputs[k]; break; }
+            }
+          }
+          if (setIn && pick) {
+            setIn(String(pick.id));
+            applied.push("setInputDevice:" + pick.id);
+          }
+        }
+        return { ok: true, applied: applied, inputId: MediaEngineStore && MediaEngineStore.getInputDeviceId && MediaEngineStore.getInputDeviceId() };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
     joinVoice: function (channelId) {
       try {
         var id = String(channelId);
@@ -1042,6 +1100,7 @@
           (common("ChannelActionCreators") && common("ChannelActionCreators").selectVoiceChannel);
         if (!fn) throw new Error("selectVoiceChannel not found");
         fn(id);
+        try { window.__deckscord.ensureVoiceProcessing(); } catch (eProc) {}
         return { ok: true, channel_id: id };
       } catch (e) {
         return err(e);
@@ -1087,10 +1146,15 @@
 
     setInputDevice: function (deviceId) {
       try {
+        var id = String(deviceId);
+        var n = id.toLowerCase();
+        if (n.indexOf("monitor") !== -1 || n.indexOf("loopback") !== -1) {
+          return { ok: false, error: "that input is speaker loopback, not a microphone" };
+        }
         var fn = findFn("setInputDevice");
         if (!fn) throw new Error("setInputDevice not found");
-        fn(String(deviceId));
-        return { ok: true, id: String(deviceId) };
+        fn(id);
+        return { ok: true, id: id };
       } catch (e) {
         return err(e);
       }

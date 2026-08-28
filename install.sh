@@ -135,6 +135,27 @@ if ! have_vesktop; then
 fi
 echo -e "  ${GREEN}Vesktop OK${NC}"
 
+# Discord "default" input is PipeWire's default source. If that source is a
+# speaker monitor, everyone in the call hears game/system audio.
+if command -v pactl >/dev/null 2>&1; then
+  src="$(pactl get-default-source 2>/dev/null || true)"
+  if [[ "${src}" == *.monitor || "${src,,}" == *monitor* ]]; then
+    mic=""
+    while read -r _ name _; do
+      [[ -z "${name:-}" ]] && continue
+      [[ "${name}" == *.monitor || "${name,,}" == *monitor* ]] && continue
+      mic="${name}"
+      break
+    done < <(pactl list short sources 2>/dev/null || true)
+    if [[ -n "${mic}" ]]; then
+      echo "  Default capture was speaker loopback — switching to ${mic}"
+      pactl set-default-source "${mic}" 2>/dev/null || true
+    else
+      echo -e "  ${YELLOW}Default capture is a speaker monitor and no microphone was found.${NC}"
+    fi
+  fi
+fi
+
 # Permissions Vesktop needs in Game Mode: mic, speakers, X11 (gamescope Wayland
 # SIGSEGVs Electron), home (session).
 # No bash arrays here — SteamOS often runs this via `sh` (POSIX bash).

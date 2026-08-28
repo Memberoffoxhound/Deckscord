@@ -738,6 +738,17 @@ function App() {
     canBack
       ? e(DFL.PanelSectionRow, { key: "back" }, e(DFL.ButtonItem, { layout: "below", onClick: () => back(), ...cancelBind(handleCancel) }, "Back"))
       : null,
+    status && status.capture && status.capture.loopback
+      ? e(
+          DFL.PanelSectionRow,
+          { key: "loop" },
+          e(
+            "div",
+            { style: { color: "#e4b44c", fontSize: 13, lineHeight: 1.35 } },
+            "Mic is capturing speaker output. Others will hear your game. Plug in a headset or pick a real microphone under Audio."
+          )
+        )
+      : null,
     error ? e(DFL.PanelSectionRow, { key: "err" }, e("div", { style: { color: "#e4b44c", fontSize: 13 } }, error)) : null,
     busy ? e(DFL.PanelSectionRow, { key: "busy" }, e("div", { style: { opacity: 0.7, fontSize: 12 } }, busy + "…")) : null,
     view.page === "home" &&
@@ -1126,7 +1137,7 @@ function App() {
       ]),
     ]);
   } else if (view.page === "devices") {
-    const inList = devices.input || [];
+    const inList = (devices.input || []).filter((d) => !/monitor|loopback|stereo mix/i.test(String(d.name || d.id || "")));
     const outList = devices.output || [];
     body = e("div", { style: FILL }, [
       e(

@@ -42,6 +42,26 @@ flags=(
 )
 
 flatpak_extra=()
+# Never let Discord's "default" capture follow a speaker monitor.
+pick_mic_source() {
+  command -v pactl >/dev/null 2>&1 || return 1
+  local name
+  while read -r _ name _; do
+    [[ -z "${name:-}" ]] && continue
+    [[ "${name}" == *.monitor ]] && continue
+    [[ "${name,,}" == *monitor* ]] && continue
+    printf '%s' "${name}"
+    return 0
+  done < <(pactl list short sources 2>/dev/null || true)
+  return 1
+}
+
+if MIC_SRC="$(pick_mic_source)"; then
+  export PULSE_SOURCE="${MIC_SRC}"
+  pactl set-default-source "${MIC_SRC}" 2>/dev/null || true
+  flatpak_extra+=(--env=PULSE_SOURCE="${MIC_SRC}")
+fi
+
 if DISPLAY_VAL="$(pick_display)"; then
   export DISPLAY="${DISPLAY_VAL}"
   unset WAYLAND_DISPLAY

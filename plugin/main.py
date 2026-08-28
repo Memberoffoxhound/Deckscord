@@ -70,6 +70,75 @@ def _systemctl(*args: str, timeout: int = 8) -> subprocess.CompletedProcess:
     return _run(["/usr/bin/systemctl", "--user", *args], timeout=timeout)
 
 
+def _pactl(*args: str, timeout: int = 5) -> subprocess.CompletedProcess:
+    pactl = "/usr/bin/pactl"
+    if not Path(pactl).exists():
+        pactl = "pactl"
+    return _run([pactl, *args], timeout=timeout)
+
+
+def _is_monitor_source(name: str) -> bool:
+    n = (name or "").lower()
+    return (
+        n.endswith(".monitor")
+        or "monitor" in n
+        or "loopback" in n
+        or "stereo mix" in n
+        or "what-u-hear" in n
+        or "wave out" in n
+    )
+
+
+def _pulse_sources() -> list[str]:
+    r = _pactl("list", "short", "sources")
+    names: list[str] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            names.append(parts[1])
+    return names
+
+
+def _pick_real_mic(sources: list[str]) -> Optional[str]:
+    real = [s for s in sources if not _is_monitor_source(s)]
+    if not real:
+        return None
+    for s in real:
+        sl = s.lower()
+        if "mic" in sl or "headset" in sl or "headphone" in sl:
+            return s
+    for s in real:
+        if s.startswith("alsa_input") or s.startswith("bluez_input"):
+            return s
+    return real[0]
+
+
+def ensure_mic_not_loopback() -> dict[str, Any]:
+    """If Pulse/PipeWire default source is a speaker monitor, switch to a real mic.
+
+    Discord's 'default' input follows this. Capturing *.monitor is why call
+    members hear game/system audio when using device speakers.
+    """
+    cur = (_pactl("get-default-source").stdout or "").strip()
+    sources = _pulse_sources()
+    mic = _pick_real_mic(sources)
+    changed = False
+    if cur and _is_monitor_source(cur):
+        if mic:
+            _pactl("set-default-source", mic)
+            changed = True
+            cur = mic
+        else:
+            decky.logger.warning(f"default source is loopback ({cur}) and no real mic was found")
+    return {
+        "source": cur,
+        "mic": mic,
+        "loopback": bool(cur and _is_monitor_source(cur)),
+        "changed": changed,
+        "sources": sources[:12],
+    }
+
+
 class Cdp:
     """Minimal CDP client. Stdlib only — no extra Python deps."""
 
@@ -300,6 +369,7 @@ class Plugin:
         self._grab_lock = asyncio.Lock()
         self._last_voice_channel: Optional[str] = None
         self._grab_log_at = 0.0
+        self._audio_hygiene_at = 0.0
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -308,6 +378,11 @@ class Plugin:
             decky.logger.info(f"vesktop service: {svc}")
         except Exception as e:
             decky.logger.warning(f"vesktop start: {e}")
+        try:
+            hy = ensure_mic_not_loopback()
+            decky.logger.info(f"capture source: {hy}")
+        except Exception as e:
+            decky.logger.warning(f"capture source: {e}")
 
     async def _unload(self) -> None:
         try:
@@ -623,6 +698,16 @@ class Plugin:
                     pass
                 self._audio_focus = {"userId": None, "saved": {}}
             self._last_voice_channel = vch
+            if vch and time.monotonic() - self._audio_hygiene_at > 15:
+                self._audio_hygiene_at = time.monotonic()
+                try:
+                    hy = ensure_mic_not_loopback()
+                    out["capture"] = {k: hy[k] for k in ("source", "loopback", "mic") if k in hy}
+                    if hy.get("loopback"):
+                        out["phase_label"] = (out.get("phase_label") or "Ready") + " · mic is speakers"
+                    await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+                except Exception as e:
+                    decky.logger.warning(f"voice processing: {e}")
             try:
                 if self._video_enabled and time.monotonic() < self._grab_alive_until:
                     pass
@@ -670,7 +755,16 @@ class Plugin:
         if not cid:
             return {"ok": False, "error": "missing channel_id"}
         await self._clear_audio_focus_safe()
+        try:
+            hy = ensure_mic_not_loopback()
+            decky.logger.info(f"join capture source: {hy}")
+        except Exception as e:
+            decky.logger.warning(f"join capture source: {e}")
         r = await self._bridge(f"joinVoice({json.dumps(cid)})")
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+        except Exception as e:
+            decky.logger.warning(f"ensureVoiceProcessing: {e}")
         decky.logger.info(f"join_voice result {r}")
         return self._ok(r)
 
