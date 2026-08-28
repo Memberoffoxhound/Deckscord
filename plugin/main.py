@@ -275,11 +275,25 @@ class Plugin:
             decky.logger.error(f"vesktop service: {e}")
             return {"running": False, "state": "failed", "error": str(e)}
 
-    async def _ensure_cdp(self) -> None:
+    async def _ensure_cdp(self, inject: bool = True) -> None:
+        want = None
+        try:
+            want = _pick_target(_cdp_targets())
+        except Exception:
+            want = None
         if self.cdp.connected:
             try:
-                await self.cdp.call("Runtime.evaluate", {"expression": "1+1", "returnByValue": True}, timeout=3)
-                return
+                href = await self._eval("location.href", timeout=3)
+                want_url = (want or {}).get("url") or ""
+                if href and want_url and href.split("#")[0] not in want_url and want_url.split("#")[0] not in str(href):
+                    await self.cdp.close()
+                else:
+                    if inject:
+                        try:
+                            await self._inject_bridge()
+                        except Exception:
+                            pass
+                    return
             except Exception:
                 await self.cdp.close()
         last_err: Optional[Exception] = None
@@ -290,7 +304,11 @@ class Plugin:
                 if not t:
                     raise ConnectionError("no CDP targets (is Vesktop running / logged in?)")
                 await self.cdp.connect(t["webSocketDebuggerUrl"])
-                await self._inject_bridge()
+                if inject:
+                    try:
+                        await self._inject_bridge()
+                    except Exception:
+                        pass
                 return
             except Exception as e:
                 last_err = e
@@ -332,9 +350,77 @@ class Plugin:
 
     async def _bridge(self, call: str) -> Any:
         await self._ensure_vesktop(wait=False)
-        await self._ensure_cdp()
+        await self._ensure_cdp(inject=True)
         await self._inject_bridge()
         return await self._eval(f"window.__deckscord.{call}")
+
+    async def _submit_first_launch(self) -> bool:
+        js = """
+        (function(){
+          var b = document.getElementById('submit');
+          if (!b) return {ok:false, error:'no submit'};
+          b.click();
+          return {ok:true};
+        })()
+        """
+        r = await self._eval(js)
+        return isinstance(r, dict) and r.get("ok") is True
+
+    async def _grab_login_qr(self) -> Optional[str]:
+        js = """
+        (function(){
+          try {
+            var canvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
+            var c = canvases.find(function(x){ return Math.min(x.width, x.height) >= 120; })
+                 || canvases.find(function(x){ return Math.min(x.offsetWidth, x.offsetHeight) >= 120; });
+            if (!c) return {ok:false, error:'no qr canvas'};
+            var png = c.toDataURL('image/png');
+            if (!png || png.length < 80) return {ok:false, error:'empty canvas'};
+            return {ok:true, png:png, w:c.width, h:c.height};
+          } catch (e) {
+            return {ok:false, error:String(e && e.message ? e.message : e)};
+          }
+        })()
+        """
+        r = await self._eval(js)
+        if isinstance(r, dict) and r.get("ok") and r.get("png"):
+            return str(r["png"])
+        clip = await self._eval(
+            """
+            (function(){
+              var el = document.querySelector('[aria-label*="QR code"]')
+                    || document.querySelector('[class*="qrCode"]')
+                    || document.querySelector('canvas');
+              if (!el) return null;
+              var r = el.getBoundingClientRect();
+              if (r.width < 80 || r.height < 80) return null;
+              return {x:r.x, y:r.y, width:r.width, height:r.height};
+            })()
+            """
+        )
+        if not isinstance(clip, dict):
+            return None
+        try:
+            shot = await self.cdp.call(
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "clip": {
+                        "x": float(clip["x"]),
+                        "y": float(clip["y"]),
+                        "width": float(clip["width"]),
+                        "height": float(clip["height"]),
+                        "scale": 1,
+                    },
+                },
+                timeout=6,
+            )
+            data = (shot or {}).get("data")
+            if data:
+                return "data:image/png;base64," + data
+        except Exception as e:
+            decky.logger.warning(f"QR screenshot: {e}")
+        return None
 
     # ---- Decky-callable -------------------------------------------------
 
@@ -371,15 +457,49 @@ class Plugin:
 
         out["cdp"] = True
         blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
-        if "first-launch" in blob or "vesktop://static" in blob:
+        if "first-launch" in blob:
+            try:
+                await self._ensure_cdp(inject=False)
+                await self._submit_first_launch()
+            except Exception as e:
+                decky.logger.warning(f"first-launch submit: {e}")
+            out["phase"] = "loading"
+            out["phase_label"] = "Opening Discord login…"
+            return out
+
+        on_login = "discord.com/login" in blob or "/login" in blob
+        if on_login or "vesktop://static" in blob:
             out["phase"] = "login"
-            out["phase_label"] = "Log into Discord"
-            out["error"] = "Finish Vesktop setup and log into Discord. Desktop Mode is easiest; the session is saved after that."
+            out["phase_label"] = "Scan QR to log in"
+            try:
+                await self._ensure_cdp(inject=False)
+                qr = await self._grab_login_qr()
+                if qr:
+                    out["qr_png"] = qr
+                    out["phase_label"] = "Scan QR to log in"
+                else:
+                    out["phase_label"] = "Waiting for login QR…"
+            except Exception as e:
+                decky.logger.warning(f"login QR: {e}")
+                out["phase_label"] = "Waiting for login QR…"
             return out
 
         try:
             snap = await self._bridge("snapshot()")
         except Exception as e:
+            # Discord may still be on login even if the URL hasn't settled.
+            try:
+                await self._ensure_cdp(inject=False)
+                href = str(await self._eval("location.href") or "")
+                qr = await self._grab_login_qr()
+                if qr or "/login" in href:
+                    out["phase"] = "login"
+                    out["phase_label"] = "Scan QR to log in"
+                    if qr:
+                        out["qr_png"] = qr
+                    return out
+            except Exception:
+                pass
             out["phase"] = "loading"
             out["phase_label"] = "Discord is loading…"
             out["error"] = str(e)
@@ -399,7 +519,13 @@ class Plugin:
         else:
             out["ready"] = False
             out["phase"] = "login"
-            out["phase_label"] = "Log into Discord"
+            out["phase_label"] = "Scan QR to log in"
+            try:
+                qr = await self._grab_login_qr()
+                if qr:
+                    out["qr_png"] = qr
+            except Exception:
+                pass
         return out
 
     async def join_voice(self, channel_id: str, channel_name: str = "") -> dict[str, Any]:

@@ -41,10 +41,10 @@ Sudo is used for linger, plugin install, and restarting Decky.
 
 ## First login
 
-1. Desktop Mode: open **Vesktop** and log into Discord (QR or password).
-2. Return to Game Mode.
-3. QAM → **Deckscord**.
-4. Voice tab to join a call. Text tab to chat.
+1. Game Mode → QAM → **Deckscord**.
+2. Wait for the login QR (amber light: **Scan QR to log in**).
+3. Phone: Discord → **Scan QR Code**.
+4. The light turns green (**Ready**). Voice + Text work from the QAM.
 
 Steam keyboard in the QAM: **Steam + X**.
 

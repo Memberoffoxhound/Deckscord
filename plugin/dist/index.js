@@ -161,7 +161,7 @@ function App() {
   const currentGuildId = guild ? guild.id : null;
   const waitHint =
     phase === "login"
-      ? "Open Vesktop in Desktop Mode, log in once, then come back. The light turns green when Deckscord can chat and join calls."
+      ? "On your phone open Discord → Scan QR Code. The light turns green after you are in."
       : "Wait for the green Ready light. Discord is still starting — joining or sending now will do nothing.";
 
   const tabBar = e("div", { style: { display: "flex", gap: "8px", marginBottom: "8px" } }, [
@@ -205,10 +205,33 @@ function App() {
   let body = null;
 
   if (!ready) {
-    body = e(DFL.PanelSection, { title: phase === "login" ? "Sign in" : "Please wait" }, [
+    const qr = status && status.qr_png;
+    body = e(DFL.PanelSection, { title: phase === "login" ? "Scan to log in" : "Please wait" }, [
       e(DFL.PanelSectionRow, null,
-        e("div", { style: { opacity: 0.8, fontSize: 14, lineHeight: 1.45 } }, waitHint)
+        e("div", { style: { opacity: 0.85, fontSize: 14, lineHeight: 1.45, marginBottom: 8 } }, waitHint)
       ),
+      qr &&
+        e(DFL.PanelSectionRow, null,
+          e("div", { style: { width: "100%", display: "flex", justifyContent: "center", padding: "8px 0 12px" } },
+            e("img", {
+              src: qr,
+              alt: "Discord login QR",
+              style: {
+                width: 220,
+                height: 220,
+                background: "#fff",
+                borderRadius: 12,
+                padding: 10,
+                boxSizing: "content-box",
+                imageRendering: "pixelated",
+              },
+            })
+          )
+        ),
+      phase === "login" && !qr &&
+        e(DFL.PanelSectionRow, null,
+          e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Waiting for the Discord QR…")
+        ),
     ]);
   } else if (tab === "voice") {
     const memberList = (voice && voice.members && voice.members.length)
