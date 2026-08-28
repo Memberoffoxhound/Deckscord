@@ -46,8 +46,18 @@ const sendMessage = backend("send_message");
 const startVesktop = backend("start_vesktop");
 
 const e = window.SP_REACT.createElement;
-const { useState, useEffect, useCallback, useRef } = window.SP_REACT;
+const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
 const Focusable = DFL.Focusable || "div";
+const BackNav = createContext(null);
+
+function cancelBind(handler) {
+  if (!handler) return {};
+  return {
+    onCancelButton: handler,
+    onCancel: handler,
+    onCancelActionDescription: "Back",
+  };
+}
 
 const FILL = {
   width: "100%",
@@ -130,6 +140,7 @@ function Avatar({ src, name, size, radius }) {
 }
 
 function Row({ onClick, children, disabled, style }) {
+  const onCancel = useContext(BackNav);
   const go = () => {
     if (disabled || !onClick) return;
     onClick();
@@ -141,6 +152,7 @@ function Row({ onClick, children, disabled, style }) {
       onActivate: go,
       onOKButton: go,
       onClick: go,
+      ...cancelBind(onCancel),
       style: {
         display: "flex",
         alignItems: "center",
@@ -300,6 +312,7 @@ function MessageBody({ m }) {
 function ChatComposer({ value, onChange, onSend, disabled }) {
   const fieldRef = useRef(null);
   const wrapRef = useRef(null);
+  const onCancel = useContext(BackNav);
 
   const openKb = () => {
     const node = fieldRef.current;
@@ -345,6 +358,7 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
           layout: "below",
           disabled: !!disabled || !String(value || "").trim(),
           onClick: onSend,
+          ...cancelBind(onCancel),
         },
         "Send"
       )
@@ -366,8 +380,25 @@ function App() {
   const volTimer = useRef(null);
 
   const view = stack[stack.length - 1] || { page: "home" };
+  const canBack = stack.length > 1;
   const push = (page) => setStack((s) => s.concat([page]));
   const back = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
+
+  const handleCancel = (evt) => {
+    if (!canBack) return;
+    if (evt) {
+      if (typeof evt.preventDefault === "function") evt.preventDefault();
+      if (typeof evt.stopPropagation === "function") evt.stopPropagation();
+      if (evt.detail && typeof evt.detail.preventDefault === "function") evt.detail.preventDefault();
+    }
+    back();
+  };
+
+  const handleButtonDown = (evt) => {
+    if (!canBack) return;
+    const btn = evt && evt.detail && evt.detail.button;
+    if (btn === 2) handleCancel(evt);
+  };
 
   const tap = (fn) => {
     const now = Date.now();
@@ -496,8 +527,8 @@ function App() {
 
   const navHeader = e(DFL.PanelSection, { title: "Deckscord" }, [
     e(DFL.PanelSectionRow, { key: "st" }, e("div", { style: FILL }, (status && status.phase_label) || (ready ? "Ready" : "Discord is loading…"))),
-    view.page !== "home"
-      ? e(DFL.PanelSectionRow, { key: "back" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(back) }, "Back"))
+    canBack
+      ? e(DFL.PanelSectionRow, { key: "back" }, e(DFL.ButtonItem, { layout: "below", onClick: () => back(), ...cancelBind(handleCancel) }, "Back"))
       : null,
     error ? e(DFL.PanelSectionRow, { key: "err" }, e("div", { style: { color: "#e4b44c", fontSize: 13 } }, error)) : null,
     busy ? e(DFL.PanelSectionRow, { key: "busy" }, e("div", { style: { opacity: 0.7, fontSize: 12 } }, busy + "…")) : null,
@@ -507,11 +538,12 @@ function App() {
     volLocal.output != null ? volLocal.output : devices.outputVolume != null ? devices.outputVolume : 100;
   const inVol = volLocal.input != null ? volLocal.input : devices.inputVolume != null ? devices.inputVolume : 100;
 
+  const showVoicePanel = ready && view.page !== "chat" && view.page !== "member";
   const voiceSection =
-    ready &&
+    showVoicePanel &&
     e(DFL.PanelSection, { title: voice ? "Voice · " + voice.name : "Voice" }, [
       voice
-        ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())) }, "Leave voice"))
+        ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
         : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
       e(
         DFL.PanelSectionRow,
@@ -521,6 +553,7 @@ function App() {
           description: "Microphone",
           checked: !!(status && status.muted),
           onChange: () => tap(() => act("Mute", () => toggleMute())),
+          ...cancelBind(handleCancel),
         })
       ),
       e(
@@ -531,6 +564,7 @@ function App() {
           description: "Speakers and microphone",
           checked: !!(status && status.deafened),
           onChange: () => tap(() => act("Deafen", () => toggleDeafen())),
+          ...cancelBind(handleCancel),
         })
       ),
       e(
@@ -545,6 +579,7 @@ function App() {
           showValue: true,
           valueSuffix: "%",
           onChange: (v) => slideVol("output", v, () => setOutputVolume(v)),
+          ...cancelBind(handleCancel),
         })
       ),
       e(
@@ -559,9 +594,10 @@ function App() {
           showValue: true,
           valueSuffix: "%",
           onChange: (v) => slideVol("input", v, () => setInputVolume(v)),
+          ...cancelBind(handleCancel),
         })
       ),
-      e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices }, "Input / output devices")),
+      e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")),
       voice && voice.members && voice.members.length
         ? voice.members.map((m) =>
             e(
@@ -749,34 +785,31 @@ function App() {
         act("Send", () => sendMessage(view.channelId, c));
       },
     });
-    const msgList = e(
-      "div",
-      {
-        style: {
-          ...FILL,
-          maxHeight: 320,
-          overflowY: "auto",
-          overflowX: "hidden",
-          padding: "4px 0 8px",
+    const shown = messages.length ? messages.slice(-20) : [{ id: "empty", author: "", content: "No messages yet." }];
+    const msgList = shown.map((m) =>
+      e(
+        Focusable,
+        {
+          key: m.id,
+          ...cancelBind(handleCancel),
+          onFocus: (ev) => {
+            const t = ev && (ev.currentTarget || ev.target);
+            if (t && typeof t.scrollIntoView === "function") t.scrollIntoView({ block: "nearest" });
+          },
+          style: { ...FILL, marginBottom: 10, padding: "4px 0" },
         },
-      },
-      (messages.length ? messages : [{ id: "empty", author: "", content: "No messages yet." }]).map((m) =>
-        e(
-          "div",
-          { key: m.id, style: { ...FILL, marginBottom: 12 } },
-          [
-            m.author &&
-              e(
-                "div",
-                { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4 } },
-                [
-                  e(Avatar, { key: "a", src: m.avatar, name: m.author, size: 22, radius: 11 }),
-                  e("div", { key: "n", style: { fontWeight: 600, fontSize: 13 } }, m.author),
-                ]
-              ),
-            e(MessageBody, { m }),
-          ]
-        )
+        [
+          m.author &&
+            e(
+              "div",
+              { key: "h", style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4 } },
+              [
+                e(Avatar, { key: "a", src: m.avatar, name: m.author, size: 22, radius: 11 }),
+                e("div", { key: "n", style: { fontWeight: 600, fontSize: 13 } }, m.author),
+              ]
+            ),
+          e(MessageBody, { key: "b", m }),
+        ]
       )
     );
     body = e("div", { style: FILL }, [
@@ -790,13 +823,20 @@ function App() {
               {
                 layout: "below",
                 onClick: () => join({ id: view.channelId, name: view.title || "Call" }),
+                ...cancelBind(handleCancel),
               },
               voice && voice.channelId === view.channelId ? "In call" : "Start voice call"
             )
           ),
+        e("div", { key: "msgs", style: FILL }, msgList),
         e("div", { key: "compose", style: FILL }, composer),
+        voice &&
+          e(
+            DFL.PanelSectionRow,
+            { key: "leave" },
+            e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice · " + voice.name)
+          ),
       ]),
-      e(DFL.PanelSection, { title: "Messages" }, e(DFL.PanelSectionRow, null, msgList)),
     ]);
   } else if (view.page === "devices") {
     const inList = devices.input || [];
@@ -815,6 +855,7 @@ function App() {
                 layout: "below",
                 disabled: !d.id,
                 onClick: d.id ? () => act("Input", () => setInputDevice(d.id)) : undefined,
+                ...cancelBind(handleCancel),
               },
               (d.id && d.id === devices.inputId ? "● " : "") + d.name
             )
@@ -834,6 +875,7 @@ function App() {
                 layout: "below",
                 disabled: !d.id,
                 onClick: d.id ? () => act("Output", () => setOutputDevice(d.id)) : undefined,
+                ...cancelBind(handleCancel),
               },
               (d.id && d.id === devices.outputId ? "● " : "") + d.name
             )
@@ -870,6 +912,7 @@ function App() {
             showValue: true,
             valueSuffix: "%",
             onChange: (v) => slideVol(volKey, v, () => setUserVolume(view.userId, v)),
+            ...cancelBind(handleCancel),
           })
         ),
       !view.self &&
@@ -881,6 +924,7 @@ function App() {
             description: "You won't hear them",
             checked: !!live.localMute,
             onChange: () => act("Mute user", () => toggleUserMute(view.userId)),
+            ...cancelBind(handleCancel),
           })
         ),
       !view.self &&
@@ -894,6 +938,7 @@ function App() {
               layout: "below",
               description: "Server mute (needs permission)",
               onClick: () => act("Server mute", () => setServerMute(guildId, view.userId, !live.muted)),
+              ...cancelBind(handleCancel),
             },
             live.muted ? "Unmute on server" : "Mute on server"
           )
@@ -909,6 +954,7 @@ function App() {
               layout: "below",
               description: "Server deafen (needs permission)",
               onClick: () => act("Server deafen", () => setServerDeaf(guildId, view.userId, !live.deaf)),
+              ...cancelBind(handleCancel),
             },
             live.deaf ? "Undeafen on server" : "Deafen on server"
           )
@@ -917,10 +963,21 @@ function App() {
     ]);
   }
 
+  const rootProps = {
+    className: "deckscord-root",
+    style: { ...FILL, paddingBottom: 8 },
+  };
+  if (canBack) {
+    rootProps.onCancelButton = handleCancel;
+    rootProps.onCancel = handleCancel;
+    rootProps.onCancelActionDescription = "Back";
+    rootProps.onButtonDown = handleButtonDown;
+  }
+
   return e(
-    "div",
-    { className: "deckscord-root", style: { ...FILL, paddingBottom: 8 } },
-    [
+    BackNav.Provider,
+    { value: canBack ? handleCancel : null },
+    e(Focusable, rootProps, [
       e(
         "style",
         { key: "css" },
@@ -930,7 +987,7 @@ function App() {
       navHeader,
       voiceSection,
       body,
-    ]
+    ])
   );
 }
 
