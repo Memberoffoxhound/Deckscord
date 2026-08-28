@@ -951,3 +951,45 @@ class Plugin:
 
     async def start_vesktop(self) -> dict[str, Any]:
         return await self._ensure_vesktop(wait=True)
+
+    async def update_from_github(self) -> dict[str, Any]:
+        """Re-run the GitHub installer in a detached session so plugin_loader
+        restart does not kill the update. Until the Decky store hosts us."""
+        log = DATA_DIR / "update.log"
+        script = DATA_DIR / "update.sh"
+        url = "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/update.sh"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Deckscord-updater"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                script.write_bytes(resp.read())
+            script.chmod(0o755)
+        except Exception as e:
+            decky.logger.warning(f"update fetch: {e}")
+            if not script.is_file():
+                return {"ok": False, "error": f"could not download updater: {e}"}
+        env = _subprocess_env()
+        env["DECKSCORD_NONINTERACTIVE"] = "1"
+        log_f = open(log, "ab")
+        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        log_f.flush()
+        try:
+            subprocess.Popen(
+                ["/bin/bash", str(script)],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception as e:
+            log_f.close()
+            decky.logger.error(f"update spawn: {e}")
+            return {"ok": False, "error": str(e)}
+        decky.logger.info("update_from_github spawned")
+        return {
+            "ok": True,
+            "started": True,
+            "log": str(log),
+            "message": "Update started. The QAM will reload in a few seconds.",
+        }

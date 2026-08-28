@@ -283,12 +283,19 @@ echo "  3. Quick Access Menu → Deckscord."
 echo "  4. Voice tab: pick a server, join a call, mute/deafen."
 echo "     Text tab: pick a channel, read and send messages."
 echo
+echo "Update (until the Decky store listing):"
+echo "  bash ${DATA_DIR}/update.sh"
+echo "  or:  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/update.sh | bash"
 echo "Uninstall:"
-echo "  bash ${DATA_DIR}/uninstall.sh   # copied below if available"
+echo "  bash ${DATA_DIR}/uninstall.sh"
 echo "  or:  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/uninstall.sh | bash"
 echo
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/uninstall.sh" ]]; then
-  cp "${SCRIPT_DIR}/uninstall.sh" "${DATA_DIR}/uninstall.sh"
-  chmod +x "${DATA_DIR}/uninstall.sh"
-fi
+for helper in uninstall.sh update.sh; do
+  if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/${helper}" ]]; then
+    cp "${SCRIPT_DIR}/${helper}" "${DATA_DIR}/${helper}"
+    chmod +x "${DATA_DIR}/${helper}"
+  else
+    curl -fsSL "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/${helper}" -o "${DATA_DIR}/${helper}" && chmod +x "${DATA_DIR}/${helper}" || true
+  fi
+done

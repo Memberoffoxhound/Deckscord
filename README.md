@@ -48,6 +48,24 @@ Sudo is used for linger, plugin install, and restarting Decky.
 
 Steam keyboard in the QAM: **Steam + X**.
 
+## Update (until it is on the Decky store)
+
+Same as install — pulls `main` from GitHub and re-runs the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/update.sh | bash
+```
+
+Or from a previous install:
+
+```bash
+bash ~/.local/share/deckscord/update.sh
+```
+
+In Game Mode: QAM → Deckscord → **Update from GitHub**. That kicks off the same script in the background; the plugin reloads when Decky restarts.
+
+Once Deckscord is listed in the Decky Plugin Store, use the store’s Update button instead.
+
 ## Uninstall
 
 ```bash

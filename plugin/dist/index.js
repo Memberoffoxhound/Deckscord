@@ -48,6 +48,7 @@ const getVideoFrames = backend("get_video_frames");
 const getSpeaking = backend("get_speaking");
 const focusAudio = backend("focus_audio");
 const clearAudioFocus = backend("clear_audio_focus");
+const updateFromGithub = backend("update_from_github");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -739,6 +740,27 @@ function App() {
       : null,
     error ? e(DFL.PanelSectionRow, { key: "err" }, e("div", { style: { color: "#e4b44c", fontSize: 13 } }, error)) : null,
     busy ? e(DFL.PanelSectionRow, { key: "busy" }, e("div", { style: { opacity: 0.7, fontSize: 12 } }, busy + "…")) : null,
+    view.page === "home" &&
+      e(
+        DFL.PanelSectionRow,
+        { key: "upd" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: "Reinstall latest from GitHub until this is in the Decky store",
+            onClick: () =>
+              tap(() =>
+                act("Updating", async () => {
+                  const r = await updateFromGithub();
+                  if (r && r.ok) setBusy("Update started — QAM will reload…");
+                  return r;
+                })
+              ),
+          },
+          "Update from GitHub"
+        )
+      ),
   ]);
 
   const outVol =

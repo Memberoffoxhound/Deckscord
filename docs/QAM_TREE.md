@@ -16,7 +16,8 @@ Deckscord
    │
    ├─ Status
    │  ├─ phase label
-   │  └─ Back                   (any nested page)
+   │  ├─ Back                   (any nested page)
+   │  └─ Update from GitHub     (home only; until Decky store)
    │
    ├─ Voice strip               (hidden on Chat / Member / Live video)
    │  ├─ Live tiles             (only if someone has camera or Go Live)
