@@ -12,8 +12,13 @@ if (internalAPIConnection) {
   }
 }
 
-const callable = (name) => {
-  if (api && api.callable) return api.callable(name);
+const backend = (name) => {
+  if (api && typeof api.call === "function") {
+    return (...args) => api.call(name, ...args);
+  }
+  if (api && typeof api.callable === "function") {
+    return api.callable(name);
+  }
   return async (...args) => {
     if (window.DeckyPluginLoader && window.DeckyPluginLoader.callServerMethod) {
       return window.DeckyPluginLoader.callServerMethod(name, { args });
@@ -22,89 +27,369 @@ const callable = (name) => {
   };
 };
 
-const getStatus = callable("get_status");
-const joinVoice = callable("join_voice");
-const leaveVoice = callable("leave_voice");
-const toggleMute = callable("toggle_mute");
-const toggleDeafen = callable("toggle_deafen");
-const selectText = callable("select_text");
-const getMessages = callable("get_messages");
-const sendMessage = callable("send_message");
-const startVesktop = callable("start_vesktop");
+const getStatus = backend("get_status");
+const joinVoice = backend("join_voice");
+const leaveVoice = backend("leave_voice");
+const toggleMute = backend("toggle_mute");
+const toggleDeafen = backend("toggle_deafen");
+const setInputDevice = backend("set_input_device");
+const setOutputDevice = backend("set_output_device");
+const setUserVolume = backend("set_user_volume");
+const toggleUserMute = backend("toggle_user_mute");
+const setServerMute = backend("set_server_mute");
+const setServerDeaf = backend("set_server_deaf");
+const setInputVolume = backend("set_input_volume");
+const setOutputVolume = backend("set_output_volume");
+const selectText = backend("select_text");
+const getMessages = backend("get_messages");
+const sendMessage = backend("send_message");
+const startVesktop = backend("start_vesktop");
 
 const e = window.SP_REACT.createElement;
-const { useState, useEffect, useCallback } = window.SP_REACT;
+const { useState, useEffect, useCallback, useRef } = window.SP_REACT;
+const Focusable = DFL.Focusable || "div";
+
+const FILL = {
+  width: "100%",
+  maxWidth: "100%",
+  minWidth: 0,
+  boxSizing: "border-box",
+  overflowX: "hidden",
+};
+
+function cx() {
+  if (DFL.joinClassNames) return DFL.joinClassNames.apply(DFL, arguments);
+  return Array.prototype.slice.call(arguments).filter(Boolean).join(" ");
+}
+
+function fieldClass() {
+  const g = DFL.gamepadDialogClasses || {};
+  return cx(g.Field, g.HighlightOnFocus);
+}
 
 function phaseOf(status) {
   if (!status) return "loading";
-  return status.phase || (status.ready ? "ready" : status.logged_in ? "loading" : "loading");
+  return status.phase || (status.ready ? "ready" : "loading");
 }
 
-function Light({ phase, label }) {
-  const color =
-    phase === "ready" ? "#3ddc84" : phase === "login" ? "#ffb020" : "#8b919a";
-  const title = phase === "ready" ? "Ready" : label || "Discord is loading…";
+function mediaUrl(url) {
+  if (!url) return url;
+  let u = String(url);
+  if (u.indexOf("cdn.discordapp.com/attachments") !== -1) {
+    u = u.replace("cdn.discordapp.com/attachments", "media.discordapp.net/attachments");
+  }
+  if (u.indexOf("media.discordapp.net") !== -1) {
+    u += (u.indexOf("?") >= 0 ? "&" : "?") + "width=380&height=380";
+  }
+  return u;
+}
+
+function Avatar({ src, name, size, radius }) {
+  const [bad, setBad] = useState(false);
+  useEffect(() => {
+    setBad(false);
+  }, [src]);
+  const s = size || 36;
+  const r = radius == null ? 8 : radius;
+  const letter = String(name || "?").trim().slice(0, 1).toUpperCase() || "?";
+  if (!src || bad) {
+    return e(
+      "div",
+      {
+        style: {
+          width: s,
+          height: s,
+          minWidth: s,
+          borderRadius: r,
+          background: "rgba(255,255,255,0.12)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontWeight: 700,
+          fontSize: Math.max(12, Math.floor(s * 0.42)),
+          flexShrink: 0,
+        },
+      },
+      letter
+    );
+  }
+  return e("img", {
+    src,
+    alt: "",
+    onError: () => setBad(true),
+    style: {
+      width: s,
+      height: s,
+      minWidth: s,
+      borderRadius: r,
+      objectFit: "cover",
+      flexShrink: 0,
+      background: "rgba(0,0,0,0.35)",
+    },
+  });
+}
+
+function Row({ onClick, children, disabled, style }) {
+  const go = () => {
+    if (disabled || !onClick) return;
+    onClick();
+  };
   return e(
-    "div",
+    Focusable,
     {
+      className: fieldClass(),
+      onActivate: go,
+      onOKButton: go,
+      onClick: go,
       style: {
         display: "flex",
         alignItems: "center",
         gap: 10,
-        padding: "6px 0 10px",
+        width: "100%",
+        maxWidth: "100%",
+        minWidth: 0,
+        boxSizing: "border-box",
+        padding: "10px 4px",
+        margin: 0,
+        opacity: disabled ? 0.5 : 1,
+        overflow: "hidden",
+        ...style,
       },
     },
-    [
-      e("span", {
-        key: "dot",
-        style: {
-          width: 14,
-          height: 14,
-          borderRadius: 14,
-          flexShrink: 0,
-          background: color,
-          boxShadow: phase === "ready" ? "0 0 10px rgba(61,220,132,0.85)" : "none",
-        },
-      }),
-      e(
-        "span",
-        {
-          key: "lbl",
-          style: {
-            fontSize: 18,
-            fontWeight: 650,
-            letterSpacing: 0.2,
-            color: phase === "ready" ? "#3ddc84" : "#fff",
-          },
-        },
-        title
-      ),
-    ]
+    children
   );
 }
 
+function Label({ children, style }) {
+  return e(
+    "div",
+    {
+      style: {
+        minWidth: 0,
+        flex: 1,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        fontSize: 16,
+        fontWeight: 500,
+        lineHeight: 1.25,
+        ...style,
+      },
+    },
+    children
+  );
+}
+
+function Sub({ children }) {
+  return e(
+    "div",
+    {
+      style: {
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        opacity: 0.65,
+        fontSize: 12,
+        marginTop: 2,
+      },
+    },
+    children
+  );
+}
+
+function Media({ item, kind, video }) {
+  const [bad, setBad] = useState(false);
+  if (!item || !item.url) return null;
+  const isVid = kind === "video" || video || (item.type && String(item.type).indexOf("video/") === 0);
+  if (bad) {
+    return e("div", { style: { opacity: 0.7, fontSize: 12, marginTop: 6 } }, item.name || "Can't load media");
+  }
+  if (isVid) {
+    return e("video", {
+      src: item.url,
+      controls: true,
+      playsInline: true,
+      style: {
+        width: "100%",
+        maxWidth: "100%",
+        maxHeight: 180,
+        marginTop: 6,
+        borderRadius: 6,
+        background: "#000",
+        display: "block",
+      },
+      onError: () => setBad(true),
+    });
+  }
+  return e("img", {
+    src: mediaUrl(item.url),
+    alt: item.name || "",
+    style: {
+      width: "100%",
+      maxWidth: "100%",
+      maxHeight: 180,
+      objectFit: "contain",
+      marginTop: 6,
+      borderRadius: 6,
+      background: "rgba(0,0,0,0.35)",
+      display: "block",
+    },
+    onError: () => setBad(true),
+  });
+}
+
+function EmbedView({ embed }) {
+  if (!embed) return null;
+  const kids = [];
+  if (embed.title) kids.push(e("div", { key: "t", style: { fontWeight: 600, fontSize: 13 } }, embed.title));
+  if (embed.description)
+    kids.push(
+      e(
+        "div",
+        { key: "d", style: { fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap", wordBreak: "break-word", marginTop: 2 } },
+        embed.description
+      )
+    );
+  if (embed.video && embed.video.url) {
+    kids.push(
+      e("video", {
+        key: "v",
+        src: embed.video.url,
+        poster: embed.image && embed.image.url,
+        controls: true,
+        autoPlay: embed.type === "gifv",
+        loop: embed.type === "gifv",
+        muted: embed.type === "gifv",
+        playsInline: true,
+        style: { width: "100%", maxWidth: "100%", maxHeight: 180, marginTop: 6, borderRadius: 6, background: "#000", display: "block" },
+      })
+    );
+  } else if (embed.image) {
+    kids.push(e(Media, { key: "i", item: embed.image, kind: "image" }));
+  }
+  if (!kids.length) return null;
+  return e("div", { style: { marginTop: 6, padding: 8, background: "rgba(255,255,255,0.04)", borderRadius: 6 } }, kids);
+}
+
+function MessageBody({ m }) {
+  const kids = [];
+  if (m.content)
+    kids.push(
+      e(
+        "div",
+        { key: "c", style: { fontSize: 14, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word" } },
+        m.content
+      )
+    );
+  (m.attachments || []).forEach((a, i) => {
+    if (a.kind === "image") kids.push(e(Media, { key: "a" + i, item: a, kind: "image" }));
+    else if (a.kind === "video") kids.push(e(Media, { key: "a" + i, item: a, kind: "video" }));
+    else if (a.kind === "audio")
+      kids.push(e("audio", { key: "a" + i, src: a.url, controls: true, style: { width: "100%", marginTop: 6 } }));
+    else kids.push(e("div", { key: "a" + i, style: { fontSize: 12, opacity: 0.75, marginTop: 6 } }, a.name || "attachment"));
+  });
+  (m.embeds || []).forEach((emb, i) => kids.push(e(EmbedView, { key: "e" + i, embed: emb })));
+  (m.stickers || []).forEach((s, i) => {
+    if (s.url) kids.push(e(Media, { key: "s" + i, item: { url: s.url, name: s.name }, kind: "image" }));
+  });
+  if (!kids.length) kids.push(e("div", { key: "empty", style: { opacity: 0.6, fontSize: 13 } }, "(no text)"));
+  return e("div", { style: FILL }, kids);
+}
+
+function ChatComposer({ value, onChange, onSend, disabled }) {
+  const fieldRef = useRef(null);
+  const wrapRef = useRef(null);
+
+  const openKb = () => {
+    const node = fieldRef.current;
+    let input = node && node.m_elInput;
+    if (!input && node && node.querySelector) input = node.querySelector("input, textarea");
+    if (!input && wrapRef.current) input = wrapRef.current.querySelector("input, textarea");
+    if (input) {
+      input.focus();
+      if (typeof input.click === "function") input.click();
+    }
+  };
+
+  const onField = (ev) => {
+    const v = typeof ev === "string" ? ev : (ev && ev.target && ev.target.value) || "";
+    onChange(v);
+  };
+
+  const field = DFL.TextField
+    ? e(DFL.TextField, {
+        ref: fieldRef,
+        label: "Message",
+        description: "Opens the Steam keyboard",
+        value: value || "",
+        focusOnMount: false,
+        onChange: onField,
+      })
+    : e("input", {
+        ref: fieldRef,
+        value: value || "",
+        onChange: (ev) => onChange(ev.target.value),
+        placeholder: "Message",
+        style: { width: "100%", maxWidth: "100%", boxSizing: "border-box", padding: 8 },
+      });
+
+  return e("div", { ref: wrapRef, style: FILL }, [
+    e(Focusable, { key: "tf", onActivate: openKb, onOKButton: openKb, onClick: openKb }, field),
+    e(
+      DFL.PanelSectionRow,
+      { key: "send" },
+      e(
+        DFL.ButtonItem,
+        {
+          layout: "below",
+          disabled: !!disabled || !String(value || "").trim(),
+          onClick: onSend,
+        },
+        "Send"
+      )
+    ),
+  ]);
+}
+
 function App() {
-  const [tab, setTab] = useState("voice");
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const [guildId, setGuildId] = useState(null);
-  const [textId, setTextId] = useState(null);
+  const [stack, setStack] = useState([{ page: "home" }]);
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
-  const [dmMode, setDmMode] = useState(false);
   const [tick, setTick] = useState(0);
+  const [volLocal, setVolLocal] = useState({});
+  const refreshBusy = useRef(false);
+  const tapLock = useRef(0);
+  const volTimer = useRef(null);
+
+  const view = stack[stack.length - 1] || { page: "home" };
+  const push = (page) => setStack((s) => s.concat([page]));
+  const back = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
+
+  const tap = (fn) => {
+    const now = Date.now();
+    if (now - tapLock.current < 250) return;
+    tapLock.current = now;
+    fn();
+  };
 
   const refresh = useCallback(async () => {
+    if (refreshBusy.current) return;
+    refreshBusy.current = true;
     try {
       const s = await getStatus();
       setStatus(s || { phase: "loading", phase_label: "Discord is loading…" });
       if (s && s.ready) setError("");
-      else if (s && s.phase === "login" && s.error) setError(s.error);
+      else if (s && s.error) setError(s.error);
       else setError("");
     } catch (err) {
       setStatus({ phase: "loading", phase_label: "Discord is loading…", vesktop_running: false });
       setError(String(err && err.message ? err.message : err));
+    } finally {
+      refreshBusy.current = false;
     }
   }, []);
 
@@ -118,246 +403,535 @@ function App() {
     return () => clearInterval(id);
   }, [status && status.ready]);
 
+  const chatId = view.page === "chat" ? view.channelId : null;
   useEffect(() => {
-    if (!(status && status.ready) || tab !== "text" || !textId) return;
+    if (!chatId || !(status && status.ready)) return;
     let stop = false;
     const pull = async () => {
       try {
-        const r = await getMessages(textId, 40);
+        const r = await getMessages(chatId, 40);
         if (!stop && r && r.ok) setMessages(r.messages || []);
       } catch (_) {}
     };
     pull();
-    const id = setInterval(pull, 3000);
+    const id = setInterval(pull, 2500);
     return () => {
       stop = true;
       clearInterval(id);
     };
-  }, [tab, textId]);
+  }, [chatId, status && status.ready]);
 
-  const act = async (label, fn) => {
-    const okNow = !!(status && status.ready);
-    if (!okNow && label !== "Starting Discord") return;
-    setBusy(label);
-    setError("");
+  const act = async (label, fn, opts) => {
+    const quiet = opts && opts.quiet;
+    if (!(status && status.ready) && label !== "Starting Discord") return;
+    if (!quiet) {
+      setBusy(label);
+      setError("");
+    }
     try {
       const r = await fn();
       if (r && r.ok === false) setError(r.error || label + " failed");
-      await refresh();
+      if (!opts || !opts.skipRefresh) await refresh();
     } catch (err) {
       setError(String(err && err.message ? err.message : err));
     }
-    setBusy("");
+    if (!quiet) setBusy("");
+  };
+
+  const slideVol = (key, value, fn) => {
+    setVolLocal((prev) => ({ ...prev, [key]: value }));
+    if (volTimer.current) clearTimeout(volTimer.current);
+    volTimer.current = setTimeout(() => {
+      act("Volume", fn, { quiet: true });
+    }, 120);
   };
 
   const phase = phaseOf(status);
   const ready = phase === "ready";
-  const loggedIn = !!(status && status.logged_in);
-  const userName = (status && status.user && (status.user.name || status.user.username)) || "";
   const voice = (status && status.voice) || null;
   const guilds = (status && status.guilds) || [];
   const dms = (status && status.dms) || [];
-  const guild = guilds.find((g) => g.id === guildId) || guilds[0];
-  const currentGuildId = guild ? guild.id : null;
-  const waitHint =
-    phase === "login"
-      ? "On your phone open Discord → Scan QR Code. The light turns green after you are in."
-      : "Wait for the green Ready light. Discord is still starting — joining or sending now will do nothing.";
+  const devices = (status && status.devices) || {};
+  const userName = (status && status.user && (status.user.name || status.user.username)) || "";
 
-  const tabBar = e("div", { style: { display: "flex", gap: "8px", marginBottom: "8px" } }, [
-    e(
-      DFL.ButtonItem,
-      { key: "tv", layout: "below", onClick: () => setTab("voice") },
-      tab === "voice" ? "● Voice" : "Voice"
-    ),
-    e(
-      DFL.ButtonItem,
-      { key: "tt", layout: "below", onClick: () => setTab("text") },
-      tab === "text" ? "● Text" : "Text"
-    ),
+  const openGuild = (g) => tap(() => push({ page: "guild", guildId: g.id, title: g.name }));
+  const openDms = () => tap(() => push({ page: "dms", title: "Direct Messages" }));
+  const openChat = (ch, extra) =>
+    tap(() => {
+      setMessages([]);
+      setDraft("");
+      push({
+        page: "chat",
+        channelId: ch.id,
+        title: ch.name,
+        icon: ch.icon || null,
+        isDm: !!(extra && extra.isDm),
+        guildId: extra && extra.guildId,
+      });
+      act("Open " + ch.name, () => selectText(ch.id), { quiet: true });
+    });
+  const openDevices = () => tap(() => push({ page: "devices", title: "Audio" }));
+  const openMember = (m) =>
+    tap(() =>
+      push({
+        page: "member",
+        userId: m.id,
+        title: m.name,
+        avatar: m.avatar,
+        self: !!m.self,
+      })
+    );
+  const join = (ch) => tap(() => act("Join " + ch.name, () => joinVoice(ch.id, ch.name)));
+
+  const memberById = (id) => {
+    const lists = [];
+    if (voice && voice.members) lists.push(voice.members);
+    guilds.forEach((g) => (g.voice || []).forEach((c) => lists.push(c.members || [])));
+    for (let i = 0; i < lists.length; i++) {
+      const found = lists[i].find((m) => m.id === id);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const navHeader = e(DFL.PanelSection, { title: "Deckscord" }, [
+    e(DFL.PanelSectionRow, { key: "st" }, e("div", { style: FILL }, (status && status.phase_label) || (ready ? "Ready" : "Discord is loading…"))),
+    view.page !== "home"
+      ? e(DFL.PanelSectionRow, { key: "back" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(back) }, "Back"))
+      : null,
+    error ? e(DFL.PanelSectionRow, { key: "err" }, e("div", { style: { color: "#e4b44c", fontSize: 13 } }, error)) : null,
+    busy ? e(DFL.PanelSectionRow, { key: "busy" }, e("div", { style: { opacity: 0.7, fontSize: 12 } }, busy + "…")) : null,
   ]);
 
-  const statusLine = e("div", { style: { width: "100%" } }, [
-    e(Light, {
-      key: "light",
-      phase,
-      label: (status && status.phase_label) || (ready ? "Ready" : "Discord is loading…"),
-    }),
+  const outVol =
+    volLocal.output != null ? volLocal.output : devices.outputVolume != null ? devices.outputVolume : 100;
+  const inVol = volLocal.input != null ? volLocal.input : devices.inputVolume != null ? devices.inputVolume : 100;
+
+  const voiceSection =
     ready &&
+    e(DFL.PanelSection, { title: voice ? "Voice · " + voice.name : "Voice" }, [
+      voice
+        ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())) }, "Leave voice"))
+        : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
       e(
-        "div",
-        { key: "meta", style: { opacity: 0.8, fontSize: 13, marginTop: -4, marginBottom: 8 } },
-        `${userName}${status.muted ? "  ·  muted" : ""}${status.deafened ? "  ·  deafened" : ""}${voice ? "  ·  " + voice.name : "  ·  not in voice"}`
+        DFL.PanelSectionRow,
+        { key: "mute" },
+        e(DFL.ToggleField, {
+          label: "Mute",
+          description: "Microphone",
+          checked: !!(status && status.muted),
+          onChange: () => tap(() => act("Mute", () => toggleMute())),
+        })
       ),
-    !ready &&
-      e("div", { key: "wait", style: { opacity: 0.8, fontSize: 13, lineHeight: 1.4, marginBottom: 8 } }, waitHint),
-    error && phase === "login" && e("div", { key: "err", style: { color: "#ffb020", fontSize: 13, marginBottom: 8 } }, error),
-    busy && e("div", { key: "busy", style: { opacity: 0.7, fontSize: 13 } }, busy + "…"),
-  ]);
-
-  const startRow =
-    phase === "starting" || (status && status.vesktop_state === "failed")
-      ? e(DFL.PanelSectionRow, null,
-          e(DFL.ButtonItem, { layout: "below", onClick: () => act("Starting Discord", () => startVesktop()) }, "Start Discord")
-        )
-      : null;
+      e(
+        DFL.PanelSectionRow,
+        { key: "deaf" },
+        e(DFL.ToggleField, {
+          label: "Deafen",
+          description: "Speakers and microphone",
+          checked: !!(status && status.deafened),
+          onChange: () => tap(() => act("Deafen", () => toggleDeafen())),
+        })
+      ),
+      e(
+        DFL.PanelSectionRow,
+        { key: "ovol" },
+        e(DFL.SliderField, {
+          label: "Output volume",
+          value: outVol,
+          min: 0,
+          max: 200,
+          step: 5,
+          showValue: true,
+          valueSuffix: "%",
+          onChange: (v) => slideVol("output", v, () => setOutputVolume(v)),
+        })
+      ),
+      e(
+        DFL.PanelSectionRow,
+        { key: "ivol" },
+        e(DFL.SliderField, {
+          label: "Input volume",
+          value: inVol,
+          min: 0,
+          max: 200,
+          step: 5,
+          showValue: true,
+          valueSuffix: "%",
+          onChange: (v) => slideVol("input", v, () => setInputVolume(v)),
+        })
+      ),
+      e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices }, "Input / output devices")),
+      voice && voice.members && voice.members.length
+        ? voice.members.map((m) =>
+            e(
+              Row,
+              { key: m.id, onClick: () => openMember(m) },
+              [
+                e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 32, radius: 16 }),
+                e(
+                  "div",
+                  { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } },
+                  [
+                    e(Label, null, m.name + (m.self ? " (you)" : "")),
+                    e(
+                      Sub,
+                      null,
+                      [
+                        m.localMute || m.muted ? "muted" : "",
+                        m.deaf ? "deaf" : "",
+                        "vol " + Math.round(volLocal["u" + m.id] != null ? volLocal["u" + m.id] : m.volume != null ? m.volume : 100) + "%",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
+                    ),
+                  ]
+                ),
+                e("div", { key: "sp", style: { fontSize: 18, flexShrink: 0, opacity: 0.9 } }, "🔊"),
+              ]
+            )
+          )
+        : null,
+    ]);
 
   let body = null;
 
   if (!ready) {
     const qr = status && status.qr_png;
+    const waitHint =
+      phase === "login"
+        ? "On your phone open Discord → Scan QR Code."
+        : "Wait for Discord to finish starting.";
     body = e(DFL.PanelSection, { title: phase === "login" ? "Scan to log in" : "Please wait" }, [
-      e(DFL.PanelSectionRow, null,
-        e("div", { style: { opacity: 0.85, fontSize: 14, lineHeight: 1.45, marginBottom: 8 } }, waitHint)
-      ),
+      e(DFL.PanelSectionRow, { key: "h" }, e("div", { style: { fontSize: 14, lineHeight: 1.4, opacity: 0.85 } }, waitHint)),
       qr &&
-        e(DFL.PanelSectionRow, null,
-          e("div", { style: { width: "100%", display: "flex", justifyContent: "center", padding: "8px 0 12px" } },
+        e(
+          DFL.PanelSectionRow,
+          { key: "qr" },
+          e(
+            "div",
+            { style: { ...FILL, display: "flex", justifyContent: "center", padding: "8px 0" } },
             e("img", {
               src: qr,
               alt: "Discord login QR",
               style: {
-                width: 220,
-                height: 220,
+                width: 200,
+                height: 200,
+                maxWidth: "100%",
                 background: "#fff",
                 borderRadius: 12,
-                padding: 10,
+                padding: 8,
                 boxSizing: "content-box",
-                imageRendering: "pixelated",
               },
             })
           )
         ),
-      phase === "login" && !qr &&
-        e(DFL.PanelSectionRow, null,
-          e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Waiting for the Discord QR…")
-        ),
+      (phase === "starting" || (status && status.vesktop_state === "failed")) &&
+        e(DFL.PanelSectionRow, { key: "start" }, e(DFL.ButtonItem, { layout: "below", onClick: () => act("Starting Discord", () => startVesktop()) }, "Start Discord")),
     ]);
-  } else if (tab === "voice") {
-    const memberList = (voice && voice.members && voice.members.length)
-      ? voice.members.map((m) =>
-          e("div", { key: m.id, style: { padding: "4px 0", opacity: m.self ? 1 : 0.9 } },
-            `${m.self ? "● " : "○ "}${m.name}${m.muted ? " (muted)" : ""}${m.deaf ? " (deaf)" : ""}`)
-        )
-      : e("div", { style: { opacity: 0.6 } }, "No one in voice.");
-
-    const voiceBtns = e(DFL.PanelSectionRow, null, e("div", { style: { display: "flex", flexDirection: "column", gap: 4, width: "100%" } }, [
-      e(DFL.ButtonItem, { layout: "below", onClick: () => act("Mute", () => toggleMute()) }, status && status.muted ? "Unmute" : "Mute"),
-      e(DFL.ButtonItem, { layout: "below", onClick: () => act("Deafen", () => toggleDeafen()) }, status && status.deafened ? "Undeafen" : "Deafen"),
-      e(DFL.ButtonItem, { layout: "below", disabled: !voice, onClick: () => act("Leave", () => leaveVoice()) }, "Leave voice"),
-    ]));
-
-    const serverBtns = guilds.slice(0, 24).map((g) =>
-      e(DFL.ButtonItem, {
-        key: g.id,
-        layout: "below",
-        onClick: () => { setGuildId(g.id); setDmMode(false); },
-      }, (currentGuildId === g.id ? "● " : "") + g.name)
-    );
-
-    const channels = ((guild && guild.voice) || []).map((c) =>
-      e(DFL.ButtonItem, {
-        key: c.id,
-        layout: "below",
-        onClick: () => act("Join " + c.name, () => joinVoice(c.id, c.name)),
-      }, (voice && voice.channelId === c.id ? "● " : "# ") + c.name)
-    );
-
-    body = e("div", null, [
-      e(DFL.PanelSection, { title: voice ? ("In voice · " + voice.name) : "In voice" }, [
-        voiceBtns,
-        e(DFL.PanelSectionRow, null, e("div", { style: { width: "100%" } }, memberList)),
-      ]),
-      e(DFL.PanelSection, { title: "Servers" }, serverBtns.length ? serverBtns.map((b, i) => e(DFL.PanelSectionRow, { key: "s" + i }, b)) : e(DFL.PanelSectionRow, null, e("div", { style: { opacity: 0.6 } }, "No servers yet."))),
-      e(DFL.PanelSection, { title: guild ? (guild.name + " · voice") : "Voice channels" },
-        channels.length ? channels.map((b, i) => e(DFL.PanelSectionRow, { key: "v" + i }, b)) : e(DFL.PanelSectionRow, null, e("div", { style: { opacity: 0.6 } }, "Pick a server."))
+  } else if (view.page === "home") {
+    body = e(DFL.PanelSection, { title: userName ? "Servers · " + userName : "Servers" }, [
+      e(
+        Row,
+        { key: "dms", onClick: openDms },
+        [
+          e(Avatar, { key: "a", name: "DM", size: 36, radius: 18 }),
+          e("div", { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } }, [
+            e(Label, null, "Direct Messages"),
+            e(Sub, null, dms.length ? dms.length + " conversations" : "Friends & group chats"),
+          ]),
+        ]
       ),
-    ]);
-  } else {
-    const serverBtns = [
-      e(DFL.ButtonItem, { key: "dms", layout: "below", onClick: () => { setDmMode(true); setGuildId(null); } }, (dmMode ? "● " : "") + "Direct messages"),
-    ].concat(guilds.slice(0, 24).map((g) =>
-      e(DFL.ButtonItem, {
-        key: g.id,
-        layout: "below",
-        onClick: () => { setGuildId(g.id); setDmMode(false); },
-      }, (!dmMode && currentGuildId === g.id ? "● " : "") + g.name)
-    ));
-
-    const textChans = dmMode ? dms : ((guild && guild.text) || []);
-    const chanBtns = textChans.map((c) =>
-      e(DFL.ButtonItem, {
-        key: c.id,
-        layout: "below",
-        onClick: () => {
-          setTextId(c.id);
-          act("Open " + c.name, () => selectText(c.id));
-        },
-      }, (textId === c.id ? "● " : "# ") + c.name)
-    );
-
-    const msgView = e("div", {
-      style: {
-        maxHeight: 220,
-        overflow: "auto",
-        background: "rgba(0,0,0,0.25)",
-        borderRadius: 6,
-        padding: 8,
-        fontSize: 13,
-        lineHeight: 1.35,
-        width: "100%",
-      },
-    }, (messages.length ? messages : [{ id: "empty", author: "", content: textId ? "No messages loaded yet." : "Pick a channel." }]).map((m) =>
-      e("div", { key: m.id, style: { marginBottom: 8 } }, [
-        m.author && e("div", { style: { fontWeight: 600, opacity: 0.9 } }, m.author),
-        e("div", { style: { opacity: 0.95, whiteSpace: "pre-wrap" } }, m.content || (m.author ? "(attachment / embed)" : "")),
-      ])
-    ));
-
-    const composer = e("div", { style: { width: "100%" } }, [
-      DFL.TextField
-        ? e(DFL.TextField, {
-            label: "Message",
-            value: draft,
-            onChange: (v) => setDraft(typeof v === "string" ? v : (v && v.target && v.target.value) || ""),
+      guilds.length
+        ? guilds.map((g) => {
+            const inHere = voice && String(voice.guildId) === String(g.id);
+            const nVoice = (g.voice || []).reduce((n, c) => n + ((c.members && c.members.length) || 0), 0);
+            return e(
+              Row,
+              { key: g.id, onClick: () => openGuild(g) },
+              [
+                e(Avatar, { key: "a", src: g.icon, name: g.name, size: 36, radius: 10 }),
+                e("div", { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } }, [
+                  e(Label, null, g.name),
+                  e(
+                    Sub,
+                    null,
+                    inHere ? "In voice · " + voice.name : nVoice ? nVoice + " in voice" : (g.text || []).length + " text · " + (g.voice || []).length + " voice"
+                  ),
+                ]),
+              ]
+            );
           })
-        : e("input", {
-            value: draft,
-            onChange: (ev) => setDraft(ev.target.value),
-            placeholder: "Message…",
-            style: { width: "100%", padding: 8, background: "#111", color: "#fff", border: "1px solid #333", borderRadius: 4 },
-          }),
-      e(DFL.ButtonItem, {
-        layout: "below",
-        disabled: !textId || !draft.trim(),
-        onClick: () => {
-          const c = draft;
-          setDraft("");
-          act("Send", () => sendMessage(textId, c));
-        },
-      }, "Send"),
+        : e(DFL.PanelSectionRow, { key: "none" }, e("div", { style: { opacity: 0.65 } }, "No servers yet.")),
     ]);
-
-    body = e("div", null, [
-      e(DFL.PanelSection, { title: "Servers & DMs" }, serverBtns.map((b, i) => e(DFL.PanelSectionRow, { key: "t" + i }, b))),
-      e(DFL.PanelSection, { title: dmMode ? "Direct messages" : (guild ? guild.name + " · text" : "Text channels") },
-        chanBtns.length ? chanBtns.map((b, i) => e(DFL.PanelSectionRow, { key: "c" + i }, b)) : e(DFL.PanelSectionRow, null, e("div", { style: { opacity: 0.6 } }, "Nothing here."))
+  } else if (view.page === "dms") {
+    body = e(
+      DFL.PanelSection,
+      { title: "Direct Messages" },
+      dms.length
+        ? dms.map((c) =>
+            e(
+              Row,
+              { key: c.id, onClick: () => openChat(c, { isDm: true }) },
+              [
+                e(Avatar, { key: "a", src: c.icon, name: c.name, size: 36, radius: 18 }),
+                e("div", { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } }, [
+                  e(Label, null, c.name),
+                  e(Sub, null, c.type === 3 ? "Group DM" : "Direct message"),
+                ]),
+              ]
+            )
+          )
+        : e(DFL.PanelSectionRow, null, e("div", { style: { opacity: 0.65 } }, "No conversations."))
+    );
+  } else if (view.page === "guild") {
+    const guild = guilds.find((g) => g.id === view.guildId) || guilds[0];
+    const text = (guild && guild.text) || [];
+    const vcs = (guild && guild.voice) || [];
+    body = e("div", { style: FILL }, [
+      e(
+        DFL.PanelSection,
+        { title: "Text" },
+        text.length
+          ? text.map((c) =>
+              e(
+                Row,
+                { key: "t" + c.id, onClick: () => openChat(c, { guildId: guild && guild.id }) },
+                [e("div", { key: "h", style: { width: 18, opacity: 0.6, flexShrink: 0 } }, "#"), e(Label, { key: "n" }, c.name)]
+              )
+            )
+          : e(DFL.PanelSectionRow, { key: "nt" }, e("div", { style: { opacity: 0.65 } }, "No text channels."))
       ),
-      e(DFL.PanelSection, { title: "Chat" }, [
-        e(DFL.PanelSectionRow, null, msgView),
-        e(DFL.PanelSectionRow, null, composer),
+      e(
+        DFL.PanelSection,
+        { title: "Voice" },
+        vcs.length
+          ? vcs.map((c) => {
+              const here = voice && voice.channelId === c.id;
+              const people = c.members || [];
+              return e("div", { key: "v" + c.id, style: FILL }, [
+                e(
+                  Row,
+                  { onClick: () => join(c) },
+                  [
+                    e("div", { key: "h", style: { width: 22, flexShrink: 0 } }, "🔊"),
+                    e("div", { key: "n", style: { minWidth: 0, flex: 1, overflow: "hidden" } }, [
+                      e(Label, null, c.name),
+                      e(Sub, null, here ? "Connected — tap to stay" : people.length ? people.length + " in channel" : "Tap to join"),
+                    ]),
+                  ]
+                ),
+                people.map((m) =>
+                  e(
+                    Row,
+                    { key: m.id, onClick: () => openMember(m), style: { paddingLeft: 28 } },
+                    [
+                      e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 28, radius: 14 }),
+                      e(Label, { key: "n", style: { fontSize: 14 } }, m.name + (m.self ? " (you)" : "")),
+                      e("div", { key: "sp", style: { fontSize: 16, flexShrink: 0 } }, "🔊"),
+                    ]
+                  )
+                ),
+              ]);
+            })
+          : e(DFL.PanelSectionRow, { key: "nv" }, e("div", { style: { opacity: 0.65 } }, "No voice channels."))
+      ),
+    ]);
+  } else if (view.page === "chat") {
+    const composer = e(ChatComposer, {
+      value: draft,
+      onChange: setDraft,
+      disabled: !view.channelId,
+      onSend: () => {
+        if (!view.channelId || !draft.trim()) return;
+        const c = draft;
+        setDraft("");
+        act("Send", () => sendMessage(view.channelId, c));
+      },
+    });
+    const msgList = e(
+      "div",
+      {
+        style: {
+          ...FILL,
+          maxHeight: 320,
+          overflowY: "auto",
+          overflowX: "hidden",
+          padding: "4px 0 8px",
+        },
+      },
+      (messages.length ? messages : [{ id: "empty", author: "", content: "No messages yet." }]).map((m) =>
+        e(
+          "div",
+          { key: m.id, style: { ...FILL, marginBottom: 12 } },
+          [
+            m.author &&
+              e(
+                "div",
+                { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4 } },
+                [
+                  e(Avatar, { key: "a", src: m.avatar, name: m.author, size: 22, radius: 11 }),
+                  e("div", { key: "n", style: { fontWeight: 600, fontSize: 13 } }, m.author),
+                ]
+              ),
+            e(MessageBody, { m }),
+          ]
+        )
+      )
+    );
+    body = e("div", { style: FILL }, [
+      e(DFL.PanelSection, { title: "#" + (view.title || "chat") }, [
+        view.isDm &&
+          e(
+            DFL.PanelSectionRow,
+            { key: "call" },
+            e(
+              DFL.ButtonItem,
+              {
+                layout: "below",
+                onClick: () => join({ id: view.channelId, name: view.title || "Call" }),
+              },
+              voice && voice.channelId === view.channelId ? "In call" : "Start voice call"
+            )
+          ),
+        e("div", { key: "compose", style: FILL }, composer),
       ]),
+      e(DFL.PanelSection, { title: "Messages" }, e(DFL.PanelSectionRow, null, msgList)),
+    ]);
+  } else if (view.page === "devices") {
+    const inList = devices.input || [];
+    const outList = devices.output || [];
+    body = e("div", { style: FILL }, [
+      e(
+        DFL.PanelSection,
+        { title: "Input" },
+        (inList.length ? inList : [{ id: "", name: "No input devices" }]).map((d) =>
+          e(
+            DFL.PanelSectionRow,
+            { key: "i" + d.id },
+            e(
+              DFL.ButtonItem,
+              {
+                layout: "below",
+                disabled: !d.id,
+                onClick: d.id ? () => act("Input", () => setInputDevice(d.id)) : undefined,
+              },
+              (d.id && d.id === devices.inputId ? "● " : "") + d.name
+            )
+          )
+        )
+      ),
+      e(
+        DFL.PanelSection,
+        { title: "Output" },
+        (outList.length ? outList : [{ id: "", name: "No output devices" }]).map((d) =>
+          e(
+            DFL.PanelSectionRow,
+            { key: "o" + d.id },
+            e(
+              DFL.ButtonItem,
+              {
+                layout: "below",
+                disabled: !d.id,
+                onClick: d.id ? () => act("Output", () => setOutputDevice(d.id)) : undefined,
+              },
+              (d.id && d.id === devices.outputId ? "● " : "") + d.name
+            )
+          )
+        )
+      ),
+    ]);
+  } else if (view.page === "member") {
+    const live = memberById(view.userId) || {};
+    const guildId = voice && voice.guildId;
+    const volKey = "u" + view.userId;
+    const vol = volLocal[volKey] != null ? volLocal[volKey] : live.volume != null ? live.volume : 100;
+    body = e(DFL.PanelSection, { title: view.title || "User" }, [
+      e(
+        DFL.PanelSectionRow,
+        { key: "who" },
+        e(
+          "div",
+          { style: { display: "flex", alignItems: "center", gap: 10 } },
+          [e(Avatar, { src: view.avatar || live.avatar, name: view.title, size: 40, radius: 20 }), e(Label, null, (view.title || "") + (view.self ? " (you)" : ""))]
+        )
+      ),
+      !view.self &&
+        e(
+          DFL.PanelSectionRow,
+          { key: "vol" },
+          e(DFL.SliderField, {
+            label: "Volume",
+            description: "How loud they are for you",
+            value: vol,
+            min: 0,
+            max: 200,
+            step: 5,
+            showValue: true,
+            valueSuffix: "%",
+            onChange: (v) => slideVol(volKey, v, () => setUserVolume(view.userId, v)),
+          })
+        ),
+      !view.self &&
+        e(
+          DFL.PanelSectionRow,
+          { key: "lm" },
+          e(DFL.ToggleField, {
+            label: "Mute for me",
+            description: "You won't hear them",
+            checked: !!live.localMute,
+            onChange: () => act("Mute user", () => toggleUserMute(view.userId)),
+          })
+        ),
+      !view.self &&
+        guildId &&
+        e(
+          DFL.PanelSectionRow,
+          { key: "sm" },
+          e(
+            DFL.ButtonItem,
+            {
+              layout: "below",
+              description: "Server mute (needs permission)",
+              onClick: () => act("Server mute", () => setServerMute(guildId, view.userId, !live.muted)),
+            },
+            live.muted ? "Unmute on server" : "Mute on server"
+          )
+        ),
+      !view.self &&
+        guildId &&
+        e(
+          DFL.PanelSectionRow,
+          { key: "sd" },
+          e(
+            DFL.ButtonItem,
+            {
+              layout: "below",
+              description: "Server deafen (needs permission)",
+              onClick: () => act("Server deafen", () => setServerDeaf(guildId, view.userId, !live.deaf)),
+            },
+            live.deaf ? "Undeafen on server" : "Deafen on server"
+          )
+        ),
+      view.self && e(DFL.PanelSectionRow, { key: "self" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "This is you. Use Mute / Deafen in Voice.")),
     ]);
   }
 
-  return e("div", null, [
-    e(DFL.PanelSection, { title: "Deckscord" }, [
-      e(DFL.PanelSectionRow, null, statusLine),
-      ready ? e(DFL.PanelSectionRow, null, tabBar) : null,
-      startRow,
-    ]),
-    body,
-  ]);
+  return e(
+    "div",
+    { className: "deckscord-root", style: { ...FILL, paddingBottom: 8 } },
+    [
+      e(
+        "style",
+        { key: "css" },
+        ".deckscord-root{width:100%!important;max-width:100%!important;overflow-x:hidden;box-sizing:border-box}" +
+          ".deckscord-root input,.deckscord-root textarea,.deckscord-root video,.deckscord-root img{max-width:100%}"
+      ),
+      navHeader,
+      voiceSection,
+      body,
+    ]
+  );
 }
 
 export default DFL.definePlugin(() => ({

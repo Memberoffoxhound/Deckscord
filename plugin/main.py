@@ -25,9 +25,48 @@ BRIDGE_PATH = PLUGIN_DIR / "bridge.js"
 DATA_DIR = Path.home() / ".local" / "share" / "deckscord"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# PluginLoader is a PyInstaller binary. Child plugin processes inherit
+# LD_LIBRARY_PATH=/tmp/_MEI... which makes systemctl (and other host
+# binaries) fail to load libcrypto. Also no XDG_RUNTIME_DIR / D-Bus.
+_PYI_KEYS = (
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_LINUX_PROCESS_NAME",
+)
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _PYI_KEYS}
+    uid = os.getuid()
+    runtime = f"/run/user/{uid}"
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env.get("PATH") or "")
+    try:
+        home = str(Path.home())
+    except Exception:
+        home = f"/home/{os.environ.get('USER', 'bazzite')}"
+    env.setdefault("HOME", home)
+    env.setdefault("USER", Path(home).name)
+    env.setdefault("XDG_RUNTIME_DIR", runtime)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
+    return env
+
 
 def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=_subprocess_env(),
+    )
+
+
+def _systemctl(*args: str, timeout: int = 8) -> subprocess.CompletedProcess:
+    return _run(["/usr/bin/systemctl", "--user", *args], timeout=timeout)
 
 
 class Cdp:
@@ -153,6 +192,8 @@ class Cdp:
         except Exception as e:
             decky.logger.error(f"CDP recv: {e}")
         finally:
+            self._writer = None
+            self._reader = None
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(ConnectionError("CDP disconnected"))
@@ -246,37 +287,40 @@ class Plugin:
         self.cdp = Cdp()
         self._bridge_hash = ""
         self._injecting = asyncio.Lock()
+        self._status_lock = asyncio.Lock()
         self._can_hide_window = True
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
-        await self._ensure_vesktop(wait=True)
         try:
-            await self._ensure_cdp()
+            svc = await self._ensure_vesktop(wait=True)
+            decky.logger.info(f"vesktop service: {svc}")
         except Exception as e:
-            decky.logger.warning(f"CDP not ready yet: {e}")
+            decky.logger.warning(f"vesktop start: {e}")
 
     async def _unload(self) -> None:
         await self.cdp.close()
 
     async def _ensure_vesktop(self, wait: bool = False) -> dict[str, Any]:
         try:
-            r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+            r = _systemctl("is-active", SERVICE, timeout=5)
             state = (r.stdout or "").strip() or "inactive"
+            if r.returncode != 0 and (r.stderr or "").strip():
+                decky.logger.warning(f"systemctl is-active: {r.stderr.strip()[:300]}")
             if state not in ("active", "activating"):
-                _run(["systemctl", "--user", "start", SERVICE], timeout=10)
-                r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+                _systemctl("start", SERVICE, timeout=10)
+                r = _systemctl("is-active", SERVICE, timeout=5)
                 state = (r.stdout or "").strip() or "inactive"
             if wait and state != "active":
                 await asyncio.sleep(2)
-                r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+                r = _systemctl("is-active", SERVICE, timeout=5)
                 state = (r.stdout or "").strip() or "inactive"
             return {"running": state == "active", "state": state}
         except Exception as e:
             decky.logger.error(f"vesktop service: {e}")
             return {"running": False, "state": "failed", "error": str(e)}
 
-    async def _ensure_cdp(self, inject: bool = True, attempts: int = 8) -> None:
+    async def _ensure_cdp(self, inject: bool = True, attempts: int = 8, hide: bool = False) -> None:
         want = None
         try:
             want = _pick_target(_cdp_targets())
@@ -294,7 +338,8 @@ class Plugin:
                             await self._inject_bridge()
                         except Exception:
                             pass
-                    await self._hide_window()
+                    if hide:
+                        await self._hide_window()
                     return
             except Exception:
                 await self.cdp.close()
@@ -311,7 +356,8 @@ class Plugin:
                         await self._inject_bridge()
                     except Exception:
                         pass
-                await self._hide_window()
+                if hide:
+                    await self._hide_window()
                 return
             except Exception as e:
                 last_err = e
@@ -388,34 +434,15 @@ class Plugin:
         return isinstance(r, dict) and r.get("ok") is True
 
     async def _grab_login_qr(self) -> Optional[str]:
-        js = """
-        (function(){
-          try {
-            var canvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
-            var square = canvases.filter(function(x){
-              return x.width >= 120 && x.height >= 120 && x.width === x.height && x.width <= 512;
-            });
-            var c = square[0]
-                 || canvases.find(function(x){ return Math.min(x.width, x.height) >= 120 && Math.max(x.width, x.height) <= 512; })
-                 || canvases.find(function(x){ return Math.min(x.offsetWidth, x.offsetHeight) >= 120 && Math.max(x.offsetWidth, x.offsetHeight) <= 512; });
-            if (!c) return {ok:false, error:'no qr canvas'};
-            var png = c.toDataURL('image/png');
-            if (!png || png.length < 80) return {ok:false, error:'empty canvas'};
-            return {ok:true, png:png, w:c.width, h:c.height};
-          } catch (e) {
-            return {ok:false, error:String(e && e.message ? e.message : e)};
-          }
-        })()
-        """
-        r = await self._eval(js)
-        if isinstance(r, dict) and r.get("ok") and r.get("png"):
-            return str(r["png"])
+        # Discord login QR is an SVG inside [aria-label*="QR"], not the hidden
+        # 240x240 fingerprint canvas (toDataURL of that is a dummy pattern).
         clip = await self._eval(
             """
             (function(){
               var el = document.querySelector('[aria-label*="QR code"]')
-                    || document.querySelector('[class*="qrCode"]')
-                    || document.querySelector('canvas');
+                    || document.querySelector('[class*="qrCodeContainer"]')
+                    || document.querySelector('[class*="qrCode"] svg')
+                    || document.querySelector('[class*="qrCode"]');
               if (!el) return null;
               var r = el.getBoundingClientRect();
               if (r.width < 80 || r.height < 80) return null;
@@ -450,41 +477,52 @@ class Plugin:
     # ---- Decky-callable -------------------------------------------------
 
     async def get_status(self) -> dict[str, Any]:
-        svc = await self._ensure_vesktop(wait=False)
-        running = bool(svc.get("running"))
-        state = svc.get("state") or "inactive"
+        async with self._status_lock:
+            return await self._get_status_unlocked()
+
+    async def _get_status_unlocked(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "vesktop_running": running,
-            "vesktop_state": state,
+            "vesktop_running": False,
+            "vesktop_state": "unknown",
             "cdp": False,
             "logged_in": False,
             "ready": False,
             "phase": "starting",
             "phase_label": "Starting Discord…",
         }
-        if state == "activating" or (not running and state != "failed"):
-            out["phase"] = "loading"
-            out["phase_label"] = "Discord is loading…"
-            return out
-        if not running:
-            out["phase"] = "starting"
-            out["phase_label"] = "Starting Discord…"
-            if svc.get("error"):
-                out["error"] = svc["error"]
-            return out
 
+        targets: Optional[list] = None
         try:
             targets = _cdp_targets()
         except Exception:
-            out["phase"] = "loading"
-            out["phase_label"] = "Discord is loading…"
-            return out
+            targets = None
+
+        if not targets:
+            svc = await self._ensure_vesktop(wait=False)
+            out["vesktop_running"] = bool(svc.get("running"))
+            out["vesktop_state"] = svc.get("state") or "inactive"
+            if svc.get("error"):
+                out["error"] = svc["error"]
+            try:
+                targets = _cdp_targets()
+            except Exception:
+                targets = None
+            if not targets:
+                if out["vesktop_state"] in ("active", "activating") or out["vesktop_running"]:
+                    out["phase"] = "loading"
+                    out["phase_label"] = "Discord is loading…"
+                else:
+                    out["phase"] = "starting"
+                    out["phase_label"] = "Starting Discord…"
+                return out
 
         out["cdp"] = True
+        out["vesktop_running"] = True
+        out["vesktop_state"] = "active"
         blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
         if "first-launch" in blob or "vesktop://static" in blob:
             try:
-                await self._ensure_cdp(inject=False, attempts=2)
+                await self._ensure_cdp(inject=False, attempts=2, hide=False)
                 if "first-launch" in blob:
                     await self._submit_first_launch()
             except Exception as e:
@@ -498,7 +536,7 @@ class Plugin:
             out["phase"] = "login"
             out["phase_label"] = "Scan QR to log in"
             try:
-                await self._ensure_cdp(inject=False, attempts=2)
+                await self._ensure_cdp(inject=False, attempts=2, hide=False)
                 qr = await self._grab_login_qr()
                 if qr:
                     out["qr_png"] = qr
@@ -508,6 +546,8 @@ class Plugin:
             except Exception as e:
                 decky.logger.warning(f"login QR: {e}")
                 out["phase_label"] = "Waiting for login QR…"
+                out["error"] = str(e)
+            decky.logger.info(f"login phase qr={bool(out.get('qr_png'))}")
             return out
 
         try:
@@ -515,7 +555,7 @@ class Plugin:
         except Exception as e:
             # Discord may still be on login even if the URL hasn't settled.
             try:
-                await self._ensure_cdp(inject=False, attempts=2)
+                await self._ensure_cdp(inject=False, attempts=2, hide=False)
                 href = str(await self._eval("location.href") or "")
                 qr = await self._grab_login_qr()
                 if qr or "discord.com/login" in href:
@@ -542,6 +582,10 @@ class Plugin:
             if isinstance(user, dict):
                 name = user.get("name") or user.get("username") or ""
             out["phase_label"] = f"Ready{(' · ' + name) if name else ''}"
+            try:
+                await self._hide_window()
+            except Exception:
+                pass
         elif out.get("booting") or not on_login:
             # Logged-in session is still hydrating UserStore — keep waiting, don't
             # bounce back to the QR screen.
@@ -560,33 +604,116 @@ class Plugin:
                 pass
         return out
 
-    async def join_voice(self, channel_id: str, channel_name: str = "") -> dict[str, Any]:
-        r = await self._bridge(f"joinVoice({json.dumps(channel_id)})")
+    def _ok(self, r: Any) -> dict[str, Any]:
         return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
+    async def join_voice(self, channel_id: str = "", channel_name: str = "", **kwargs: Any) -> dict[str, Any]:
+        cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")
+        decky.logger.info(f"join_voice {cid} {channel_name}")
+        if not cid:
+            return {"ok": False, "error": "missing channel_id"}
+        r = await self._bridge(f"joinVoice({json.dumps(cid)})")
+        decky.logger.info(f"join_voice result {r}")
+        return self._ok(r)
+
     async def leave_voice(self) -> dict[str, Any]:
+        decky.logger.info("leave_voice")
         r = await self._bridge("leaveVoice()")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+        decky.logger.info(f"leave_voice result {r}")
+        return self._ok(r)
 
     async def toggle_mute(self) -> dict[str, Any]:
         r = await self._bridge("toggleMute()")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+        decky.logger.info(f"toggle_mute result {r}")
+        return self._ok(r)
 
     async def toggle_deafen(self) -> dict[str, Any]:
         r = await self._bridge("toggleDeafen()")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+        decky.logger.info(f"toggle_deafen result {r}")
+        return self._ok(r)
 
-    async def select_text(self, channel_id: str) -> dict[str, Any]:
-        r = await self._bridge(f"selectText({json.dumps(channel_id)})")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+    async def set_input_device(self, device_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        did = str(device_id or kwargs.get("device_id") or kwargs.get("id") or "")
+        decky.logger.info(f"set_input_device {did}")
+        if not did:
+            return {"ok": False, "error": "missing device_id"}
+        r = await self._bridge(f"setInputDevice({json.dumps(did)})")
+        return self._ok(r)
 
-    async def get_messages(self, channel_id: str, limit: int = 40) -> dict[str, Any]:
-        r = await self._bridge(f"getMessages({json.dumps(channel_id)}, {int(limit)})")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+    async def set_output_device(self, device_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        did = str(device_id or kwargs.get("device_id") or kwargs.get("id") or "")
+        decky.logger.info(f"set_output_device {did}")
+        if not did:
+            return {"ok": False, "error": "missing device_id"}
+        r = await self._bridge(f"setOutputDevice({json.dumps(did)})")
+        return self._ok(r)
 
-    async def send_message(self, channel_id: str, content: str) -> dict[str, Any]:
-        r = await self._bridge(f"sendMessage({json.dumps(channel_id)}, {json.dumps(content)})")
-        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+    async def set_user_volume(self, user_id: str = "", volume: float = 100, **kwargs: Any) -> dict[str, Any]:
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        vol = kwargs.get("volume", volume)
+        if not uid:
+            return {"ok": False, "error": "missing user_id"}
+        r = await self._bridge(f"setUserVolume({json.dumps(uid)}, {float(vol)})")
+        return self._ok(r)
+
+    async def toggle_user_mute(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        if not uid:
+            return {"ok": False, "error": "missing user_id"}
+        r = await self._bridge(f"toggleUserMute({json.dumps(uid)})")
+        return self._ok(r)
+
+    async def set_server_mute(self, guild_id: str = "", user_id: str = "", mute: bool = True, **kwargs: Any) -> dict[str, Any]:
+        gid = str(guild_id or kwargs.get("guild_id") or "")
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        flag = kwargs.get("mute", mute)
+        if not gid or not uid:
+            return {"ok": False, "error": "missing guild_id or user_id"}
+        r = await self._bridge(f"setServerMute({json.dumps(gid)}, {json.dumps(uid)}, {json.dumps(bool(flag))})")
+        return self._ok(r)
+
+    async def set_server_deaf(self, guild_id: str = "", user_id: str = "", deaf: bool = True, **kwargs: Any) -> dict[str, Any]:
+        gid = str(guild_id or kwargs.get("guild_id") or "")
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        flag = kwargs.get("deaf", deaf)
+        if not gid or not uid:
+            return {"ok": False, "error": "missing guild_id or user_id"}
+        r = await self._bridge(f"setServerDeaf({json.dumps(gid)}, {json.dumps(uid)}, {json.dumps(bool(flag))})")
+        return self._ok(r)
+
+    async def set_input_volume(self, volume: float = 100, **kwargs: Any) -> dict[str, Any]:
+        vol = kwargs.get("volume", volume)
+        r = await self._bridge(f"setInputVolume({float(vol)})")
+        return self._ok(r)
+
+    async def set_output_volume(self, volume: float = 100, **kwargs: Any) -> dict[str, Any]:
+        vol = kwargs.get("volume", volume)
+        r = await self._bridge(f"setOutputVolume({float(vol)})")
+        return self._ok(r)
+
+    async def select_text(self, channel_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")
+        if not cid:
+            return {"ok": False, "error": "missing channel_id"}
+        r = await self._bridge(f"selectText({json.dumps(cid)})")
+        return self._ok(r)
+
+    async def get_messages(self, channel_id: str = "", limit: int = 40, **kwargs: Any) -> dict[str, Any]:
+        cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")
+        lim = int(kwargs.get("limit") or limit or 40)
+        if not cid:
+            return {"ok": False, "error": "missing channel_id"}
+        r = await self._bridge(f"getMessages({json.dumps(cid)}, {lim})")
+        return self._ok(r)
+
+    async def send_message(self, channel_id: str = "", content: str = "", **kwargs: Any) -> dict[str, Any]:
+        cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")
+        body = str(content if content != "" else kwargs.get("content") or "")
+        decky.logger.info(f"send_message {cid} len={len(body)}")
+        if not cid:
+            return {"ok": False, "error": "missing channel_id"}
+        r = await self._bridge(f"sendMessage({json.dumps(cid)}, {json.dumps(body)})")
+        return self._ok(r)
 
     async def start_vesktop(self) -> dict[str, Any]:
         return await self._ensure_vesktop(wait=True)

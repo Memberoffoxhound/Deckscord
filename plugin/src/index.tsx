@@ -1,7 +1,16 @@
 /**
  * Source sketch for the QAM UI.
- * Bazzite images often have no Node, so the shipped frontend is the
- * hand-written Decky 3 bundle at plugin/dist/index.js (SP_REACT + DFL).
- * Keep that file as the source of truth until a real decky build pipeline exists.
+ * Shipped frontend is plugin/dist/index.js (SP_REACT + DFL).
+ *
+ * Native Decky/Steam controls: PanelSection, ButtonItem, ToggleField,
+ * SliderField, TextField. TextField is wrapped in Focusable so A/click
+ * opens the Steam keyboard; the composer sits at the top of chat so it
+ * stays visible above the keyboard.
+ *
+ * Voice: Leave / mute / deafen / volume sliders live in a Voice section
+ * at the top of every page (gamepad-reachable). Per-user 🔊 opens a
+ * mixer with volume, local mute, server mute/deafen.
+ *
+ * Chat packs attachments, embeds, gifv, stickers (images + video).
  */
 export {};
