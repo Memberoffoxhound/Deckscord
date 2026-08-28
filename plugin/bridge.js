@@ -14,6 +14,14 @@
     return v.Webpack;
   }
 
+  function common(name) {
+    try {
+      var c = W().Common;
+      if (c && c[name]) return c[name];
+    } catch (e) {}
+    return null;
+  }
+
   function byProps() {
     var wp = W();
     var props = Array.prototype.slice.call(arguments);
@@ -24,10 +32,12 @@
   }
 
   function store(name) {
+    var s = common(name);
+    if (s) return s;
     var wp = W();
     try {
       if (typeof wp.findStore === "function") {
-        var s = wp.findStore(name);
+        s = wp.findStore(name);
         if (s) return s;
       }
     } catch (e) {}
@@ -74,7 +84,17 @@
         var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
 
         var me = UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser();
-        if (!me) return { ok: true, ready: false, logged_in: false };
+        var Auth = common("AuthenticationStore");
+        var authed = !!(me && me.id);
+        if (!authed && Auth) {
+          try {
+            if (typeof Auth.isAuthenticated === "function") authed = !!Auth.isAuthenticated();
+            else if (Auth.getId && Auth.getId()) authed = true;
+          } catch (e2) {}
+        }
+        if (!me) {
+          return { ok: true, ready: false, logged_in: false, booting: true, authenticated: authed };
+        }
 
         var muted = !!(MediaEngineStore && MediaEngineStore.isSelfMute && MediaEngineStore.isSelfMute());
         var deafened = !!(MediaEngineStore && MediaEngineStore.isSelfDeaf && MediaEngineStore.isSelfDeaf());
@@ -173,7 +193,7 @@
 
     joinVoice: function (channelId) {
       try {
-        var actions = byProps("selectVoiceChannel", "selectChannel") || byProps("selectVoiceChannel");
+        var actions = common("ChannelActionCreators") || byProps("selectVoiceChannel", "selectChannel") || byProps("selectVoiceChannel");
         if (!actions || !actions.selectVoiceChannel) throw new Error("selectVoiceChannel not found");
         actions.selectVoiceChannel(String(channelId));
         return { ok: true, channel_id: String(channelId) };
@@ -184,7 +204,7 @@
 
     leaveVoice: function () {
       try {
-        var actions = byProps("selectVoiceChannel", "selectChannel") || byProps("selectVoiceChannel");
+        var actions = common("ChannelActionCreators") || byProps("selectVoiceChannel", "selectChannel") || byProps("selectVoiceChannel");
         if (!actions || !actions.selectVoiceChannel) throw new Error("selectVoiceChannel not found");
         actions.selectVoiceChannel(null);
         return { ok: true };
@@ -267,7 +287,7 @@
       try {
         content = String(content || "").trim();
         if (!content) return { ok: false, error: "empty" };
-        var actions = byProps("sendMessage", "editMessage") || byProps("sendMessage");
+        var actions = common("MessageActions") || byProps("sendMessage", "editMessage") || byProps("sendMessage");
         if (!actions || !actions.sendMessage) throw new Error("sendMessage not found");
         var payload = {
           content: content,

@@ -125,12 +125,14 @@ if ! have_vesktop; then
 fi
 echo -e "  ${GREEN}Vesktop OK${NC}"
 
-# Permissions Vesktop needs in Game Mode: mic, speakers, Wayland, home (session).
+# Permissions Vesktop needs in Game Mode: mic, speakers, X11 (gamescope Wayland
+# SIGSEGVs Electron), home (session).
 if flatpak list --app 2>/dev/null | grep -qi "${FLATPAK_ID}"; then
-  echo "  Applying Flatpak overrides (Wayland, PipeWire, devices)…"
+  echo "  Applying Flatpak overrides (X11, PipeWire, devices)…"
   override=(
-    --socket=wayland
+    --socket=x11
     --socket=fallback-x11
+    --socket=wayland
     --socket=pulseaudio
     --socket=session-bus
     --device=all
@@ -168,9 +170,12 @@ StartLimitIntervalSec=0
 Type=simple
 Restart=on-failure
 RestartSec=8
-Environment=ELECTRON_OZONE_PLATFORM_HINT=auto
+KillMode=control-group
+TimeoutStopSec=12
+Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
 Environment=DECKSCORD_CDP_PORT=${CDP_PORT}
 ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
+ExecStop=/usr/bin/flatpak kill ${FLATPAK_ID}
 
 [Install]
 WantedBy=default.target

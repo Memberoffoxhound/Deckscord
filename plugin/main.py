@@ -246,6 +246,7 @@ class Plugin:
         self.cdp = Cdp()
         self._bridge_hash = ""
         self._injecting = asyncio.Lock()
+        self._can_hide_window = True
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -275,7 +276,7 @@ class Plugin:
             decky.logger.error(f"vesktop service: {e}")
             return {"running": False, "state": "failed", "error": str(e)}
 
-    async def _ensure_cdp(self, inject: bool = True) -> None:
+    async def _ensure_cdp(self, inject: bool = True, attempts: int = 8) -> None:
         want = None
         try:
             want = _pick_target(_cdp_targets())
@@ -293,11 +294,12 @@ class Plugin:
                             await self._inject_bridge()
                         except Exception:
                             pass
+                    await self._hide_window()
                     return
             except Exception:
                 await self.cdp.close()
         last_err: Optional[Exception] = None
-        for _ in range(8):
+        for i in range(max(1, attempts)):
             try:
                 targets = _cdp_targets()
                 t = _pick_target(targets)
@@ -309,12 +311,31 @@ class Plugin:
                         await self._inject_bridge()
                     except Exception:
                         pass
+                await self._hide_window()
                 return
             except Exception as e:
                 last_err = e
                 await self.cdp.close()
-                await asyncio.sleep(1.2)
+                if i + 1 < attempts:
+                    await asyncio.sleep(1.2)
         raise ConnectionError(str(last_err) if last_err else "CDP connect failed")
+
+    async def _hide_window(self) -> None:
+        if not self._can_hide_window:
+            return
+        try:
+            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
+            wid = (info or {}).get("windowId")
+            if wid is None:
+                return
+            await self.cdp.call(
+                "Browser.setWindowBounds",
+                {"windowId": wid, "bounds": {"windowState": "minimized"}},
+                timeout=3,
+            )
+        except Exception as e:
+            if "wasn't found" in str(e) or "-32601" in str(e):
+                self._can_hide_window = False
 
     async def _inject_bridge(self) -> None:
         src = BRIDGE_PATH.read_text(encoding="utf-8")
@@ -371,8 +392,12 @@ class Plugin:
         (function(){
           try {
             var canvases = Array.prototype.slice.call(document.querySelectorAll('canvas'));
-            var c = canvases.find(function(x){ return Math.min(x.width, x.height) >= 120; })
-                 || canvases.find(function(x){ return Math.min(x.offsetWidth, x.offsetHeight) >= 120; });
+            var square = canvases.filter(function(x){
+              return x.width >= 120 && x.height >= 120 && x.width === x.height && x.width <= 512;
+            });
+            var c = square[0]
+                 || canvases.find(function(x){ return Math.min(x.width, x.height) >= 120 && Math.max(x.width, x.height) <= 512; })
+                 || canvases.find(function(x){ return Math.min(x.offsetWidth, x.offsetHeight) >= 120 && Math.max(x.offsetWidth, x.offsetHeight) <= 512; });
             if (!c) return {ok:false, error:'no qr canvas'};
             var png = c.toDataURL('image/png');
             if (!png || png.length < 80) return {ok:false, error:'empty canvas'};
@@ -457,22 +482,23 @@ class Plugin:
 
         out["cdp"] = True
         blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
-        if "first-launch" in blob:
+        if "first-launch" in blob or "vesktop://static" in blob:
             try:
-                await self._ensure_cdp(inject=False)
-                await self._submit_first_launch()
+                await self._ensure_cdp(inject=False, attempts=2)
+                if "first-launch" in blob:
+                    await self._submit_first_launch()
             except Exception as e:
                 decky.logger.warning(f"first-launch submit: {e}")
             out["phase"] = "loading"
             out["phase_label"] = "Opening Discord login…"
             return out
 
-        on_login = "discord.com/login" in blob or "/login" in blob
-        if on_login or "vesktop://static" in blob:
+        on_login = "discord.com/login" in blob
+        if on_login:
             out["phase"] = "login"
             out["phase_label"] = "Scan QR to log in"
             try:
-                await self._ensure_cdp(inject=False)
+                await self._ensure_cdp(inject=False, attempts=2)
                 qr = await self._grab_login_qr()
                 if qr:
                     out["qr_png"] = qr
@@ -489,10 +515,10 @@ class Plugin:
         except Exception as e:
             # Discord may still be on login even if the URL hasn't settled.
             try:
-                await self._ensure_cdp(inject=False)
+                await self._ensure_cdp(inject=False, attempts=2)
                 href = str(await self._eval("location.href") or "")
                 qr = await self._grab_login_qr()
-                if qr or "/login" in href:
+                if qr or "discord.com/login" in href:
                     out["phase"] = "login"
                     out["phase_label"] = "Scan QR to log in"
                     if qr:
@@ -516,6 +542,12 @@ class Plugin:
             if isinstance(user, dict):
                 name = user.get("name") or user.get("username") or ""
             out["phase_label"] = f"Ready{(' · ' + name) if name else ''}"
+        elif out.get("booting") or not on_login:
+            # Logged-in session is still hydrating UserStore — keep waiting, don't
+            # bounce back to the QR screen.
+            out["ready"] = False
+            out["phase"] = "loading"
+            out["phase_label"] = "Signing into Discord…"
         else:
             out["ready"] = False
             out["phase"] = "login"

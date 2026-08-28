@@ -42,7 +42,7 @@ Sudo is used for linger, plugin install, and restarting Decky.
 ## First login
 
 1. Game Mode → QAM → **Deckscord**.
-2. Wait for the login QR (amber light: **Scan QR to log in**).
+2. Wait for the login QR (amber light: **Scan QR to log in**). Discord stays minimized in the background — the QAM is the UI.
 3. Phone: Discord → **Scan QR Code**.
 4. The light turns green (**Ready**). Voice + Text work from the QAM.
 
