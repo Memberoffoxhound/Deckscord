@@ -1,43 +1,47 @@
 # Deckscord Architecture
 
-## High-level
-
 ```
-┌─────────────────────┐     CDP / IPC      ┌──────────────────┐
-│  Decky QAM UI       │◄──────────────────►│  Vesktop         │
-│  (React / @decky)   │                    │  (Electron +     │
-│  Voice / Text /     │                    │   Vencord)       │
-│  Settings tabs      │                    └──────────────────┘
-└──────────┬──────────┘                              ▲
-           │ call()                                  │ managed by
-           ▼                                         │
-┌─────────────────────┐                     ┌────────┴─────────┐
-│  main.py backend    │────────────────────►│ systemd user     │
-│  (Python)           │  start/stop/status  │ deckscord-       │
-│  volume, mute,      │                     │ vesktop.service  │
-│  overlay flags,     │                     └──────────────────┘
-│  toast emit         │
-└─────────────────────┘
+┌──────────────────────┐   call("join_voice")    ┌─────────────────────┐
+│  Decky QAM           │   call("send_message")  │  plugin/main.py     │
+│  Voice / Text        │◄───────────────────────►│  CDP client         │
+└──────────────────────┘                         └──────────┬──────────┘
+                                                            │ ws://127.0.0.1:9222
+                                                            ▼
+                                                 ┌─────────────────────┐
+                                                 │  Vesktop            │
+                                                 │  (Electron+Vencord) │
+                                                 │  Discord renderer   │
+                                                 │  plugin/bridge.js   │
+                                                 └──────────┬──────────┘
+                                                            │
+                                                 systemd --user
+                                                 deckscord-vesktop.service
 ```
 
 ## Why Vesktop
 
-- Real native Discord client (not a webview hack)
-- Microphone and voice audio work without capture tricks
-- Vencord plugins available if the user wants them
-- Can be driven over Chrome DevTools Protocol for channel list, join, volume, etc.
+Official Discord’s Flatpak overlay does not work as a Game Mode companion. Vesktop is a native client with working mic/speakers under PipeWire, Vencord already loaded, and a stable Electron debugger port.
+
+## Chat + calls (current)
+
+`bridge.js` is injected once per CDP session and uses `Vencord.Webpack`:
+
+| Action | Module |
+|---|---|
+| Join / leave voice | `selectVoiceChannel` |
+| Mute / deafen | `toggleSelfMute` / `toggleSelfDeaf` |
+| Snapshot (guilds, channels, members) | `GuildStore`, `ChannelStore`, `VoiceStateStore`, `UserStore` |
+| Read messages | `MessageStore.getMessages` |
+| Send message | `sendMessage` |
+
+The Python backend is stdlib-only (asyncio + a tiny WebSocket client). No pip packages.
 
 ## Persistence
 
-- `systemctl --user` service + `loginctl enable-linger` so Discord stays up when the session goes into pure Game Mode / after reboot.
-- Settings stored in `~/.local/share/deckscord/settings.json`.
+- `systemctl --user enable --now deckscord-vesktop.service`
+- `loginctl enable-linger` so it survives Game Mode / reboot
+- Discord session lives in Vesktop’s Flatpak config
 
-## Overlay & notifications
+## Later
 
-- Speaking overlay can be a transparent Gamescope overlay or a Decky-injected HUD element.
-- Toasts use Decky’s built-in toaster (`emit`).
-- Join/leave events come from the CDP member-list stream.
-
-## Screen share / PiP (nice-to-have)
-
-Gamescope has limited portal support. Future work can follow the portal-shim approach used by other Game Mode Discord projects or fall back to window capture when in Desktop Mode.
+Speaking overlay, join/leave toasts, per-user volume, screen share / PiP. Those wait until Voice + Text stay up in Game Mode.

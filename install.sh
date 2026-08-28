@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deckscord installer
-# One-stop Discord companion for SteamOS / Bazzite Game Mode
+# Deckscord installer — Discord in Steam Game Mode (QAM), Xbox/PS5 style.
 # https://github.com/Memberoffoxhound/Deckscord
 #
-# Safe to run as:  curl -fsSL .../install.sh | bash
-# Prompts always go to the real terminal via /dev/tty so the pipe is not consumed.
+# Always installs dependencies (Vesktop, plugin files, user service).
+# Safe as:  curl -fsSL .../install.sh | bash
+# Prompts go to /dev/tty so a pipe is not consumed.
 
-REPO_RAW="https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main"
+REPO="https://github.com/Memberoffoxhound/Deckscord.git"
 PLUGIN_DIR="${HOME}/homebrew/plugins/Deckscord"
 DATA_DIR="${HOME}/.local/share/deckscord"
 SERVICE_NAME="deckscord-vesktop.service"
+CDP_PORT="${DECKSCORD_CDP_PORT:-9222}"
+FLATPAK_ID="dev.vencord.Vesktop"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,39 +21,54 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Prompt helper that always talks to the real terminal (works with curl | bash)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+NONINTERACTIVE=0
+[[ "${1:-}" == "--yes" || "${DECKSCORD_NONINTERACTIVE:-}" == "1" ]] && NONINTERACTIVE=1
+
 prompt() {
   local msg="$1"
   local reply=""
+  if [[ ${NONINTERACTIVE} -eq 1 ]]; then
+    printf 'y'
+    return
+  fi
   if [[ -r /dev/tty ]]; then
-    # Force prompt to the controlling terminal so stdin (the pipe) is not eaten
     read -r -p "$msg" reply < /dev/tty || true
   else
-    # No tty (rare) — default to yes
     reply="y"
   fi
   printf '%s' "$reply"
 }
 
+need_sudo() {
+  if sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  echo -e "  ${YELLOW}Need sudo: $*${NC}"
+  sudo -v
+}
+
+have_vesktop() {
+  flatpak list --app 2>/dev/null | grep -qi "${FLATPAK_ID}\\|vesktop" && return 0
+  command -v vesktop >/dev/null 2>&1 && return 0
+  return 1
+}
+
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║                    D E C K S C O R D                     ║"
-echo "║   Discord companion for SteamOS / Bazzite Game Mode      ║"
+echo "║   Discord in Game Mode — chat + calls in the QAM         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo
 echo "This installer will:"
-echo "  • Check for (and install if missing) Vesktop — the reliable"
-echo "    native Discord client that works properly in Game Mode"
-echo "  • Create a systemd user service so Discord stays running"
-echo "    minimized across reboots and Game Mode sessions"
-echo "  • Install the Deckscord Decky Loader plugin so you can"
-echo "    see channels, join voice, control volumes, chat, and"
-echo "    get speaking overlays / toasts without ever leaving Game Mode"
-echo "  • Only ask for sudo when it truly needs it (udev / linger / etc.)"
+echo "  • Install Vesktop (Discord client that actually works in Game Mode)"
+echo "  • Give it Wayland, PipeWire, and a local DevTools port so the QAM"
+echo "    plugin can join voice and send messages"
+echo "  • Create a systemd user service so Discord stays logged in"
+echo "  • Install the Deckscord Decky plugin (Quick Access Menu)"
 echo
-echo "After this you will be able to do everything the PS5 and Xbox"
-echo "Discord apps can do, but from the Steam Quick Access Menu."
+echo "After this: log in once, then Voice + Text live in the QAM like Xbox/PS5."
 echo
 
 reply=$(prompt "Continue? [Y/n] ")
@@ -63,55 +80,85 @@ fi
 mkdir -p "${DATA_DIR}"
 mkdir -p "${HOME}/.config/systemd/user"
 
-# ---------- detect environment ----------
 echo
-echo -e "${BLUE}[1/7] Detecting environment...${NC}"
+echo -e "${BLUE}[1/6] Environment${NC}"
 if [[ -f /etc/os-release ]]; then
   # shellcheck source=/dev/null
   . /etc/os-release
   echo "  Distro: ${NAME:-unknown} ${VERSION_ID:-}"
 fi
 if command -v gamescope >/dev/null 2>&1 || [[ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]]; then
-  echo "  Gamescope: present (Game Mode capable)"
+  echo "  Gamescope: present"
 else
-  echo -e "  ${YELLOW}Gamescope not detected — still installing, but Game Mode integration may be limited${NC}"
+  echo -e "  ${YELLOW}Gamescope not detected — installing anyway${NC}"
+fi
+if [[ -d "${HOME}/homebrew" ]]; then
+  echo "  Decky Loader: ${HOME}/homebrew"
+else
+  echo -e "  ${YELLOW}Decky Loader not found. Installing it (required for the QAM plugin).${NC}"
+  curl -L https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh | sh
 fi
 
-# ---------- Vesktop ----------
 echo
-echo -e "${BLUE}[2/7] Vesktop (Discord client)...${NC}"
-need_vesktop=0
-if flatpak list --app 2>/dev/null | grep -qi "vesktop\|dev.vencord.Vesktop"; then
-  echo "  Vesktop Flatpak already installed."
-elif command -v vesktop >/dev/null 2>&1; then
-  echo "  Native Vesktop binary found in PATH."
-else
-  need_vesktop=1
+echo -e "${BLUE}[2/6] Vesktop (required)${NC}"
+if ! command -v flatpak >/dev/null 2>&1; then
+  echo -e "${RED}flatpak is required. Install it, then re-run.${NC}"
+  exit 1
 fi
 
-if [[ ${need_vesktop} -eq 1 ]]; then
-  echo "  Vesktop not found. Installing via Flatpak (recommended for Game Mode)..."
-  if ! command -v flatpak >/dev/null 2>&1; then
-    echo -e "${RED}flatpak is required to install Vesktop. Install it first, then re-run this script.${NC}"
-    exit 1
-  fi
+if have_vesktop; then
+  echo "  Vesktop already installed."
+else
+  echo "  Installing Vesktop from Flathub (this is the Discord client)…"
   flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
-  flatpak install -y --user flathub dev.vencord.Vesktop
-  echo -e "  ${GREEN}Vesktop installed.${NC}"
-else
-  echo -e "  ${GREEN}OK${NC}"
+  if ! flatpak install -y --user flathub "${FLATPAK_ID}"; then
+    echo "  User install failed — trying system install with sudo…"
+    need_sudo "install Vesktop system-wide"
+    sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
+    sudo flatpak install -y flathub "${FLATPAK_ID}"
+  fi
 fi
 
-# Give Vesktop Wayland access if it is a Flatpak
-if flatpak list --app 2>/dev/null | grep -qi "dev.vencord.Vesktop"; then
-  flatpak override --user --socket=wayland --socket=fallback-x11 --device=all --filesystem=home dev.vencord.Vesktop || true
+if ! have_vesktop; then
+  echo -e "${RED}Vesktop did not install. Check network / Flathub and re-run.${NC}"
+  exit 1
+fi
+echo -e "  ${GREEN}Vesktop OK${NC}"
+
+# Permissions Vesktop needs in Game Mode: mic, speakers, Wayland, home (session).
+if flatpak list --app 2>/dev/null | grep -qi "${FLATPAK_ID}"; then
+  echo "  Applying Flatpak overrides (Wayland, PipeWire, devices)…"
+  override=(
+    --socket=wayland
+    --socket=fallback-x11
+    --socket=pulseaudio
+    --socket=session-bus
+    --device=all
+    --share=network
+    --share=ipc
+    --filesystem=home
+    --filesystem=xdg-run/pipewire-0:ro
+  )
+  if flatpak list --app --user 2>/dev/null | grep -qi "${FLATPAK_ID}"; then
+    flatpak override --user "${override[@]}" "${FLATPAK_ID}" || true
+  else
+    need_sudo "Flatpak override"
+    sudo flatpak override "${override[@]}" "${FLATPAK_ID}" || true
+  fi
 fi
 
-# ---------- systemd user service for Game Mode ----------
 echo
-echo -e "${BLUE}[3/7] Creating Game Mode systemd service...${NC}"
+echo -e "${BLUE}[3/6] Game Mode systemd service${NC}"
 
-cat > "${HOME}/.config/systemd/user/${SERVICE_NAME}" << 'EOF'
+LAUNCH="${DATA_DIR}/launch-vesktop.sh"
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/launch-vesktop.sh" ]]; then
+  cp "${SCRIPT_DIR}/launch-vesktop.sh" "${LAUNCH}"
+else
+  curl -fsSL "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/launch-vesktop.sh" -o "${LAUNCH}"
+fi
+chmod +x "${LAUNCH}"
+
+cat > "${HOME}/.config/systemd/user/${SERVICE_NAME}" << EOF
 [Unit]
 Description=Deckscord Vesktop (Discord) for Game Mode
 After=graphical-session.target
@@ -122,107 +169,107 @@ Type=simple
 Restart=on-failure
 RestartSec=8
 Environment=ELECTRON_OZONE_PLATFORM_HINT=auto
-# Wait for gamescope Wayland socket when in Game Mode
-ExecStartPre=/usr/bin/bash -c 'for i in {1..45}; do for s in "$XDG_RUNTIME_DIR"/gamescope-*; do [ -S "$s" ] && export WAYLAND_DISPLAY="$(basename "$s")" && exit 0; done; sleep 1; done; true'
-ExecStart=/usr/bin/bash -c '
-  if flatpak list --app 2>/dev/null | grep -qi dev.vencord.Vesktop; then
-    wl=""; for s in "$XDG_RUNTIME_DIR"/gamescope-*; do [ -S "$s" ] && wl=$(basename "$s") && break; done
-    [ -n "$wl" ] && export WAYLAND_DISPLAY="$wl"
-    exec flatpak run dev.vencord.Vesktop --start-minimized --enable-features=UseOzonePlatform --ozone-platform=wayland
-  elif command -v vesktop >/dev/null 2>&1; then
-    exec vesktop --start-minimized
-  else
-    echo "Vesktop not found" >&2
-    exit 1
-  fi
-'
+Environment=DECKSCORD_CDP_PORT=${CDP_PORT}
+ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
 
 [Install]
 WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now "${SERVICE_NAME}" || true
+systemctl --user enable --now "${SERVICE_NAME}"
 
-# Enable linger so the user service survives without a logged-in session
 if loginctl show-user "$(whoami)" -p Linger 2>/dev/null | grep -q "no"; then
-  echo "  Enabling systemd linger (so Discord survives reboots into Game Mode)..."
-  if sudo -n true 2>/dev/null; then
-    sudo loginctl enable-linger "$(whoami)"
-  else
-    echo -e "  ${YELLOW}Need sudo to enable linger.${NC}"
-    sudo loginctl enable-linger "$(whoami)"
-  fi
+  echo "  Enabling linger so Discord survives Game Mode / reboot…"
+  need_sudo "loginctl enable-linger"
+  sudo loginctl enable-linger "$(whoami)"
 fi
-echo -e "  ${GREEN}Service installed and enabled.${NC}"
+echo -e "  ${GREEN}Service $(systemctl --user is-active "${SERVICE_NAME}" || true)${NC}"
 
-# ---------- Decky Loader ----------
 echo
-echo -e "${BLUE}[4/7] Decky Loader...${NC}"
-if [[ -d "${HOME}/homebrew" ]] || command -v decky >/dev/null 2>&1; then
-  echo "  Decky appears to be present."
+echo -e "${BLUE}[4/6] Deckscord Decky plugin${NC}"
+
+SRC=""
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/plugin/main.py" ]]; then
+  SRC="${SCRIPT_DIR}/plugin"
 else
-  echo "  Decky Loader not detected."
-  dreply=$(prompt "  Install Decky Loader now? (recommended) [Y/n] ")
-  if [[ ! "${dreply,,}" =~ ^n ]]; then
-    echo "  Fetching official Decky installer..."
-    curl -L https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh | sh
-  else
-    echo -e "  ${YELLOW}Skipping Decky. You can install it later and re-run this script.${NC}"
-  fi
+  tmp="$(mktemp -d)"
+  echo "  Cloning plugin from GitHub…"
+  git clone --depth 1 "${REPO}" "${tmp}/repo"
+  SRC="${tmp}/repo/plugin"
 fi
 
-# ---------- Plugin ----------
-echo
-echo -e "${BLUE}[5/7] Installing Deckscord Decky plugin...${NC}"
-mkdir -p "${PLUGIN_DIR}"
+need_sudo "install plugin into ${PLUGIN_DIR}"
+sudo mkdir -p "${PLUGIN_DIR}"
+if command -v rsync >/dev/null 2>&1; then
+  sudo rsync -a --delete \
+    --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' \
+    "${SRC}/" "${PLUGIN_DIR}/"
+else
+  sudo find "${PLUGIN_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  sudo cp -a "${SRC}/." "${PLUGIN_DIR}/"
+fi
+sudo chown -R root:root "${PLUGIN_DIR}" 2>/dev/null || true
+echo "  Installed ${PLUGIN_DIR}"
 
-# Download core plugin files
-for f in plugin.json package.json main.py; do
-  curl -fsSL "${REPO_RAW}/plugin/${f}" -o "${PLUGIN_DIR}/${f}"
-done
-
-mkdir -p "${PLUGIN_DIR}/dist" "${PLUGIN_DIR}/src"
-# Minimal frontend placeholder (full React build can be added later)
-curl -fsSL "${REPO_RAW}/plugin/dist/index.js" -o "${PLUGIN_DIR}/dist/index.js" 2>/dev/null || echo "// Deckscord frontend placeholder" > "${PLUGIN_DIR}/dist/index.js"
-
-echo -e "  ${GREEN}Plugin files placed in ${PLUGIN_DIR}${NC}"
-
-# Restart Decky if possible
-if systemctl --user is-active plugin_loader.service >/dev/null 2>&1; then
-  systemctl --user restart plugin_loader.service || true
-elif [[ -f /usr/bin/systemctl ]]; then
-  # Some setups run it as system
-  sudo systemctl restart plugin_loader 2>/dev/null || true
+if [[ -n "${tmp:-}" && -d "${tmp:-}" ]]; then
+  rm -rf "${tmp}"
 fi
 
-# ---------- final notes ----------
 echo
-echo -e "${BLUE}[6/7] Finalizing...${NC}"
-# Save a local uninstall helper
-curl -fsSL "${REPO_RAW}/uninstall.sh" -o "${DATA_DIR}/uninstall.sh" 2>/dev/null || true
-chmod +x "${DATA_DIR}/uninstall.sh" 2>/dev/null || true
+echo -e "${BLUE}[5/6] Restart Decky Loader${NC}"
+need_sudo "restart plugin_loader"
+sudo systemctl restart plugin_loader 2>/dev/null || sudo systemctl restart plugin_loader.service || true
+sleep 1
+echo -e "  ${GREEN}plugin_loader restarted${NC}"
 
 echo
-echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}  Deckscord install complete.${NC}"
-echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}[6/6] Verify${NC}"
+ok=1
+if have_vesktop; then
+  echo -e "  ${GREEN}✓${NC} Vesktop"
+else
+  echo -e "  ${RED}✗${NC} Vesktop missing"
+  ok=0
+fi
+if [[ -f "${PLUGIN_DIR}/main.py" && -f "${PLUGIN_DIR}/dist/index.js" && -f "${PLUGIN_DIR}/bridge.js" ]]; then
+  echo -e "  ${GREEN}✓${NC} Plugin files"
+else
+  echo -e "  ${RED}✗${NC} Plugin files incomplete"
+  ok=0
+fi
+if systemctl --user is-enabled "${SERVICE_NAME}" >/dev/null 2>&1; then
+  echo -e "  ${GREEN}✓${NC} ${SERVICE_NAME} enabled ($(systemctl --user is-active "${SERVICE_NAME}" || true))"
+else
+  echo -e "  ${YELLOW}!${NC} service not enabled"
+fi
+if [[ -d "${HOME}/homebrew" ]]; then
+  echo -e "  ${GREEN}✓${NC} Decky homebrew dir"
+fi
+
 echo
-echo "Next steps:"
-echo "  1. Return to Game Mode (or reboot)."
-echo "  2. Open the Quick Access Menu (QAM) → look for Deckscord."
-echo "  3. First launch will show a QR code or login page."
-echo "     Scan it with the Discord mobile app or log in once."
-echo "  4. After that your session stays alive across reboots."
+if [[ ${ok} -eq 1 ]]; then
+  echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+  echo -e "${GREEN}  Deckscord install complete.${NC}"
+  echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+else
+  echo -e "${YELLOW}Install finished with warnings. Re-run if something above is red.${NC}"
+fi
 echo
-echo "Voice, text, per-user volume, mute, overlay, and notifications"
-echo "are all available from the QAM while you play."
+echo "Next:"
+echo "  1. If this is the first time, open Vesktop in Desktop Mode and log in."
+echo "     (After that the session persists.)"
+echo "  2. Return to Game Mode."
+echo "  3. Quick Access Menu → Deckscord."
+echo "  4. Voice tab: pick a server, join a call, mute/deafen."
+echo "     Text tab: pick a channel, read and send messages."
 echo
-echo "If the plugin does not appear immediately, open Decky settings,"
-echo "enable Developer Mode if needed, and restart the plugin loader."
+echo "Uninstall:"
+echo "  bash ${DATA_DIR}/uninstall.sh   # copied below if available"
+echo "  or:  curl -fsSL https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/uninstall.sh | bash"
 echo
-echo "Uninstall later with:"
-echo "  ${DATA_DIR}/uninstall.sh"
-echo
-echo "Enjoy."
-echo
+
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/uninstall.sh" ]]; then
+  cp "${SCRIPT_DIR}/uninstall.sh" "${DATA_DIR}/uninstall.sh"
+  chmod +x "${DATA_DIR}/uninstall.sh"
+fi

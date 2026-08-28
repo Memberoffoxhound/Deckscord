@@ -1,5 +1,4 @@
 node_modules/
-dist/
 *.pyc
 __pycache__/
 .DS_Store
@@ -7,3 +6,4 @@ __pycache__/
 .env
 .local/
 *.zip
+plugin/src/.cache/

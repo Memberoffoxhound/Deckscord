@@ -1,184 +1,387 @@
 #!/usr/bin/env python3
-"""
-Deckscord backend
-
-Owns the relationship with the Vesktop process (via the systemd user service)
-and exposes a clean API to the Decky frontend for:
-
-  - status (running, current voice channel, members)
-  - join / leave voice
-  - per-user volume (0–200) and local mute
-  - settings (overlay, toasts, join/leave alerts, master volume)
-  - toast emission for notifications
-
-The live channel list, speaking indicators, and message history will be filled
-by a CDP (Chrome DevTools Protocol) client that attaches to Vesktop. That
-layer is the next major piece; the hooks and data model are already here.
-"""
+"""Deckscord Decky backend — drives Vesktop over Chrome DevTools Protocol."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
+import struct
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
-# Decky environment
-try:
-    import decky  # type: ignore
-    from decky import logger, emit  # type: ignore
-except ImportError:
-    class _Logger:
-        def info(self, *a: Any) -> None: print("[INFO]", *a)
-        def error(self, *a: Any) -> None: print("[ERROR]", *a)
-        def warning(self, *a: Any) -> None: print("[WARN]", *a)
-    logger = _Logger()
-    def emit(event: str, data: Any = None) -> None:
-        print(f"[EMIT] {event}", data)
+import decky
 
-PLUGIN_DIR = Path(os.environ.get("DECKY_PLUGIN_DIR", Path(__file__).parent))
+CDP_PORT = int(os.environ.get("DECKSCORD_CDP_PORT", "9222"))
+SERVICE = "deckscord-vesktop.service"
+PLUGIN_DIR = Path(getattr(decky, "DECKY_PLUGIN_DIR", Path(__file__).parent))
+BRIDGE_PATH = PLUGIN_DIR / "bridge.js"
 DATA_DIR = Path.home() / ".local" / "share" / "deckscord"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-SETTINGS_FILE = DATA_DIR / "settings.json"
-
-DEFAULT_SETTINGS = {
-    "overlay_enabled": True,
-    "toasts_enabled": True,
-    "join_leave_notify": True,
-    "master_volume": 100,
-}
 
 
-class DeckscordBackend:
+def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+class Cdp:
+    """Minimal CDP client. Stdlib only — no extra Python deps."""
+
     def __init__(self) -> None:
-        self.vesktop_running = False
-        self.current_voice_channel: Optional[Dict[str, str]] = None
-        self.members: Dict[str, Dict[str, Any]] = {}
-        self.settings = dict(DEFAULT_SETTINGS)
-        self._load_settings()
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._recv_task: Optional[asyncio.Task] = None
+        self._buf = bytearray()
+        self._lock = asyncio.Lock()
 
-    def _load_settings(self) -> None:
-        if SETTINGS_FILE.exists():
+    @property
+    def connected(self) -> bool:
+        return self._writer is not None and not self._writer.is_closing()
+
+    async def close(self) -> None:
+        if self._recv_task:
+            self._recv_task.cancel()
+            self._recv_task = None
+        if self._writer:
             try:
-                self.settings.update(json.loads(SETTINGS_FILE.read_text()))
-            except Exception as e:
-                logger.warning(f"Could not load settings: {e}")
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        self._writer = None
+        self._reader = None
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
 
-    def _save_settings(self) -> None:
+    async def connect(self, ws_url: str) -> None:
+        await self.close()
+        u = urlparse(ws_url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or 9222
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+        reader, writer = await asyncio.open_connection(host, port)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        writer.write(req.encode())
+        await writer.drain()
+        header = b""
+        while b"\r\n\r\n" not in header:
+            chunk = await asyncio.wait_for(reader.read(1024), timeout=8)
+            if not chunk:
+                raise ConnectionError("CDP websocket handshake closed")
+            header += chunk
+        if b"101" not in header.split(b"\r\n", 1)[0]:
+            raise ConnectionError(f"CDP handshake failed: {header[:200]!r}")
+        leftover = header.split(b"\r\n\r\n", 1)[1]
+        self._reader = reader
+        self._writer = writer
+        self._buf = bytearray(leftover)
+        self._recv_task = asyncio.create_task(self._recv_loop())
+
+    async def call(self, method: str, params: Optional[dict] = None, timeout: float = 12.0) -> Any:
+        if not self.connected:
+            raise ConnectionError("not connected")
+        self._id += 1
+        msg_id = self._id
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[msg_id] = fut
+        payload = {"id": msg_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        async with self._lock:
+            self._send_frame(json.dumps(payload, separators=(",", ":")))
         try:
-            SETTINGS_FILE.write_text(json.dumps(self.settings, indent=2))
-        except Exception as e:
-            logger.error(f"Could not save settings: {e}")
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(msg_id, None)
 
-    async def _ensure_vesktop(self) -> None:
-        """Make sure the Game Mode Vesktop service is alive."""
+    def _send_frame(self, text: str) -> None:
+        assert self._writer is not None
+        data = text.encode("utf-8")
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", n))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", n))
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self._writer.write(header + mask + masked)
+
+    async def _recv_loop(self) -> None:
         try:
-            r = subprocess.run(
-                ["systemctl", "--user", "is-active", "deckscord-vesktop.service"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.stdout.strip() != "active":
-                subprocess.run(
-                    ["systemctl", "--user", "start", "deckscord-vesktop.service"],
-                    check=False, timeout=10,
-                )
-                await asyncio.sleep(2)
-            self.vesktop_running = True
-            logger.info("Vesktop service is active")
+            while self._reader:
+                msg = await self._read_message()
+                if msg is None:
+                    break
+                try:
+                    obj = json.loads(msg)
+                except Exception:
+                    continue
+                mid = obj.get("id")
+                if mid in self._pending and not self._pending[mid].done():
+                    if "error" in obj:
+                        self._pending[mid].set_exception(RuntimeError(obj["error"]))
+                    else:
+                        self._pending[mid].set_result(obj.get("result"))
+        except asyncio.CancelledError:
+            return
         except Exception as e:
-            logger.error(f"Could not ensure Vesktop: {e}")
-            self.vesktop_running = False
+            decky.logger.error(f"CDP recv: {e}")
+        finally:
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("CDP disconnected"))
 
-    async def get_status(self) -> Dict[str, Any]:
+    async def _read_message(self) -> Optional[str]:
+        assert self._reader is not None
+        parts: list[bytes] = []
+        while True:
+            op, payload, fin = await self._read_frame()
+            if op == 0x8:
+                return None
+            if op == 0x9:
+                continue
+            parts.append(payload)
+            if fin:
+                return b"".join(parts).decode("utf-8", "replace")
+
+    async def _ensure(self, n: int) -> None:
+        assert self._reader is not None
+        while len(self._buf) < n:
+            chunk = await self._reader.read(4096)
+            if not chunk:
+                raise ConnectionError("CDP closed")
+            self._buf.extend(chunk)
+
+    async def _read_frame(self) -> tuple[int, bytes, bool]:
+        await self._ensure(2)
+        b0, b1 = self._buf[0], self._buf[1]
+        del self._buf[:2]
+        fin = bool(b0 & 0x80)
+        op = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        length = b1 & 0x7F
+        if length == 126:
+            await self._ensure(2)
+            length = struct.unpack("!H", bytes(self._buf[:2]))[0]
+            del self._buf[:2]
+        elif length == 127:
+            await self._ensure(8)
+            length = struct.unpack("!Q", bytes(self._buf[:8]))[0]
+            del self._buf[:8]
+        mask = b""
+        if masked:
+            await self._ensure(4)
+            mask = bytes(self._buf[:4])
+            del self._buf[:4]
+        await self._ensure(length)
+        payload = bytes(self._buf[:length])
+        del self._buf[:length]
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return op, payload, fin
+
+
+def _cdp_targets() -> list[dict]:
+    url = f"http://127.0.0.1:{CDP_PORT}/json"
+    req = urllib.request.Request(url, headers={"Host": f"127.0.0.1:{CDP_PORT}"})
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _pick_target(targets: list[dict]) -> Optional[dict]:
+    scored: list[tuple[int, dict]] = []
+    for t in targets:
+        u = (t.get("url") or "") + " " + (t.get("title") or "")
+        ws = t.get("webSocketDebuggerUrl")
+        if not ws:
+            continue
+        score = 0
+        lu = u.lower()
+        if "discord.com" in lu:
+            score += 10
+        if "/channels" in lu or "/app" in lu:
+            score += 5
+        if "vesktop://" in lu:
+            score += 3
+        if t.get("type") == "page":
+            score += 2
+        if "devtools://" in lu:
+            continue
+        if score:
+            scored.append((score, t))
+    if not scored:
+        return next((t for t in targets if t.get("webSocketDebuggerUrl") and "devtools://" not in (t.get("url") or "")), None)
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1]
+
+
+class Plugin:
+    def __init__(self) -> None:
+        self.cdp = Cdp()
+        self._bridge_hash = ""
+        self._injecting = asyncio.Lock()
+
+    async def _main(self) -> None:
+        decky.logger.info("Deckscord backend starting")
         await self._ensure_vesktop()
-        return {
-            "vesktop_running": self.vesktop_running,
-            "voice_channel": self.current_voice_channel,
-            "members": list(self.members.values()),
-            "settings": self.settings,
-        }
-
-    async def join_voice(self, channel_id: str, channel_name: str = "") -> Dict[str, Any]:
-        """Request join. Real implementation will issue CDP commands to Vesktop."""
-        logger.info(f"Join voice request: {channel_id} ({channel_name})")
-        self.current_voice_channel = {"id": channel_id, "name": channel_name or channel_id}
-        # TODO: CDP → Discord client join
-        return {"ok": True, "channel": self.current_voice_channel}
-
-    async def leave_voice(self) -> Dict[str, Any]:
-        logger.info("Leave voice request")
-        self.current_voice_channel = None
-        # TODO: CDP → leave
-        return {"ok": True}
-
-    async def set_user_volume(self, user_id: str, volume: int) -> Dict[str, Any]:
-        volume = max(0, min(200, int(volume)))
-        if user_id not in self.members:
-            self.members[user_id] = {"id": user_id, "name": user_id, "volume": 100, "local_mute": False}
-        self.members[user_id]["volume"] = volume
-        logger.info(f"Set volume {user_id} → {volume}")
-        # TODO: CDP or local audio graph
-        return {"ok": True, "volume": volume}
-
-    async def set_user_mute(self, user_id: str, muted: bool) -> Dict[str, Any]:
-        muted = bool(muted)
-        if user_id not in self.members:
-            self.members[user_id] = {"id": user_id, "name": user_id, "volume": 100, "local_mute": False}
-        self.members[user_id]["local_mute"] = muted
-        logger.info(f"Local mute {user_id} → {muted}")
-        return {"ok": True, "muted": muted}
-
-    async def set_setting(self, key: str, value: Any) -> Dict[str, Any]:
-        if key in self.settings:
-            self.settings[key] = value
-            self._save_settings()
-            logger.info(f"Setting {key} = {value}")
-        return {"ok": True, "settings": self.settings}
-
-    async def notify_join_leave(self, user_name: str, joined: bool) -> None:
-        if not self.settings.get("join_leave_notify", True):
-            return
-        if not self.settings.get("toasts_enabled", True):
-            return
-        msg = f"{user_name} {'joined' if joined else 'left'} the voice channel"
         try:
-            emit("deckscord_toast", {"title": "Deckscord", "body": msg})
-        except Exception:
-            logger.info(msg)
+            await self._ensure_cdp()
+        except Exception as e:
+            decky.logger.warning(f"CDP not ready yet: {e}")
 
+    async def _unload(self) -> None:
+        await self.cdp.close()
 
-backend = DeckscordBackend()
+    async def _ensure_vesktop(self) -> dict[str, Any]:
+        try:
+            r = _run(["systemctl", "--user", "is-active", SERVICE], timeout=5)
+            if r.stdout.strip() != "active":
+                _run(["systemctl", "--user", "start", SERVICE], timeout=10)
+                await asyncio.sleep(2)
+            return {"running": _run(["systemctl", "--user", "is-active", SERVICE], timeout=5).stdout.strip() == "active"}
+        except Exception as e:
+            decky.logger.error(f"vesktop service: {e}")
+            return {"running": False, "error": str(e)}
 
+    async def _ensure_cdp(self) -> None:
+        if self.cdp.connected:
+            try:
+                await self.cdp.call("Runtime.evaluate", {"expression": "1+1", "returnByValue": True}, timeout=3)
+                return
+            except Exception:
+                await self.cdp.close()
+        last_err: Optional[Exception] = None
+        for _ in range(8):
+            try:
+                targets = _cdp_targets()
+                t = _pick_target(targets)
+                if not t:
+                    raise ConnectionError("no CDP targets (is Vesktop running / logged in?)")
+                await self.cdp.connect(t["webSocketDebuggerUrl"])
+                await self._inject_bridge()
+                return
+            except Exception as e:
+                last_err = e
+                await self.cdp.close()
+                await asyncio.sleep(1.2)
+        raise ConnectionError(str(last_err) if last_err else "CDP connect failed")
 
-async def _startup() -> None:
-    logger.info("Deckscord backend starting")
-    await backend._ensure_vesktop()
-    logger.info("Deckscord backend ready")
+    async def _inject_bridge(self) -> None:
+        src = BRIDGE_PATH.read_text(encoding="utf-8")
+        h = hashlib.sha1(src.encode()).hexdigest()
+        async with self._injecting:
+            if self._bridge_hash == h:
+                ping = await self._eval("window.__deckscord ? window.__deckscord.ping() : {ok:false}")
+                if isinstance(ping, dict) and ping.get("ok"):
+                    return
+            result = await self._eval(f"(function(){{ {src}\n }})()")
+            if isinstance(result, dict) and result.get("ok") is False:
+                raise RuntimeError(result.get("error") or "bridge inject failed")
+            self._bridge_hash = h
 
+    async def _eval(self, expression: str, timeout: float = 12.0) -> Any:
+        res = await self.cdp.call(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+            timeout=timeout,
+        )
+        if not res:
+            return None
+        if res.get("exceptionDetails"):
+            desc = res["exceptionDetails"].get("text") or res["exceptionDetails"]
+            raise RuntimeError(str(desc))
+        val = (res.get("result") or {}).get("value")
+        return val
 
-# ---- Decky-callable entry points ----
+    async def _bridge(self, call: str) -> Any:
+        await self._ensure_vesktop()
+        await self._ensure_cdp()
+        await self._inject_bridge()
+        return await self._eval(f"window.__deckscord.{call}")
 
-async def get_status() -> Dict[str, Any]:
-    return await backend.get_status()
+    # ---- Decky-callable -------------------------------------------------
 
-async def join_voice(channel_id: str, channel_name: str = "") -> Dict[str, Any]:
-    return await backend.join_voice(channel_id, channel_name)
+    async def get_status(self) -> dict[str, Any]:
+        svc = await self._ensure_vesktop()
+        out: dict[str, Any] = {
+            "vesktop_running": bool(svc.get("running")),
+            "cdp": False,
+            "logged_in": False,
+            "ready": False,
+        }
+        try:
+            targets = _cdp_targets()
+            out["cdp"] = True
+            blob = " ".join(((t.get("url") or "") + " " + (t.get("title") or "")) for t in targets).lower()
+            if "first-launch" in blob or "vesktop://static" in blob:
+                out["error"] = "Finish Vesktop setup and log into Discord. Desktop Mode is easiest; the session is saved after that."
+                return out
+            snap = await self._bridge("snapshot()")
+            if isinstance(snap, dict):
+                out.update(snap)
+                out["cdp"] = True
+        except Exception as e:
+            out["error"] = str(e)
+        return out
 
-async def leave_voice() -> Dict[str, Any]:
-    return await backend.leave_voice()
+    async def join_voice(self, channel_id: str, channel_name: str = "") -> dict[str, Any]:
+        r = await self._bridge(f"joinVoice({json.dumps(channel_id)})")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
-async def set_user_volume(user_id: str, volume: int) -> Dict[str, Any]:
-    return await backend.set_user_volume(user_id, volume)
+    async def leave_voice(self) -> dict[str, Any]:
+        r = await self._bridge("leaveVoice()")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
-async def set_user_mute(user_id: str, muted: bool) -> Dict[str, Any]:
-    return await backend.set_user_mute(user_id, muted)
+    async def toggle_mute(self) -> dict[str, Any]:
+        r = await self._bridge("toggleMute()")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
-async def set_setting(key: str, value: Any) -> Dict[str, Any]:
-    return await backend.set_setting(key, value)
+    async def toggle_deafen(self) -> dict[str, Any]:
+        r = await self._bridge("toggleDeafen()")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
+    async def select_text(self, channel_id: str) -> dict[str, Any]:
+        r = await self._bridge(f"selectText({json.dumps(channel_id)})")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
-# Decky load hook
-async def _main() -> None:
-    await _startup()
+    async def get_messages(self, channel_id: str, limit: int = 40) -> dict[str, Any]:
+        r = await self._bridge(f"getMessages({json.dumps(channel_id)}, {int(limit)})")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+
+    async def send_message(self, channel_id: str, content: str) -> dict[str, Any]:
+        r = await self._bridge(f"sendMessage({json.dumps(channel_id)}, {json.dumps(content)})")
+        return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
+
+    async def start_vesktop(self) -> dict[str, Any]:
+        return await self._ensure_vesktop()

@@ -1,11 +1,6 @@
 {
   "name": "deckscord",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discord companion for SteamOS / Bazzite Game Mode",
-  "type": "module",
-  "scripts": {
-    "build": "echo 'Frontend build placeholder — expand with React + Decky UI'"
-  },
-  "dependencies": {},
-  "devDependencies": {}
+  "type": "module"
 }

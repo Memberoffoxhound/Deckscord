@@ -1,10 +1,11 @@
 {
   "name": "Deckscord",
   "author": "Memberoffoxhound",
-  "flags": ["debug"],
+  "flags": [],
+  "api_version": 1,
   "publish": {
-    "tags": ["discord", "voice", "overlay", "bazzite", "steamOS"],
-    "description": "Full Discord companion for Game Mode — voice, text, per-user volume, speaking overlay, toasts. One-stop with Vesktop.",
+    "tags": ["discord", "voice", "chat", "bazzite", "steamOS"],
+    "description": "Xbox/PS5-style Discord in Game Mode — chat and calls from the Quick Access Menu.",
     "image": "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/assets/icon.png"
   }
 }
