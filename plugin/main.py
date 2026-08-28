@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -282,6 +283,9 @@ def _pick_target(targets: list[dict]) -> Optional[dict]:
     return scored[0][1]
 
 
+SINK_ID = "deckscord-qam"
+
+
 class Plugin:
     def __init__(self) -> None:
         self.cdp = Cdp()
@@ -289,6 +293,13 @@ class Plugin:
         self._injecting = asyncio.Lock()
         self._status_lock = asyncio.Lock()
         self._can_hide_window = True
+        self._video_enabled = True
+        self._grab_alive_until = 0.0
+        self._last_frames: list[dict[str, Any]] = []
+        self._audio_focus: dict[str, Any] = {"userId": None, "saved": {}}
+        self._grab_lock = asyncio.Lock()
+        self._last_voice_channel: Optional[str] = None
+        self._grab_log_at = 0.0
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -299,6 +310,10 @@ class Plugin:
             decky.logger.warning(f"vesktop start: {e}")
 
     async def _unload(self) -> None:
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
+        except Exception:
+            pass
         await self.cdp.close()
 
     async def _ensure_vesktop(self, wait: bool = False) -> dict[str, Any]:
@@ -395,6 +410,15 @@ class Plugin:
             if isinstance(result, dict) and result.get("ok") is False:
                 raise RuntimeError(result.get("error") or "bridge inject failed")
             self._bridge_hash = h
+            if self._audio_focus.get("userId"):
+                try:
+                    await self._eval(
+                        "window.__deckscord && window.__deckscord.restoreAudioFocus("
+                        + json.dumps(self._audio_focus)
+                        + ")"
+                    )
+                except Exception:
+                    pass
 
     async def _eval(self, expression: str, timeout: float = 12.0) -> Any:
         res = await self.cdp.call(
@@ -489,6 +513,7 @@ class Plugin:
             "ready": False,
             "phase": "starting",
             "phase_label": "Starting Discord…",
+            "videoEnabled": bool(self._video_enabled),
         }
 
         targets: Optional[list] = None
@@ -582,8 +607,33 @@ class Plugin:
             if isinstance(user, dict):
                 name = user.get("name") or user.get("username") or ""
             out["phase_label"] = f"Ready{(' · ' + name) if name else ''}"
+            out["videoEnabled"] = bool(self._video_enabled)
+            voice = out.get("voice") if isinstance(out.get("voice"), dict) else None
+            vch = str((voice or {}).get("channelId") or "") or None
+            if self._last_voice_channel and vch != self._last_voice_channel:
+                try:
+                    await self._eval("window.__deckscord && window.__deckscord.clearAudioFocus()")
+                except Exception:
+                    pass
+                self._audio_focus = {"userId": None, "saved": {}}
+            if not vch and self._audio_focus.get("userId"):
+                try:
+                    await self._eval("window.__deckscord && window.__deckscord.clearAudioFocus()")
+                except Exception:
+                    pass
+                self._audio_focus = {"userId": None, "saved": {}}
+            self._last_voice_channel = vch
             try:
-                await self._hide_window()
+                if self._video_enabled and time.monotonic() < self._grab_alive_until:
+                    pass
+                else:
+                    if self._video_enabled and self._grab_alive_until and time.monotonic() >= self._grab_alive_until:
+                        try:
+                            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
+                        except Exception:
+                            pass
+                        self._grab_alive_until = 0.0
+                    await self._hide_window()
             except Exception:
                 pass
         elif out.get("booting") or not on_login:
@@ -607,17 +657,30 @@ class Plugin:
     def _ok(self, r: Any) -> dict[str, Any]:
         return r if isinstance(r, dict) else {"ok": False, "error": "bad response"}
 
+    async def _clear_audio_focus_safe(self) -> None:
+        try:
+            await self._bridge("clearAudioFocus()")
+        except Exception as e:
+            decky.logger.warning(f"clearAudioFocus: {e}")
+        self._audio_focus = {"userId": None, "saved": {}}
+
     async def join_voice(self, channel_id: str = "", channel_name: str = "", **kwargs: Any) -> dict[str, Any]:
         cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")
         decky.logger.info(f"join_voice {cid} {channel_name}")
         if not cid:
             return {"ok": False, "error": "missing channel_id"}
+        await self._clear_audio_focus_safe()
         r = await self._bridge(f"joinVoice({json.dumps(cid)})")
         decky.logger.info(f"join_voice result {r}")
         return self._ok(r)
 
     async def leave_voice(self) -> dict[str, Any]:
         decky.logger.info("leave_voice")
+        await self._clear_audio_focus_safe()
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
+        except Exception:
+            pass
         r = await self._bridge("leaveVoice()")
         decky.logger.info(f"leave_voice result {r}")
         return self._ok(r)
@@ -690,6 +753,103 @@ class Plugin:
         vol = kwargs.get("volume", volume)
         r = await self._bridge(f"setOutputVolume({float(vol)})")
         return self._ok(r)
+
+    async def set_window_mode(self, mode: str = "minimized", **kwargs: Any) -> dict[str, Any]:
+        mode = str(kwargs.get("mode") or mode or "minimized")
+        if not self._can_hide_window:
+            return {"ok": False, "error": "window api missing"}
+        try:
+            await self._ensure_cdp(inject=False, attempts=2, hide=False)
+            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
+            wid = (info or {}).get("windowId")
+            if wid is None:
+                return {"ok": False, "error": "no windowId"}
+            if mode == "minimized":
+                bounds: dict[str, Any] = {"windowState": "minimized"}
+            elif mode == "offscreen":
+                bounds = {"windowState": "normal", "left": -600, "top": 0, "width": 480, "height": 640}
+            else:
+                bounds = {"windowState": "normal", "width": 480, "height": 640}
+            await self.cdp.call("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds}, timeout=3)
+            return {"ok": True, "mode": mode}
+        except Exception as e:
+            decky.logger.warning(f"set_window_mode: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def _arm_grab_window(self) -> None:
+        if not self._video_enabled:
+            return
+        self._grab_alive_until = time.monotonic() + 3.0
+        await self.set_window_mode("offscreen")
+
+    async def _bridge_hot(self, call: str, timeout: float = 0.4) -> Any:
+        if not self.cdp.connected:
+            await self._bridge("ping()")
+        if not self.cdp.connected:
+            raise ConnectionError("not connected")
+        return await self._eval(f"window.__deckscord.{call}", timeout=timeout)
+
+    async def probe_video(self, restore: bool = False, **kwargs: Any) -> dict[str, Any]:
+        restore = bool(kwargs.get("restore", restore))
+        if restore:
+            await self._arm_grab_window()
+        r = await self._bridge("probeVideo()")
+        out = self._ok(r)
+        try:
+            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
+            out["windowState"] = ((info or {}).get("bounds") or {}).get("windowState")
+        except Exception:
+            out["windowState"] = None
+        decky.logger.info(
+            f"probe_video winner={out.get('winner')} engine={out.get('engineType')} "
+            f"sink={out.get('sinkApi')} streams={out.get('streamIds')} videos={len(out.get('dom') or [])}"
+        )
+        return out
+
+    async def get_video_frames(self) -> dict[str, Any]:
+        if not self._video_enabled:
+            return {"ok": True, "frames": [], "videoEnabled": False}
+        if self._status_lock.locked() or self._grab_lock.locked():
+            return {"ok": True, "frames": self._last_frames, "cached": True, "videoEnabled": True}
+        async with self._grab_lock:
+            await self._arm_grab_window()
+            t0 = time.monotonic()
+            try:
+                r = await self._bridge_hot("grabVideoFrames()", timeout=0.8)
+            except Exception as e:
+                decky.logger.warning(f"grab: {e}")
+                return {"ok": True, "frames": self._last_frames, "cached": True, "error": "grab_timeout", "videoEnabled": True}
+            ms = int((time.monotonic() - t0) * 1000)
+            if isinstance(r, dict) and r.get("ok") and r.get("frames"):
+                self._last_frames = r["frames"]
+            if time.monotonic() - self._grab_log_at > 5:
+                n = len((r or {}).get("frames") or [])
+                raw = 0
+                for f in (r or {}).get("frames") or []:
+                    raw += len(str((f or {}).get("jpeg") or ""))
+                decky.logger.info(f"video_grab n={n} ms={ms} jpeg_chars={raw}")
+                self._grab_log_at = time.monotonic()
+            if isinstance(r, dict):
+                r["videoEnabled"] = True
+                r["ms"] = ms
+                return r
+            return {"ok": False, "error": "bad response", "frames": self._last_frames}
+
+    async def focus_audio(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        if not uid:
+            return {"ok": False, "error": "missing user_id"}
+        r = await self._bridge(f"focusAudio({json.dumps(uid)})")
+        if isinstance(r, dict) and r.get("focus"):
+            self._audio_focus = r["focus"]
+        elif isinstance(r, dict) and r.get("ok"):
+            self._audio_focus = {"userId": uid, "saved": (self._audio_focus or {}).get("saved") or {}}
+        decky.logger.info(f"focus_audio {uid} {r if isinstance(r, dict) else ''}")
+        return self._ok(r)
+
+    async def clear_audio_focus(self) -> dict[str, Any]:
+        await self._clear_audio_focus_safe()
+        return {"ok": True}
 
     async def select_text(self, channel_id: str = "", **kwargs: Any) -> dict[str, Any]:
         cid = str(channel_id or kwargs.get("channel_id") or kwargs.get("id") or "")

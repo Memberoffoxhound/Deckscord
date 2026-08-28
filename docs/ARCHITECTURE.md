@@ -44,4 +44,4 @@ The Python backend is stdlib-only (asyncio + a tiny WebSocket client). No pip pa
 
 ## Later
 
-Speaking overlay, join/leave toasts, per-user volume, screen share / PiP. Those wait until Voice + Text stay up in Game Mode.
+QAM live video copies JPEG tiles out of Vesktop (`grabVideoFrames`) and solos one speaker via local mute (`focusAudio`). Call audio stays in PipeWire. Vesktop is un-minimized only while frames are polled, then hidden again.

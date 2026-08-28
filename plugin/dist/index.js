@@ -44,6 +44,9 @@ const selectText = backend("select_text");
 const getMessages = backend("get_messages");
 const sendMessage = backend("send_message");
 const startVesktop = backend("start_vesktop");
+const getVideoFrames = backend("get_video_frames");
+const focusAudio = backend("focus_audio");
+const clearAudioFocus = backend("clear_audio_focus");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -366,6 +369,148 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
+function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
+  const onCancel = useContext(BackNav);
+  const go = () => {
+    if (stream.self) {
+      if (onOpenMember) onOpenMember(stream);
+      return;
+    }
+    if (focused && onOpenMember) onOpenMember(stream);
+    else if (onFocus) onFocus(stream.userId);
+  };
+  return e(
+    Focusable,
+    {
+      className: fieldClass(),
+      onActivate: go,
+      onOKButton: go,
+      onClick: go,
+      ...cancelBind(onCancel),
+      style: {
+        ...FILL,
+        position: "relative",
+        height: height || undefined,
+        aspectRatio: height ? undefined : "16 / 9",
+        padding: 0,
+        margin: "0 0 6px",
+        overflow: "hidden",
+        boxShadow: focused ? "inset 0 0 0 2px #3ba55d" : undefined,
+      },
+    },
+    [
+      jpeg
+        ? e("img", {
+            key: "img",
+            src: jpeg,
+            alt: "",
+            style: {
+              width: "100%",
+              height: "100%",
+              objectFit: stream.kind === "screenshare" ? "contain" : "cover",
+              display: "block",
+              background: "#000",
+            },
+          })
+        : e("div", {
+            key: "ph",
+            style: {
+              width: "100%",
+              height: "100%",
+              minHeight: height || 120,
+              background: "rgba(0,0,0,0.55)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              opacity: 0.85,
+            },
+          }, e(Avatar, { src: stream.avatar, name: stream.name, size: 48, radius: 24 })),
+      e("div", {
+        key: "scrim",
+        style: {
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: 48,
+          height: 48,
+          pointerEvents: "none",
+          background: "linear-gradient(135deg, rgba(0,0,0,0.45) 0%, transparent 70%)",
+        },
+      }),
+      e(
+        "div",
+        { key: "av", style: { position: "absolute", top: 6, left: 6, pointerEvents: "none", opacity: 0.88 } },
+        e(Avatar, { src: stream.avatar, name: stream.name, size: 22, radius: 11 })
+      ),
+      e(
+        "div",
+        {
+          key: "kind",
+          style: { position: "absolute", top: 6, right: 6, pointerEvents: "none", fontSize: 14, opacity: 0.75 },
+        },
+        stream.kind === "screenshare" ? "🖥" : "📷"
+      ),
+      focused &&
+        e(
+          "div",
+          {
+            key: "pill",
+            style: {
+              position: "absolute",
+              right: 6,
+              bottom: 6,
+              pointerEvents: "none",
+              background: "rgba(0,0,0,0.55)",
+              borderRadius: 4,
+              padding: "3px 5px",
+              color: "#3ba55d",
+              fontSize: 12,
+              fontWeight: 700,
+            },
+          },
+          "🔊"
+        ),
+    ]
+  );
+}
+
+function VideoStack({ streams, frames, focusedUserId, max, onFocus, onOpenMember, onMore }) {
+  const list = streams || [];
+  const copied = list.slice(0, max);
+  const extra = Math.max(0, list.length - copied.length);
+  const n = copied.length || 1;
+  const h = n === 1 ? 225 : n === 2 ? 160 : 120;
+  const byKey = {};
+  (frames || []).forEach((f) => {
+    byKey[f.userId + ":" + (f.kind || "camera")] = f;
+  });
+  if (!copied.length) return null;
+  return e(
+    "div",
+    { style: { ...FILL, padding: 0, margin: "0 0 8px" } },
+    copied
+      .map((s) => {
+        const fr = byKey[s.userId + ":" + s.kind] || {};
+        return e(VideoTile, {
+          key: s.userId + s.kind,
+          stream: s,
+          focused: !s.self && focusedUserId === s.userId,
+          jpeg: fr.black ? null : fr.jpeg,
+          height: h,
+          onFocus,
+          onOpenMember,
+        });
+      })
+      .concat(
+        extra
+          ? [
+              e(Row, { key: "more", onClick: onMore }, e(Label, null, "+" + extra + " more videos")),
+            ]
+          : []
+      )
+  );
+}
+
 function App() {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState("");
@@ -375,9 +520,11 @@ function App() {
   const [draft, setDraft] = useState("");
   const [tick, setTick] = useState(0);
   const [volLocal, setVolLocal] = useState({});
+  const [frames, setFrames] = useState([]);
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const volTimer = useRef(null);
+  const grabBusy = useRef(false);
 
   const view = stack[stack.length - 1] || { page: "home" };
   const canBack = stack.length > 1;
@@ -451,6 +598,32 @@ function App() {
       clearInterval(id);
     };
   }, [chatId, status && status.ready]);
+
+  const videoOn = !!(status && status.videoEnabled && status.voice && status.voice.hasVideo);
+  const streamCount = ((status && status.voice && status.voice.streams) || []).length;
+  useEffect(() => {
+    if (!videoOn) {
+      setFrames([]);
+      return;
+    }
+    let stop = false;
+    const pull = async () => {
+      if (grabBusy.current || stop) return;
+      grabBusy.current = true;
+      try {
+        const r = await getVideoFrames();
+        if (!stop && r && r.frames) setFrames(r.frames);
+      } catch (_) {}
+      grabBusy.current = false;
+    };
+    pull();
+    const fps = streamCount <= 1 ? 5 : streamCount === 2 ? 4 : 3;
+    const id = setInterval(pull, Math.max(220, Math.floor(1000 / fps)));
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [videoOn, streamCount]);
 
   const act = async (label, fn, opts) => {
     const quiet = opts && opts.quiet;
@@ -538,97 +711,131 @@ function App() {
     volLocal.output != null ? volLocal.output : devices.outputVolume != null ? devices.outputVolume : 100;
   const inVol = volLocal.input != null ? volLocal.input : devices.inputVolume != null ? devices.inputVolume : 100;
 
-  const showVoicePanel = ready && view.page !== "chat" && view.page !== "member";
+  const videoEnabled = !!(status && status.videoEnabled);
+  const hasVideo = !!(voice && voice.hasVideo);
+  const liveStreams = (voice && voice.streams) || [];
+  const focusedUserId = (voice && voice.focusedUserId) || null;
+  const showLiveVideo = videoEnabled && hasVideo;
+  const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
+  const onTileFocus = (uid) => act("Focus", () => focusAudio(uid), { quiet: true });
+  const onTileMember = (s) => {
+    const m = memberById(s.userId) || { id: s.userId, name: s.name, avatar: s.avatar, self: !!s.self };
+    openMember(m);
+  };
+
+  const compactVoice = [
+    voice
+      ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
+      : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
+    e(
+      DFL.PanelSectionRow,
+      { key: "mute" },
+      e(DFL.ToggleField, {
+        label: "Mute",
+        description: "Microphone",
+        checked: !!(status && status.muted),
+        onChange: () => tap(() => act("Mute", () => toggleMute())),
+        ...cancelBind(handleCancel),
+      })
+    ),
+    e(
+      DFL.PanelSectionRow,
+      { key: "deaf" },
+      e(DFL.ToggleField, {
+        label: "Deafen",
+        description: "Speakers and microphone",
+        checked: !!(status && status.deafened),
+        onChange: () => tap(() => act("Deafen", () => toggleDeafen())),
+        ...cancelBind(handleCancel),
+      })
+    ),
+  ];
+  const sliderRows = [
+    e(
+      DFL.PanelSectionRow,
+      { key: "ovol" },
+      e(DFL.SliderField, {
+        label: "Output volume",
+        value: outVol,
+        min: 0,
+        max: 200,
+        step: 5,
+        showValue: true,
+        valueSuffix: "%",
+        onChange: (v) => slideVol("output", v, () => setOutputVolume(v)),
+        ...cancelBind(handleCancel),
+      })
+    ),
+    e(
+      DFL.PanelSectionRow,
+      { key: "ivol" },
+      e(DFL.SliderField, {
+        label: "Input volume",
+        value: inVol,
+        min: 0,
+        max: 200,
+        step: 5,
+        showValue: true,
+        valueSuffix: "%",
+        onChange: (v) => slideVol("input", v, () => setInputVolume(v)),
+        ...cancelBind(handleCancel),
+      })
+    ),
+    e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")),
+  ];
+  const memberRows =
+    voice && voice.members && voice.members.length
+      ? voice.members.map((m) =>
+          e(
+            Row,
+            { key: m.id, onClick: () => openMember(m) },
+            [
+              e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 32, radius: 16 }),
+              e(
+                "div",
+                { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } },
+                [
+                  e(Label, null, m.name + (m.self ? " (you)" : "")),
+                  e(
+                    Sub,
+                    null,
+                    [
+                      focusedUserId === m.id ? "solo" : "",
+                      m.localMute || m.muted ? "muted" : "",
+                      m.deaf ? "deaf" : "",
+                      "vol " + Math.round(volLocal["u" + m.id] != null ? volLocal["u" + m.id] : m.volume != null ? m.volume : 100) + "%",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  ),
+                ]
+              ),
+              e("div", { key: "sp", style: { fontSize: 18, flexShrink: 0, opacity: 0.9 } }, "🔊"),
+            ]
+          )
+        )
+      : null;
+  const videoStack = showLiveVideo
+    ? e(VideoStack, {
+        key: "vids",
+        streams: liveStreams,
+        frames,
+        focusedUserId,
+        max: 3,
+        onFocus: onTileFocus,
+        onOpenMember: onTileMember,
+        onMore: openVideoPage,
+      })
+    : null;
+
+  const showVoicePanel = ready && view.page !== "chat" && view.page !== "member" && view.page !== "video";
+  const voiceKids =
+    showLiveVideo && view.page !== "devices"
+      ? [videoStack].concat(compactVoice).concat(memberRows || []).concat(sliderRows)
+      : compactVoice.concat(sliderRows).concat(memberRows || []);
   const voiceSection =
     showVoicePanel &&
-    e(DFL.PanelSection, { title: voice ? "Voice · " + voice.name : "Voice" }, [
-      voice
-        ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
-        : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
-      e(
-        DFL.PanelSectionRow,
-        { key: "mute" },
-        e(DFL.ToggleField, {
-          label: "Mute",
-          description: "Microphone",
-          checked: !!(status && status.muted),
-          onChange: () => tap(() => act("Mute", () => toggleMute())),
-          ...cancelBind(handleCancel),
-        })
-      ),
-      e(
-        DFL.PanelSectionRow,
-        { key: "deaf" },
-        e(DFL.ToggleField, {
-          label: "Deafen",
-          description: "Speakers and microphone",
-          checked: !!(status && status.deafened),
-          onChange: () => tap(() => act("Deafen", () => toggleDeafen())),
-          ...cancelBind(handleCancel),
-        })
-      ),
-      e(
-        DFL.PanelSectionRow,
-        { key: "ovol" },
-        e(DFL.SliderField, {
-          label: "Output volume",
-          value: outVol,
-          min: 0,
-          max: 200,
-          step: 5,
-          showValue: true,
-          valueSuffix: "%",
-          onChange: (v) => slideVol("output", v, () => setOutputVolume(v)),
-          ...cancelBind(handleCancel),
-        })
-      ),
-      e(
-        DFL.PanelSectionRow,
-        { key: "ivol" },
-        e(DFL.SliderField, {
-          label: "Input volume",
-          value: inVol,
-          min: 0,
-          max: 200,
-          step: 5,
-          showValue: true,
-          valueSuffix: "%",
-          onChange: (v) => slideVol("input", v, () => setInputVolume(v)),
-          ...cancelBind(handleCancel),
-        })
-      ),
-      e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")),
-      voice && voice.members && voice.members.length
-        ? voice.members.map((m) =>
-            e(
-              Row,
-              { key: m.id, onClick: () => openMember(m) },
-              [
-                e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 32, radius: 16 }),
-                e(
-                  "div",
-                  { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } },
-                  [
-                    e(Label, null, m.name + (m.self ? " (you)" : "")),
-                    e(
-                      Sub,
-                      null,
-                      [
-                        m.localMute || m.muted ? "muted" : "",
-                        m.deaf ? "deaf" : "",
-                        "vol " + Math.round(volLocal["u" + m.id] != null ? volLocal["u" + m.id] : m.volume != null ? m.volume : 100) + "%",
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")
-                    ),
-                  ]
-                ),
-                e("div", { key: "sp", style: { fontSize: 18, flexShrink: 0, opacity: 0.9 } }, "🔊"),
-              ]
-            )
-          )
-        : null,
-    ]);
+    e(DFL.PanelSection, { title: voice ? "Voice · " + voice.name : "Voice" }, voiceKids);
 
   let body = null;
 
@@ -830,6 +1037,12 @@ function App() {
           ),
         e("div", { key: "msgs", style: FILL }, msgList),
         e("div", { key: "compose", style: FILL }, composer),
+        showLiveVideo &&
+          e(
+            DFL.PanelSectionRow,
+            { key: "live" },
+            e(DFL.ButtonItem, { layout: "below", onClick: openVideoPage, ...cancelBind(handleCancel) }, "Live video (" + liveStreams.length + ")")
+          ),
         voice &&
           e(
             DFL.PanelSectionRow,
@@ -928,6 +1141,21 @@ function App() {
           })
         ),
       !view.self &&
+        e(
+          DFL.PanelSectionRow,
+          { key: "solo" },
+          e(DFL.ToggleField, {
+            label: "Solo this user",
+            description: "Hear only them in this call",
+            checked: focusedUserId === view.userId,
+            onChange: () => {
+              if (focusedUserId === view.userId) act("Clear solo", () => clearAudioFocus());
+              else act("Solo", () => focusAudio(view.userId));
+            },
+            ...cancelBind(handleCancel),
+          })
+        ),
+      !view.self &&
         guildId &&
         e(
           DFL.PanelSectionRow,
@@ -961,6 +1189,18 @@ function App() {
         ),
       view.self && e(DFL.PanelSectionRow, { key: "self" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "This is you. Use Mute / Deafen in Voice.")),
     ]);
+  } else if (view.page === "video") {
+    body = e(DFL.PanelSection, { title: voice ? "Live · " + voice.name : "Live video" }, [
+      e(VideoStack, {
+        key: "vids",
+        streams: liveStreams,
+        frames,
+        focusedUserId,
+        max: 4,
+        onFocus: onTileFocus,
+        onOpenMember: onTileMember,
+      }),
+    ].concat(compactVoice));
   }
 
   const rootProps = {

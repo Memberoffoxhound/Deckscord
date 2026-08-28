@@ -15,5 +15,9 @@
  * B / onCancel pops the view stack until home, then QAM closes.
  * Chat puts messages first (no nested scroller) so the thread sits in
  * the upper half of the QAM and d-pad can move through it.
+ *
+ * Live video: edge-to-edge JPEG tiles (VideoStack first in voice),
+ * exclusive local-mute on tile A, 🔊 pill on the focused stream.
+ * Member-row A still opens the mixer; Solo is a ToggleField there.
  */
 export {};

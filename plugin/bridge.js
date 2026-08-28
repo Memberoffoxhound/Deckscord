@@ -203,6 +203,8 @@
       self: id === meId,
       volume: volume,
       localMute: localMute,
+      selfVideo: !!(st && (st.selfVideo || st.self_video)),
+      selfStream: !!(st && (st.selfStream || st.self_stream)),
     };
   }
 
@@ -238,6 +240,258 @@
       width: x.width || 0,
       height: x.height || 0,
     };
+  }
+
+  var SINK_ID = "deckscord-qam";
+  window.__deckscordAudioFocus = window.__deckscordAudioFocus || { userId: null, saved: {} };
+  window.__deckscordVideo = window.__deckscordVideo || { canvases: {}, sinks: false };
+
+  function eachMediaConnection(fn) {
+    var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+    var eng = null;
+    try {
+      eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
+    } catch (e) {}
+    if (!eng) return;
+    try {
+      if (typeof eng.eachConnection === "function") {
+        eng.eachConnection(fn);
+        return;
+      }
+    } catch (e2) {}
+    var conns = eng.connections;
+    try {
+      if (!conns && eng.getConnections) conns = eng.getConnections();
+    } catch (e3) {}
+    if (!conns) return;
+    if (Array.isArray(conns)) conns.forEach(fn);
+    else Object.keys(conns).forEach(function (k) { fn(conns[k], k); });
+  }
+
+  function findEngineFn(name) {
+    var found = null;
+    eachMediaConnection(function (c) {
+      if (found || !c) return;
+      if (typeof c[name] === "function") found = c[name].bind(c);
+    });
+    if (found) return found;
+    var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+    try {
+      var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
+      if (eng && typeof eng[name] === "function") return eng[name].bind(eng);
+    } catch (e) {}
+    return findFn(name);
+  }
+
+  function setLocalMuteSafe(userId, mute) {
+    var id = String(userId);
+    var fn = findEngineFn("setLocalMute") || findFn("setLocalMute");
+    if (fn) {
+      fn(id, !!mute);
+      return "setLocalMute";
+    }
+    var MediaEngineStore = store("MediaEngineStore") || byProps("isLocalMute", "getLocalVolume");
+    var now = !!(MediaEngineStore && MediaEngineStore.isLocalMute && MediaEngineStore.isLocalMute(id));
+    if (now !== !!mute) {
+      var tog = findFn("toggleLocalMute");
+      if (tog) tog(id);
+      return "toggleLocalMute";
+    }
+    return "noop";
+  }
+
+  function collectStreams() {
+    var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
+    var ChannelStore = store("ChannelStore") || byProps("getChannel", "getDMFromUserId");
+    var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
+    var VoiceStateStore = store("VoiceStateStore") || byProps("getVoiceStateForUser", "getVoiceStatesForChannel");
+    var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+    var me = UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser();
+    var meId = me && String(me.id);
+    var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
+    if (!cid) return { channelId: null, guildId: null, meId: meId, members: [], streams: [] };
+    var vc = ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(cid);
+    var guildId = vc ? (vc.guild_id || vc.guildId || null) : null;
+    var members = voiceMembersFor(cid, UserStore, VoiceStateStore, meId, MediaEngineStore);
+    var streams = [];
+    var seen = {};
+    function add(userId, kind, streamId) {
+      userId = String(userId || "");
+      if (!userId) return;
+      kind = kind || "camera";
+      var key = userId + ":" + kind;
+      if (seen[key]) return;
+      seen[key] = true;
+      var m = null;
+      for (var i = 0; i < members.length; i++) if (members[i].id === userId) m = members[i];
+      var u = UserStore && UserStore.getUser && UserStore.getUser(userId);
+      streams.push({
+        userId: userId,
+        kind: kind,
+        name: (m && m.name) || (u && (u.globalName || u.username)) || userId,
+        avatar: (m && m.avatar) || avatarFromUser(u, 48),
+        self: !!(m && m.self) || userId === meId,
+        streamId: String(streamId || userId),
+      });
+    }
+    members.forEach(function (m) {
+      if (m.selfVideo) add(m.id, "camera", m.id);
+      if (m.selfStream) add(m.id, "screenshare", m.id);
+    });
+    var rtc = store("ChannelRTCStore");
+    function walkParticipants(bag, kind) {
+      if (!bag) return;
+      if (Array.isArray(bag)) {
+        bag.forEach(function (p) {
+          var id = p && (p.userId || p.user_id || p.id || (p.user && p.user.id));
+          if (id) add(id, kind, (p && (p.streamId || p.id)) || id);
+        });
+        return;
+      }
+      if (typeof bag === "object") {
+        Object.keys(bag).forEach(function (id) {
+          var p = bag[id];
+          add((p && (p.userId || p.id)) || id, kind, (p && p.streamId) || id);
+        });
+      }
+    }
+    try {
+      if (rtc && typeof rtc.getVideoParticipants === "function") {
+        var vp = rtc.getVideoParticipants(cid);
+        if (vp == null) vp = rtc.getVideoParticipants();
+        walkParticipants(vp, "camera");
+      }
+      if (rtc && typeof rtc.getStreamParticipants === "function") {
+        var sp = rtc.getStreamParticipants(cid);
+        if (sp == null) sp = rtc.getStreamParticipants();
+        walkParticipants(sp, "screenshare");
+      }
+    } catch (eRtc) {}
+    var App = store("ApplicationStreamingStore") || byProps("getAllApplicationStreamsForChannel");
+    try {
+      if (App && App.getAllApplicationStreamsForChannel) {
+        var list = App.getAllApplicationStreamsForChannel(cid) || [];
+        var arr = Array.isArray(list) ? list : Object.keys(list).map(function (k) { return list[k]; });
+        arr.forEach(function (s) {
+          var oid = s && (s.ownerId || s.owner_id || (s.user && s.user.id));
+          if (oid) add(String(oid), "screenshare", s.id || oid);
+        });
+      }
+    } catch (eApp) {}
+    streams.sort(function (a, b) {
+      if (a.self !== b.self) return a.self ? 1 : -1;
+      if (a.kind !== b.kind) return a.kind === "camera" ? -1 : 1;
+      return 0;
+    });
+    return { channelId: String(cid), guildId: guildId && String(guildId), meId: meId, members: members, streams: streams };
+  }
+
+  function canvasFromFrame(frame, w, h) {
+    var c = document.createElement("canvas");
+    c.width = w || 400;
+    c.height = h || 225;
+    var ctx = c.getContext("2d");
+    try {
+      if (!frame) return c;
+      if (frame instanceof HTMLCanvasElement || (frame.tagName && String(frame.tagName).toLowerCase() === "canvas")) {
+        ctx.drawImage(frame, 0, 0, c.width, c.height);
+      } else if (frame instanceof HTMLVideoElement || (frame.videoWidth && frame.readyState)) {
+        ctx.drawImage(frame, 0, 0, c.width, c.height);
+      } else if (frame.data && frame.width) {
+        var tmp = document.createElement("canvas");
+        tmp.width = frame.width;
+        tmp.height = frame.height;
+        tmp.getContext("2d").putImageData(frame, 0, 0);
+        ctx.drawImage(tmp, 0, 0, c.width, c.height);
+      } else if (frame.imageData) {
+        return canvasFromFrame(frame.imageData, w, h);
+      }
+    } catch (e) {}
+    return c;
+  }
+
+  function lumaBlack(canvas) {
+    try {
+      var s = document.createElement("canvas");
+      s.width = 8;
+      s.height = 8;
+      var ctx = s.getContext("2d");
+      ctx.drawImage(canvas, 0, 0, 8, 8);
+      var d = ctx.getImageData(0, 0, 8, 8).data;
+      var sum = 0;
+      var n = 0;
+      for (var i = 0; i < d.length; i += 4) {
+        sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+        n++;
+      }
+      return n ? sum / n < 8 : true;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function jpegFromCanvas(canvas, q) {
+    try {
+      return canvas.toDataURL("image/jpeg", q);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function rememberFrame(key, frame) {
+    var c = canvasFromFrame(frame, 400, 225);
+    window.__deckscordVideo.canvases[key] = c;
+  }
+
+  function ensureVideoSinks(enable) {
+    var bag = collectStreams();
+    var add = findEngineFn("addVideoOutputSink") || findEngineFn("addDirectVideoOutputSink");
+    var remove = findEngineFn("removeVideoOutputSink");
+    var keep = findEngineFn("setHasActiveVideoOutputSink");
+    bag.streams.forEach(function (s) {
+      var sid = s.streamId || s.userId;
+      try {
+        if (enable && add) {
+          add(SINK_ID, sid, function (frame) {
+            rememberFrame(s.userId + ":" + s.kind, frame);
+          });
+        }
+      } catch (e1) {
+        try {
+          if (enable && add) add(sid, function (frame) { rememberFrame(s.userId + ":" + s.kind, frame); });
+        } catch (e2) {}
+      }
+      try {
+        if (!enable && remove) remove(SINK_ID, sid);
+      } catch (e3) {}
+      try {
+        if (keep) keep(s.userId, !!enable, SINK_ID);
+      } catch (e4) {}
+    });
+    window.__deckscordVideo.sinks = !!enable;
+    return { ok: true, enabled: !!enable, n: bag.streams.length, hasAdd: !!add };
+  }
+
+  function previewJpegFor(guildId, channelId, ownerId) {
+    var Prev = store("ApplicationStreamPreviewStore") || byProps("getPreviewURL");
+    if (!Prev || !Prev.getPreviewURL) return Promise.resolve(null);
+    var p;
+    try {
+      p = Prev.getPreviewURL(guildId, channelId, ownerId);
+    } catch (e) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve(p).then(function (url) {
+      if (!url || String(url).indexOf("http") !== 0) return null;
+      return fetch(String(url)).then(function (r) { return r.blob(); }).then(function (blob) {
+        return new Promise(function (resolve) {
+          var fr = new FileReader();
+          fr.onload = function () { resolve(fr.result); };
+          fr.onerror = function () { resolve(null); };
+          fr.readAsDataURL(blob);
+        });
+      }).catch(function () { return null; });
+    }).catch(function () { return null; });
   }
 
   function kindOf(type, name) {
@@ -308,12 +562,29 @@
         if (voiceChannelId && ChannelStore) {
           var vc = ChannelStore.getChannel(voiceChannelId);
           var members = voiceMembersFor(voiceChannelId, UserStore, VoiceStateStore, me.id, MediaEngineStore);
+          var bag = collectStreams();
+          var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
+          if (af.userId && String(voiceChannelId) !== String(window.__deckscordLastVoice || voiceChannelId)) {
+            try { window.__deckscord && window.__deckscord.clearAudioFocus && window.__deckscord.clearAudioFocus(); } catch (eClr) {}
+            af = window.__deckscordAudioFocus || { userId: null, saved: {} };
+          }
+          window.__deckscordLastVoice = String(voiceChannelId);
           voice = {
             channelId: String(voiceChannelId),
             name: vc ? vc.name : String(voiceChannelId),
             guildId: vc ? (vc.guild_id || vc.guildId || null) : null,
             members: members,
+            hasVideo: !!(bag.streams && bag.streams.length),
+            focusedUserId: (af && af.userId) || null,
+            streams: bag.streams || [],
           };
+        } else {
+          window.__deckscordLastVoice = null;
+          try {
+            if (window.__deckscordAudioFocus && window.__deckscordAudioFocus.userId && window.__deckscord && window.__deckscord.clearAudioFocus) {
+              window.__deckscord.clearAudioFocus();
+            }
+          } catch (eGone) {}
         }
 
         var guilds = [];
@@ -398,6 +669,193 @@
             outputVolume: outputVolume,
           },
         };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    probeVideo: function () {
+      try {
+        var bag = collectStreams();
+        var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+        var eng = null;
+        try { eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine(); } catch (e) {}
+        var sinkApi = {
+          addVideoOutputSink: typeof findEngineFn("addVideoOutputSink") === "function" ? "function" : "undefined",
+          addDirectVideoOutputSink: typeof findEngineFn("addDirectVideoOutputSink") === "function" ? "function" : "undefined",
+          removeVideoOutputSink: typeof findEngineFn("removeVideoOutputSink") === "function" ? "function" : "undefined",
+          setVideoOutputSink: typeof findEngineFn("setVideoOutputSink") === "function" ? "function" : "undefined",
+          setHasActiveVideoOutputSink: typeof findEngineFn("setHasActiveVideoOutputSink") === "function" ? "function" : "undefined",
+          setLocalMute: typeof findEngineFn("setLocalMute") === "function" || typeof findFn("setLocalMute") === "function" ? "function" : "undefined",
+        };
+        var videos = [];
+        try {
+          Array.prototype.forEach.call(document.querySelectorAll("video"), function (el) {
+            videos.push({
+              tag: "video",
+              className: String(el.className || "").slice(0, 80),
+              w: el.videoWidth || 0,
+              h: el.videoHeight || 0,
+              readyState: el.readyState,
+              hasSrcObject: !!el.srcObject,
+              videoWidth: el.videoWidth || 0,
+            });
+          });
+        } catch (eDom) {}
+        var winner = null;
+        if (sinkApi.addVideoOutputSink === "function" || sinkApi.addDirectVideoOutputSink === "function") winner = "F";
+        else if (videos.some(function (v) { return v.videoWidth > 0; })) winner = "B";
+        else if (bag.streams.some(function (s) { return s.kind === "screenshare"; })) winner = "C";
+        var previewP = Promise.resolve(null);
+        var ss = bag.streams.filter(function (s) { return s.kind === "screenshare"; })[0];
+        if (ss && bag.guildId && bag.channelId) previewP = previewJpegFor(bag.guildId, bag.channelId, ss.userId);
+        return previewP.then(function (pj) {
+          return {
+            ok: true,
+            inVoice: !!bag.channelId,
+            channelId: bag.channelId,
+            engineType: (eng && eng.constructor && eng.constructor.name) || "unknown",
+            members: bag.members.map(function (m) {
+              return { id: m.id, name: m.name, selfVideo: !!m.selfVideo, selfStream: !!m.selfStream };
+            }),
+            streamIds: bag.streams.map(function (s) { return { userId: s.userId, kind: s.kind, streamId: s.streamId }; }),
+            sinkApi: sinkApi,
+            dom: videos,
+            window: { hidden: document.hidden, vis: document.visibilityState },
+            previewJpeg: pj || null,
+            winner: winner,
+            black: false,
+          };
+        });
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    grabVideoFrames: function () {
+      try {
+        var bag = collectStreams();
+        try { ensureVideoSinks(true); } catch (eSink) {}
+        var copied = (bag.streams || []).slice(0, 4);
+        var jobs = copied.map(function (s) {
+          var key = s.userId + ":" + s.kind;
+          var cached = window.__deckscordVideo.canvases[key];
+          var jpeg = null;
+          var black = true;
+          if (cached) {
+            black = lumaBlack(cached);
+            jpeg = black ? null : jpegFromCanvas(cached, s.kind === "screenshare" ? 0.5 : 0.4);
+          }
+          if (!jpeg) {
+            var vids = document.querySelectorAll("video");
+            for (var i = 0; i < vids.length; i++) {
+              if (vids[i].videoWidth > 0) {
+                var c = canvasFromFrame(vids[i], 400, 225);
+                black = lumaBlack(c);
+                if (!black) {
+                  jpeg = jpegFromCanvas(c, s.kind === "screenshare" ? 0.5 : 0.4);
+                  window.__deckscordVideo.canvases[key] = c;
+                  break;
+                }
+              }
+            }
+          }
+          var next = Promise.resolve(jpeg);
+          if (!jpeg && s.kind === "screenshare" && bag.guildId && bag.channelId) {
+            next = previewJpegFor(bag.guildId, bag.channelId, s.userId);
+          }
+          return next.then(function (j) {
+            var outJpeg = j || jpeg;
+            return {
+              userId: s.userId,
+              kind: s.kind,
+              name: s.name,
+              avatar: s.avatar,
+              jpeg: outJpeg || null,
+              w: 400,
+              h: 225,
+              black: !outJpeg,
+              self: !!s.self,
+            };
+          });
+        });
+        return Promise.all(jobs).then(function (frames) {
+          return { ok: true, ts: Date.now(), frames: frames };
+        });
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    ensureVideoSinks: function (enable) {
+      try {
+        return ensureVideoSinks(!!enable);
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    focusAudio: function (userId) {
+      try {
+        var bag = collectStreams();
+        var id = String(userId || "");
+        var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
+        if (!id || id === String(bag.meId || "")) {
+          return window.__deckscord.clearAudioFocus();
+        }
+        if (af.userId === id) {
+          return { ok: true, user_id: id, already: true };
+        }
+        if (af.userId) window.__deckscord.clearAudioFocus();
+        var MediaEngineStore = store("MediaEngineStore") || byProps("isLocalMute", "getLocalVolume");
+        var saved = {};
+        bag.members.forEach(function (m) {
+          if (m.self) return;
+          saved[m.id] = {
+            localMute: !!(MediaEngineStore && MediaEngineStore.isLocalMute && MediaEngineStore.isLocalMute(m.id)),
+            volume: (MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(m.id)) || 100,
+          };
+        });
+        window.__deckscordAudioFocus = { userId: id, saved: saved };
+        var used = setLocalMuteSafe(id, false);
+        var vol = MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(id);
+        if (typeof vol === "number" && vol <= 0) {
+          var sv = findFn("setLocalVolume");
+          if (sv) sv(id, 100);
+        }
+        bag.members.forEach(function (m) {
+          if (m.self || m.id === id) return;
+          setLocalMuteSafe(m.id, true);
+        });
+        return { ok: true, user_id: id, method: used, focus: window.__deckscordAudioFocus };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    clearAudioFocus: function () {
+      try {
+        var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
+        var saved = af.saved || {};
+        Object.keys(saved).forEach(function (uid) {
+          var st = saved[uid] || {};
+          setLocalMuteSafe(uid, !!st.localMute);
+          if (typeof st.volume === "number") {
+            var sv = findFn("setLocalVolume");
+            if (sv) sv(uid, st.volume);
+          }
+        });
+        window.__deckscordAudioFocus = { userId: null, saved: {} };
+        return { ok: true, cleared: true };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    restoreAudioFocus: function (blob) {
+      try {
+        if (blob && typeof blob === "object") window.__deckscordAudioFocus = blob;
+        return { ok: true, userId: (window.__deckscordAudioFocus && window.__deckscordAudioFocus.userId) || null };
       } catch (e) {
         return err(e);
       }
