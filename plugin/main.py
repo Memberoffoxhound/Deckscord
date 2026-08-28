@@ -780,7 +780,9 @@ class Plugin:
         if not self._video_enabled:
             return
         self._grab_alive_until = time.monotonic() + 3.0
-        await self.set_window_mode("offscreen")
+        # Normal (not offscreen): Discord's native video often does not paint
+        # when the window is off-screen. Idle hide still kicks in after 3s.
+        await self.set_window_mode("normal")
 
     async def _bridge_hot(self, call: str, timeout: float = 0.4) -> Any:
         if not self.cdp.connected:
@@ -821,7 +823,11 @@ class Plugin:
                 return {"ok": True, "frames": self._last_frames, "cached": True, "error": "grab_timeout", "videoEnabled": True}
             ms = int((time.monotonic() - t0) * 1000)
             if isinstance(r, dict) and r.get("ok") and r.get("frames"):
-                self._last_frames = r["frames"]
+                frames = r["frames"]
+                if any(not (f or {}).get("jpeg") for f in frames):
+                    await self._fill_frames_from_clips(frames, r.get("clips") or [])
+                self._last_frames = frames
+                r["frames"] = frames
             if time.monotonic() - self._grab_log_at > 5:
                 n = len((r or {}).get("frames") or [])
                 raw = 0
@@ -834,6 +840,53 @@ class Plugin:
                 r["ms"] = ms
                 return r
             return {"ok": False, "error": "bad response", "frames": self._last_frames}
+
+    async def _fill_frames_from_clips(self, frames: list, clips: list) -> None:
+        if not clips:
+            try:
+                rects = await self._bridge_hot("videoClipRects()", timeout=0.4)
+                if isinstance(rects, dict):
+                    clips = rects.get("clips") or []
+            except Exception:
+                clips = []
+        for i, f in enumerate(frames):
+            if not isinstance(f, dict) or f.get("jpeg"):
+                continue
+            clip = clips[i] if i < len(clips) else (clips[0] if clips else None)
+            if not clip:
+                continue
+            try:
+                shot = await self.cdp.call(
+                    "Page.captureScreenshot",
+                    {
+                        "format": "jpeg",
+                        "quality": 45,
+                        "clip": {
+                            "x": float(clip["x"]),
+                            "y": float(clip["y"]),
+                            "width": float(clip["width"]),
+                            "height": float(clip["height"]),
+                            "scale": 1,
+                        },
+                    },
+                    timeout=1.2,
+                )
+                data = (shot or {}).get("data")
+                if data:
+                    f["jpeg"] = "data:image/jpeg;base64," + data
+                    f["black"] = False
+            except Exception as e:
+                decky.logger.warning(f"clip grab: {e}")
+
+    async def get_speaking(self) -> dict[str, Any]:
+        try:
+            r = await self._bridge_hot("speakingNow()", timeout=0.4)
+        except Exception:
+            try:
+                r = await self._bridge("speakingNow()")
+            except Exception as e:
+                return {"ok": False, "ids": [], "error": str(e)}
+        return r if isinstance(r, dict) else {"ok": False, "ids": []}
 
     async def focus_audio(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
         uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")

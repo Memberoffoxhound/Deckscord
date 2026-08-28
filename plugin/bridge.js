@@ -205,7 +205,46 @@
       localMute: localMute,
       selfVideo: !!(st && (st.selfVideo || st.self_video)),
       selfStream: !!(st && (st.selfStream || st.self_stream)),
+      speaking: isUserSpeaking(id, meId),
     };
+  }
+
+  function isUserSpeaking(userId, meId) {
+    var id = String(userId || "");
+    if (!id) return false;
+    try {
+      var Sp = store("SpeakingStore") || byProps("isSpeaking", "isCurrentUserSpeaking") || byProps("isSpeaking");
+      if (Sp) {
+        if (meId && id === String(meId) && typeof Sp.isCurrentUserSpeaking === "function") {
+          if (Sp.isCurrentUserSpeaking()) return true;
+        }
+        if (typeof Sp.isSpeaking === "function" && Sp.isSpeaking(id)) return true;
+        if (typeof Sp.getSpeakers === "function") {
+          var s = Sp.getSpeakers() || [];
+          if (Array.isArray(s)) {
+            for (var i = 0; i < s.length; i++) {
+              var x = s[i];
+              if (x === id || (x && (x.userId === id || x.id === id))) return true;
+            }
+          } else if (s[id]) return true;
+        }
+      }
+    } catch (e) {}
+    try {
+      var rtc = store("ChannelRTCStore");
+      if (rtc && typeof rtc.getSpeakingParticipants === "function") {
+        var bag = rtc.getSpeakingParticipants();
+        if (bag) {
+          if (Array.isArray(bag)) {
+            for (var j = 0; j < bag.length; j++) {
+              var p = bag[j];
+              if (p === id || (p && (p.userId === id || p.id === id))) return true;
+            }
+          } else if (bag[id]) return true;
+        }
+      }
+    } catch (e2) {}
+    return false;
   }
 
   function voiceMembersFor(channelId, UserStore, VoiceStateStore, meId, MediaEngineStore) {
@@ -441,6 +480,58 @@
   function rememberFrame(key, frame) {
     var c = canvasFromFrame(frame, 400, 225);
     window.__deckscordVideo.canvases[key] = c;
+  }
+
+  function paintElementToJpeg(el, q) {
+    if (!el) return null;
+    try {
+      var w = el.videoWidth || el.width || 0;
+      var h = el.videoHeight || el.height || 0;
+      var r = el.getBoundingClientRect && el.getBoundingClientRect();
+      if ((!w || !h) && r) {
+        w = r.width;
+        h = r.height;
+      }
+      if (w < 64 || h < 64) return null;
+      if (w === 240 && h === 240) return null;
+      var c = document.createElement("canvas");
+      c.width = 400;
+      c.height = 225;
+      c.getContext("2d").drawImage(el, 0, 0, 400, 225);
+      if (lumaBlack(c)) return null;
+      return jpegFromCanvas(c, q || 0.45);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function grabDomJpeg() {
+    var nodes = document.querySelectorAll("video, canvas");
+    for (var i = 0; i < nodes.length; i++) {
+      var j = paintElementToJpeg(nodes[i], 0.45);
+      if (j) return j;
+    }
+    return null;
+  }
+
+  function videoClipRects() {
+    var out = [];
+    var nodes = document.querySelectorAll("video, canvas");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var r = el.getBoundingClientRect();
+      var vw = el.videoWidth || el.width || r.width;
+      var vh = el.videoHeight || el.height || r.height;
+      if (r.width < 80 || r.height < 80) continue;
+      if (vw === 240 && vh === 240) continue;
+      out.push({
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+      });
+    }
+    return out;
   }
 
   function ensureVideoSinks(enable) {
@@ -747,18 +838,8 @@
             jpeg = black ? null : jpegFromCanvas(cached, s.kind === "screenshare" ? 0.5 : 0.4);
           }
           if (!jpeg) {
-            var vids = document.querySelectorAll("video");
-            for (var i = 0; i < vids.length; i++) {
-              if (vids[i].videoWidth > 0) {
-                var c = canvasFromFrame(vids[i], 400, 225);
-                black = lumaBlack(c);
-                if (!black) {
-                  jpeg = jpegFromCanvas(c, s.kind === "screenshare" ? 0.5 : 0.4);
-                  window.__deckscordVideo.canvases[key] = c;
-                  break;
-                }
-              }
-            }
+            jpeg = grabDomJpeg();
+            if (jpeg) black = false;
           }
           var next = Promise.resolve(jpeg);
           if (!jpeg && s.kind === "screenshare" && bag.guildId && bag.channelId) {
@@ -780,8 +861,52 @@
           });
         });
         return Promise.all(jobs).then(function (frames) {
-          return { ok: true, ts: Date.now(), frames: frames };
+          return {
+            ok: true,
+            ts: Date.now(),
+            frames: frames,
+            clips: videoClipRects(),
+          };
         });
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    speakingNow: function () {
+      try {
+        var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
+        var me = UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser();
+        var meId = me && String(me.id);
+        var ids = [];
+        var Sp = store("SpeakingStore") || byProps("isSpeaking", "isCurrentUserSpeaking") || byProps("isSpeaking");
+        if (Sp && typeof Sp.getSpeakers === "function") {
+          var s = Sp.getSpeakers() || [];
+          if (Array.isArray(s)) {
+            s.forEach(function (x) {
+              var id = typeof x === "string" ? x : x && (x.userId || x.id);
+              if (id) ids.push(String(id));
+            });
+          } else {
+            Object.keys(s).forEach(function (id) { ids.push(String(id)); });
+          }
+        }
+        var bag = collectStreams();
+        (bag.members || []).forEach(function (m) {
+          if (isUserSpeaking(m.id, meId) && ids.indexOf(m.id) === -1) ids.push(m.id);
+        });
+        if (meId && Sp && typeof Sp.isCurrentUserSpeaking === "function" && Sp.isCurrentUserSpeaking()) {
+          if (ids.indexOf(meId) === -1) ids.push(meId);
+        }
+        return { ok: true, ids: ids };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    videoClipRects: function () {
+      try {
+        return { ok: true, clips: videoClipRects() };
       } catch (e) {
         return err(e);
       }

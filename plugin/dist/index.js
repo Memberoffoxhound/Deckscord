@@ -45,6 +45,7 @@ const getMessages = backend("get_messages");
 const sendMessage = backend("send_message");
 const startVesktop = backend("start_vesktop");
 const getVideoFrames = backend("get_video_frames");
+const getSpeaking = backend("get_speaking");
 const focusAudio = backend("focus_audio");
 const clearAudioFocus = backend("clear_audio_focus");
 
@@ -369,7 +370,7 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
+function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMember }) {
   const onCancel = useContext(BackNav);
   const go = () => {
     if (stream.self) {
@@ -395,7 +396,11 @@ function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
         padding: 0,
         margin: "0 0 6px",
         overflow: "hidden",
-        boxShadow: focused ? "inset 0 0 0 2px #3ba55d" : undefined,
+        boxShadow: focused
+          ? "inset 0 0 0 2px #3ba55d"
+          : speaking
+            ? "inset 0 0 0 2px rgba(59,165,93,0.7)"
+            : undefined,
       },
     },
     [
@@ -450,7 +455,7 @@ function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
         },
         stream.kind === "screenshare" ? "🖥" : "📷"
       ),
-      focused &&
+      (focused || speaking) &&
         e(
           "div",
           {
@@ -463,9 +468,10 @@ function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
               background: "rgba(0,0,0,0.55)",
               borderRadius: 4,
               padding: "3px 5px",
-              color: "#3ba55d",
-              fontSize: 12,
+              color: speaking ? "#3ba55d" : "#8fbc9a",
+              fontSize: 14,
               fontWeight: 700,
+              textShadow: speaking ? "0 0 8px #3ba55d" : "none",
             },
           },
           "🔊"
@@ -474,7 +480,7 @@ function VideoTile({ stream, focused, jpeg, height, onFocus, onOpenMember }) {
   );
 }
 
-function VideoStack({ streams, frames, focusedUserId, max, onFocus, onOpenMember, onMore }) {
+function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus, onOpenMember, onMore }) {
   const list = streams || [];
   const copied = list.slice(0, max);
   const extra = Math.max(0, list.length - copied.length);
@@ -497,6 +503,7 @@ function VideoStack({ streams, frames, focusedUserId, max, onFocus, onOpenMember
           focused: !s.self && focusedUserId === s.userId,
           jpeg: fr.black ? null : fr.jpeg,
           height: h,
+          speaking: !!(speakingIds && speakingIds[s.userId]),
           onFocus,
           onOpenMember,
         });
@@ -521,6 +528,7 @@ function App() {
   const [tick, setTick] = useState(0);
   const [volLocal, setVolLocal] = useState({});
   const [frames, setFrames] = useState([]);
+  const [speakingIds, setSpeakingIds] = useState({});
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const volTimer = useRef(null);
@@ -624,6 +632,32 @@ function App() {
       clearInterval(id);
     };
   }, [videoOn, streamCount]);
+
+  const inVoice = !!(status && status.ready && status.voice && status.voice.channelId);
+  useEffect(() => {
+    if (!inVoice) {
+      setSpeakingIds({});
+      return;
+    }
+    let stop = false;
+    const pull = async () => {
+      try {
+        const r = await getSpeaking();
+        if (stop) return;
+        const next = {};
+        ((r && r.ids) || []).forEach((id) => {
+          next[String(id)] = true;
+        });
+        setSpeakingIds(next);
+      } catch (_) {}
+    };
+    pull();
+    const id = setInterval(pull, 280);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [inVoice]);
 
   const act = async (label, fn, opts) => {
     const quiet = opts && opts.quiet;
@@ -783,44 +817,62 @@ function App() {
     ),
     e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")),
   ];
-  const memberRows =
-    voice && voice.members && voice.members.length
-      ? voice.members.map((m) =>
-          e(
-            Row,
-            { key: m.id, onClick: () => openMember(m) },
-            [
-              e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 32, radius: 16 }),
-              e(
-                "div",
-                { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } },
-                [
-                  e(Label, null, m.name + (m.self ? " (you)" : "")),
-                  e(
-                    Sub,
-                    null,
-                    [
-                      focusedUserId === m.id ? "solo" : "",
-                      m.localMute || m.muted ? "muted" : "",
-                      m.deaf ? "deaf" : "",
-                      "vol " + Math.round(volLocal["u" + m.id] != null ? volLocal["u" + m.id] : m.volume != null ? m.volume : 100) + "%",
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")
-                  ),
-                ]
-              ),
-              e("div", { key: "sp", style: { fontSize: 18, flexShrink: 0, opacity: 0.9 } }, "🔊"),
-            ]
-          )
-        )
-      : null;
+  const videoUserIds = {};
+  liveStreams.forEach((s) => {
+    videoUserIds[s.userId] = true;
+  });
+  const listMembers = ((voice && voice.members) || []).filter((m) => !showLiveVideo || !videoUserIds[m.id]);
+  const memberRows = listMembers.map((m) => {
+    const talking = !!(speakingIds[m.id] || m.speaking);
+    return e(
+      Row,
+      { key: m.id, onClick: () => openMember(m) },
+      [
+        e(Avatar, { key: "a", src: m.avatar, name: m.name, size: 32, radius: 16 }),
+        e(
+          "div",
+          { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } },
+          [
+            e(Label, null, m.name + (m.self ? " (you)" : "")),
+            e(
+              Sub,
+              null,
+              [
+                talking ? "speaking" : "",
+                focusedUserId === m.id ? "solo" : "",
+                m.localMute || m.muted ? "muted" : "",
+                m.deaf ? "deaf" : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            ),
+          ]
+        ),
+        e(
+          "div",
+          {
+            key: "sp",
+            style: {
+              fontSize: 18,
+              flexShrink: 0,
+              color: talking ? "#3ba55d" : "rgba(255,255,255,0.28)",
+              textShadow: talking ? "0 0 10px #3ba55d" : "none",
+              transform: talking ? "scale(1.15)" : "scale(1)",
+              transition: "color 80ms, text-shadow 80ms, transform 80ms",
+            },
+          },
+          "🔊"
+        ),
+      ]
+    );
+  });
   const videoStack = showLiveVideo
     ? e(VideoStack, {
         key: "vids",
         streams: liveStreams,
         frames,
         focusedUserId,
+        speakingIds,
         max: 3,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
@@ -829,10 +881,10 @@ function App() {
     : null;
 
   const showVoicePanel = ready && view.page !== "chat" && view.page !== "member" && view.page !== "video";
-  const voiceKids =
-    showLiveVideo && view.page !== "devices"
-      ? [videoStack].concat(compactVoice).concat(memberRows || []).concat(sliderRows)
-      : compactVoice.concat(sliderRows).concat(memberRows || []);
+  const people = [];
+  if (showLiveVideo && view.page !== "devices" && videoStack) people.push(videoStack);
+  if (memberRows.length) people.push.apply(people, memberRows);
+  const voiceKids = people.concat(compactVoice).concat(sliderRows);
   const voiceSection =
     showVoicePanel &&
     e(DFL.PanelSection, { title: voice ? "Voice · " + voice.name : "Voice" }, voiceKids);
@@ -1196,6 +1248,7 @@ function App() {
         streams: liveStreams,
         frames,
         focusedUserId,
+        speakingIds,
         max: 4,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
