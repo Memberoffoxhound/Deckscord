@@ -780,9 +780,21 @@ class Plugin:
         if not self._video_enabled:
             return
         self._grab_alive_until = time.monotonic() + 3.0
-        # Normal (not offscreen): Discord's native video often does not paint
-        # when the window is off-screen. Idle hide still kicks in after 3s.
-        await self.set_window_mode("normal")
+
+    async def _maybe_show_for_camera(self, frames: list) -> None:
+        """Only raise Vesktop if we still have no pixels and someone has a camera.
+        Screenshare stills come from Discord preview URLs and do not need a window."""
+        if not self._video_enabled:
+            return
+        need = False
+        for f in frames or []:
+            if not isinstance(f, dict):
+                continue
+            if f.get("kind") == "camera" and not f.get("jpeg"):
+                need = True
+                break
+        if need:
+            await self.set_window_mode("normal")
 
     async def _bridge_hot(self, call: str, timeout: float = 0.4) -> Any:
         if not self.cdp.connected:
@@ -817,7 +829,7 @@ class Plugin:
             await self._arm_grab_window()
             t0 = time.monotonic()
             try:
-                r = await self._bridge_hot("grabVideoFrames()", timeout=0.8)
+                r = await self._bridge_hot("grabVideoFrames()", timeout=1.6)
             except Exception as e:
                 decky.logger.warning(f"grab: {e}")
                 return {"ok": True, "frames": self._last_frames, "cached": True, "error": "grab_timeout", "videoEnabled": True}
@@ -826,6 +838,15 @@ class Plugin:
                 frames = r["frames"]
                 if any(not (f or {}).get("jpeg") for f in frames):
                     await self._fill_frames_from_clips(frames, r.get("clips") or [])
+                if any((f or {}).get("kind") == "camera" and not (f or {}).get("jpeg") for f in frames):
+                    await self._maybe_show_for_camera(frames)
+                    try:
+                        r2 = await self._bridge_hot("grabVideoFrames()", timeout=1.6)
+                        if isinstance(r2, dict) and r2.get("frames"):
+                            frames = r2["frames"]
+                            await self._fill_frames_from_clips(frames, r2.get("clips") or [])
+                    except Exception:
+                        pass
                 self._last_frames = frames
                 r["frames"] = frames
             if time.monotonic() - self._grab_log_at > 5:

@@ -181,7 +181,7 @@
 
   function memberFromState(st, UserStore, meId, uid, MediaEngineStore) {
     var id = String((st && (st.userId || st.user_id)) || uid || "");
-    if (!id) return null;
+    if (!id || !/^\d{5,}$/.test(id)) return null;
     var u = UserStore && UserStore.getUser && UserStore.getUser(id);
     var volume = 100;
     var localMute = false;
@@ -354,20 +354,25 @@
     var members = voiceMembersFor(cid, UserStore, VoiceStateStore, meId, MediaEngineStore);
     var streams = [];
     var seen = {};
+    function isSnowflake(id) {
+      return /^\d{5,}$/.test(String(id || ""));
+    }
     function add(userId, kind, streamId) {
       userId = String(userId || "");
-      if (!userId) return;
-      kind = kind || "camera";
+      if (!isSnowflake(userId)) return;
+      kind = kind === "screenshare" || kind === "stream" ? "screenshare" : "camera";
       var key = userId + ":" + kind;
       if (seen[key]) return;
       seen[key] = true;
       var m = null;
       for (var i = 0; i < members.length; i++) if (members[i].id === userId) m = members[i];
       var u = UserStore && UserStore.getUser && UserStore.getUser(userId);
+      var name = (m && m.name) || (u && (u.globalName || u.username)) || "";
+      if (!name || name.length < 2) return;
       streams.push({
         userId: userId,
         kind: kind,
-        name: (m && m.name) || (u && (u.globalName || u.username)) || userId,
+        name: name,
         avatar: (m && m.avatar) || avatarFromUser(u, 48),
         self: !!(m && m.self) || userId === meId,
         streamId: String(streamId || userId),
@@ -378,19 +383,33 @@
       if (m.selfStream) add(m.id, "screenshare", m.id);
     });
     var rtc = store("ChannelRTCStore");
+    function idFrom(p, fallback) {
+      if (p == null) return fallback;
+      if (typeof p === "string" || typeof p === "number") return p;
+      return (p.userId || p.user_id || (p.user && p.user.id) || (isSnowflake(p.id) ? p.id : null) || fallback);
+    }
     function walkParticipants(bag, kind) {
       if (!bag) return;
+      if (typeof bag.forEach === "function" && typeof bag !== "string") {
+        try {
+          bag.forEach(function (p, k) {
+            add(idFrom(p, k), kind, p && p.streamId);
+          });
+          return;
+        } catch (eWalk) {}
+      }
       if (Array.isArray(bag)) {
-        bag.forEach(function (p) {
-          var id = p && (p.userId || p.user_id || p.id || (p.user && p.user.id));
-          if (id) add(id, kind, (p && (p.streamId || p.id)) || id);
-        });
+        bag.forEach(function (p) { add(idFrom(p), kind, p && p.streamId); });
         return;
       }
       if (typeof bag === "object") {
+        if (bag.userId || (bag.user && bag.user.id) || isSnowflake(bag.id)) {
+          add(idFrom(bag), kind, bag.streamId);
+          return;
+        }
         Object.keys(bag).forEach(function (id) {
-          var p = bag[id];
-          add((p && (p.userId || p.id)) || id, kind, (p && p.streamId) || id);
+          if (!isSnowflake(id) && typeof bag[id] !== "object") return;
+          add(idFrom(bag[id], id), kind, bag[id] && bag[id].streamId);
         });
       }
     }
@@ -563,24 +582,53 @@
     return { ok: true, enabled: !!enable, n: bag.streams.length, hasAdd: !!add };
   }
 
+  function urlToDataJpeg(url) {
+    if (!url || String(url).indexOf("http") !== 0) return Promise.resolve(null);
+    return fetch(String(url), { credentials: "include" }).then(function (r) {
+      if (!r || !r.ok) return null;
+      return r.blob();
+    }).then(function (blob) {
+      if (!blob) return null;
+      return new Promise(function (resolve) {
+        var fr = new FileReader();
+        fr.onload = function () { resolve(fr.result); };
+        fr.onerror = function () { resolve(null); };
+        fr.readAsDataURL(blob);
+      });
+    }).catch(function () { return null; });
+  }
+
   function previewJpegFor(guildId, channelId, ownerId) {
     var Prev = store("ApplicationStreamPreviewStore") || byProps("getPreviewURL");
-    if (!Prev || !Prev.getPreviewURL) return Promise.resolve(null);
-    var p;
-    try {
-      p = Prev.getPreviewURL(guildId, channelId, ownerId);
-    } catch (e) {
-      return Promise.resolve(null);
+    var getter = Prev && (Prev.getPreviewURL || Prev.getPreviewUrl);
+    var fetcher =
+      findFn("fetchStreamPreview") ||
+      findFn("fetchPreview") ||
+      (byProps("fetchStreamPreview") && byProps("fetchStreamPreview").fetchStreamPreview) ||
+      (byProps("fetchPreview") && byProps("fetchPreview").fetchPreview);
+    var kick = Promise.resolve();
+    if (fetcher) {
+      try {
+        kick = Promise.resolve(fetcher(String(guildId), String(channelId), String(ownerId))).catch(function () {});
+      } catch (eKick) {
+        kick = Promise.resolve();
+      }
     }
-    return Promise.resolve(p).then(function (url) {
-      if (!url || String(url).indexOf("http") !== 0) return null;
-      return fetch(String(url)).then(function (r) { return r.blob(); }).then(function (blob) {
-        return new Promise(function (resolve) {
-          var fr = new FileReader();
-          fr.onload = function () { resolve(fr.result); };
-          fr.onerror = function () { resolve(null); };
-          fr.readAsDataURL(blob);
-        });
+    return kick.then(function () {
+      var p = null;
+      if (getter) {
+        try { p = getter.call(Prev, String(guildId), String(channelId), String(ownerId)); } catch (e1) {}
+      }
+      return Promise.resolve(p);
+    }).then(function (url) {
+      if (url && typeof url === "object") url = url.url || url.previewURL || url.previewUrl || null;
+      if (url) return urlToDataJpeg(url);
+      var Rest = common("RestAPI") || byProps("get", "post", "put");
+      var key = String(guildId) + ":" + String(channelId) + ":" + String(ownerId);
+      if (!Rest || !Rest.get) return null;
+      return Promise.resolve(Rest.get({ url: "/streams/" + encodeURIComponent(key) + "/preview" })).then(function (res) {
+        var u = res && (res.body && (res.body.url || res.body.preview_url) || res.url);
+        return urlToDataJpeg(u);
       }).catch(function () { return null; });
     }).catch(function () { return null; });
   }
