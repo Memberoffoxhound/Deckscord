@@ -144,6 +144,8 @@ if command -v pactl >/dev/null 2>&1; then
     while read -r _ name _; do
       [[ -z "${name:-}" ]] && continue
       [[ "${name}" == *.monitor || "${name,,}" == *monitor* ]] && continue
+      [[ "${name,,}" == *loopback* || "${name,,}" == *vencord-screen-share* || "${name,,}" == *venmic* ]] && continue
+      [[ "${name}" == deckscord.mic ]] && continue
       mic="${name}"
       break
     done < <(pactl list short sources 2>/dev/null || true)

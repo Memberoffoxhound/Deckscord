@@ -50,6 +50,10 @@ pick_mic_source() {
     [[ -z "${name:-}" ]] && continue
     [[ "${name}" == *.monitor ]] && continue
     [[ "${name,,}" == *monitor* ]] && continue
+    [[ "${name,,}" == *loopback* ]] && continue
+    [[ "${name,,}" == *vencord-screen-share* ]] && continue
+    [[ "${name,,}" == *venmic* ]] && continue
+    [[ "${name}" == deckscord.mic ]] && continue
     printf '%s' "${name}"
     return 0
   done < <(pactl list short sources 2>/dev/null || true)

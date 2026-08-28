@@ -861,6 +861,7 @@
     stopRequested: false,
     gen: 0,
     lastStop: 0,
+    gameAudio: [],
   };
 
   function pinScreenshareQuality() {
@@ -908,33 +909,90 @@
     }
     if (!root) return;
 
-    var skip = /vesktop|vencord|discord|chrome|chromium|firefox|steamwebhelper|plasmashell|pipewire|entire system|entire computer|also share/i;
-    var boxes = root.querySelectorAll("input[type=checkbox], input[type=radio]");
-    var gameBox = null;
-    var boxCount = 0;
+    function txt(el) {
+      try {
+        return String(
+          (el.getAttribute && el.getAttribute("aria-label")) ||
+            el.textContent ||
+            el.value ||
+            ""
+        ).replace(/\s+/g, " ").trim();
+      } catch (e) {
+        return "";
+      }
+    }
+    function isOn(el) {
+      if (!el) return false;
+      if (el.checked) return true;
+      var a = el.getAttribute && el.getAttribute("aria-checked");
+      return a === "true" || a === "mixed";
+    }
+    function clickIf(el, wantOn) {
+      if (!el) return;
+      if (isOn(el) !== !!wantOn) {
+        try { el.click(); } catch (eC) {}
+      }
+    }
+    function looksLikeGame(label) {
+      var n = String(label || "").toLowerCase();
+      if (!n) return false;
+      if (/vesktop|vencord|discord|chrome|chromium|firefox|steamwebhelper|plasmashell|pipewire|pulse|entire system|entire computer|none|monitor|loopback/.test(n)) {
+        return false;
+      }
+      var names = GO_LIVE.gameAudio || [];
+      for (var g = 0; g < names.length; g++) {
+        var want = String(names[g] || "").toLowerCase();
+        if (want.length < 2) continue;
+        if (n.indexOf(want) !== -1 || want.indexOf(n) !== -1) return true;
+      }
+      return false;
+    }
+
+    var skipAudio = /entire system|entire computer|also share|system audio|desktop audio/i;
+    var boxes = root.querySelectorAll("input[type=checkbox], input[type=radio], [role='switch'], [role='checkbox']");
+    var pickedGame = false;
     for (var b = 0; b < boxes.length; b++) {
       var el = boxes[b];
-      var label = "";
+      var label = txt(el);
       try {
-        label = (el.labels && el.labels[0] && el.labels[0].textContent) || el.getAttribute("aria-label") || el.parentElement.textContent || "";
+        if (el.labels && el.labels[0]) label = txt(el.labels[0]) || label;
+        else if (el.parentElement) label = label || txt(el.parentElement);
       } catch (eL) {}
-      if (skip.test(label) || skip.test(el.value || "")) {
-        if (el.checked) {
-          try { el.click(); } catch (eUn) {}
-        }
+      if (/stream with audio/i.test(label)) continue;
+      if (skipAudio.test(label) || skipAudio.test(el.value || "")) {
+        clickIf(el, false);
         continue;
       }
-      boxCount++;
-      if (!gameBox) gameBox = el;
+      if (looksLikeGame(label)) {
+        clickIf(el, true);
+        pickedGame = true;
+      } else if (isOn(el) && !/stream with audio/i.test(label)) {
+        clickIf(el, false);
+      }
     }
-    if (gameBox && !gameBox.checked && boxCount <= 4) {
-      try { gameBox.click(); } catch (eCk) {}
+
+    var options = root.querySelectorAll("[role='option'], option");
+    if (!pickedGame) {
+      for (var n = 0; n < options.length; n++) {
+        if (/^none$/i.test(txt(options[n]))) {
+          try { options[n].click(); } catch (eN) {}
+          break;
+        }
+      }
+    }
+
+    var switches = root.querySelectorAll("[role='switch'], input[type=checkbox]");
+    for (var s = 0; s < switches.length; s++) {
+      var sl = txt(switches[s]) || txt(switches[s].parentElement);
+      if (/stream with audio/i.test(sl)) {
+        clickIf(switches[s], pickedGame);
+      }
     }
 
     var buttons = root.querySelectorAll("button");
     var go = null;
     for (var k = 0; k < buttons.length; k++) {
-      var t = String(buttons[k].textContent || "").replace(/\s+/g, " ").trim();
+      var t = txt(buttons[k]);
       if (/go live|share|live/i.test(t) && !/cancel|stop|back/i.test(t)) {
         go = buttons[k];
         break;
@@ -1392,23 +1450,46 @@
           }
         } catch (eIn) {}
         var cur = MediaEngineStore && MediaEngineStore.getInputDeviceId && MediaEngineStore.getInputDeviceId();
-        function isMon(d) {
+        function isForbiddenVoice(d) {
           var n = String((d && (d.name || d.label || d.id)) || "").toLowerCase();
-          return n.indexOf("monitor") !== -1 || n.indexOf("loopback") !== -1 || n.indexOf("stereo mix") !== -1;
+          return (
+            n.indexOf("monitor") !== -1 ||
+            n.indexOf("loopback") !== -1 ||
+            n.indexOf("stereo mix") !== -1 ||
+            n.indexOf("vencord-screen-share") !== -1 ||
+            n.indexOf("venmic") !== -1 ||
+            n.indexOf("what-u-hear") !== -1 ||
+            n === "default" ||
+            n === "communications"
+          );
+        }
+        function isRealMic(d) {
+          if (!d || isForbiddenVoice(d)) return false;
+          var n = String((d.name || d.label || d.id) || "").toLowerCase();
+          if (n.indexOf("deckscord") !== -1 && n.indexOf("silent") !== -1) return false;
+          return true;
         }
         var curDev = null;
         for (var i = 0; i < inputs.length; i++) {
           if (String(inputs[i].id) === String(cur)) curDev = inputs[i];
         }
-        if (curDev && isMon(curDev)) {
+        var needPin = !curDev || isForbiddenVoice(curDev) || String(cur || "").toLowerCase() === "default";
+        if (needPin) {
           var setIn = findFn("setInputDevice");
           var pick = null;
           for (var j = 0; j < inputs.length; j++) {
-            if (!isMon(inputs[j]) && String(inputs[j].id) !== "default") { pick = inputs[j]; break; }
+            var n = String((inputs[j].name || inputs[j].label || "")).toLowerCase();
+            if (isRealMic(inputs[j]) && (n.indexOf("mic") !== -1 || n.indexOf("headset") !== -1)) {
+              pick = inputs[j];
+              break;
+            }
           }
           if (!pick) {
             for (var k = 0; k < inputs.length; k++) {
-              if (!isMon(inputs[k])) { pick = inputs[k]; break; }
+              if (isRealMic(inputs[k]) && String(inputs[k].id) !== "default") {
+                pick = inputs[k];
+                break;
+              }
             }
           }
           if (setIn && pick) {
@@ -1459,7 +1540,9 @@
       GO_LIVE.width = width;
       GO_LIVE.height = height;
       GO_LIVE.fps = fps;
+      GO_LIVE.gameAudio = Array.isArray(opts.gameAudio) ? opts.gameAudio : [];
       pinScreenshareQuality();
+      try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
 
       var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId");
       var ChannelStore = store("ChannelStore") || byProps("getChannel");
@@ -1523,7 +1606,8 @@
           return { ok: false, error: "cancelled" };
         }
         var constraints = { width: width, height: height, frameRate: fps };
-        var acq = eng.getDesktopSource(constraints, true);
+        var wantAudio = GO_LIVE.gameAudio.length > 0;
+        var acq = eng.getDesktopSource(constraints, wantAudio);
         var timed = new Promise(function (_, rej) {
           setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
         });
@@ -1542,6 +1626,7 @@
           GO_LIVE.pending = false;
           GO_LIVE.stopRequested = false;
         }
+        try { window.__deckscord.ensureVoiceProcessing(); } catch (eAfter) {}
         return r;
       });
     },
@@ -1564,6 +1649,8 @@
             try { stopFn(s); } catch (e2) {}
           }
         }
+        GO_LIVE.gameAudio = [];
+        try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
         return { ok: true, streaming: false };
       } catch (e) {
         return err(e);
@@ -1598,8 +1685,13 @@
       try {
         var id = String(deviceId);
         var n = id.toLowerCase();
-        if (n.indexOf("monitor") !== -1 || n.indexOf("loopback") !== -1) {
-          return { ok: false, error: "that input is speaker loopback, not a microphone" };
+        if (
+          n.indexOf("monitor") !== -1 ||
+          n.indexOf("loopback") !== -1 ||
+          n.indexOf("vencord-screen-share") !== -1 ||
+          n.indexOf("venmic") !== -1
+        ) {
+          return { ok: false, error: "that input is desktop/game capture, not a microphone" };
         }
         var fn = findFn("setInputDevice");
         if (!fn) throw new Error("setInputDevice not found");

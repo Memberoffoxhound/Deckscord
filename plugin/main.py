@@ -77,16 +77,27 @@ def _pactl(*args: str, timeout: int = 5) -> subprocess.CompletedProcess:
     return _run([pactl, *args], timeout=timeout)
 
 
+SILENCE_SINK = "deckscord_silence"
+SILENCE_MIC = "deckscord.mic"
+
+_VOICE_SKIP = (
+    "monitor",
+    "loopback",
+    "stereo mix",
+    "what-u-hear",
+    "wave out",
+    "vencord-screen-share",
+    "venmic",
+    "deckscord_silence",
+    "deckscord.silence",
+)
+
+
 def _is_monitor_source(name: str) -> bool:
     n = (name or "").lower()
-    return (
-        n.endswith(".monitor")
-        or "monitor" in n
-        or "loopback" in n
-        or "stereo mix" in n
-        or "what-u-hear" in n
-        or "wave out" in n
-    )
+    if n == SILENCE_MIC or n.startswith("deckscord.mic"):
+        return False
+    return any(s in n for s in _VOICE_SKIP)
 
 
 def _pulse_sources() -> list[str]:
@@ -100,7 +111,7 @@ def _pulse_sources() -> list[str]:
 
 
 def _pick_real_mic(sources: list[str]) -> Optional[str]:
-    real = [s for s in sources if not _is_monitor_source(s)]
+    real = [s for s in sources if not _is_monitor_source(s) and s != SILENCE_MIC]
     if not real:
         return None
     for s in real:
@@ -113,27 +124,63 @@ def _pick_real_mic(sources: list[str]) -> Optional[str]:
     return real[0]
 
 
-def ensure_mic_not_loopback() -> dict[str, Any]:
-    """If Pulse/PipeWire default source is a speaker monitor, switch to a real mic.
+def _ensure_silence_mic() -> Optional[str]:
+    """Silent capture source so voice never falls through to a speaker monitor."""
+    sources = _pulse_sources()
+    if SILENCE_MIC in sources:
+        return SILENCE_MIC
+    _pactl(
+        "load-module",
+        "module-null-source",
+        f"source_name={SILENCE_MIC}",
+        'source_properties=device.description="Deckscord Silent Mic"',
+    )
+    sources = _pulse_sources()
+    if SILENCE_MIC in sources:
+        return SILENCE_MIC
+    _pactl(
+        "load-module",
+        "module-null-sink",
+        f"sink_name={SILENCE_SINK}",
+        'sink_properties=device.description="Deckscord Silence"',
+    )
+    _pactl(
+        "load-module",
+        "module-remap-source",
+        f"source_name={SILENCE_MIC}",
+        f"master={SILENCE_SINK}.monitor",
+        'source_properties=device.description="Deckscord Silent Mic"',
+    )
+    sources = _pulse_sources()
+    return SILENCE_MIC if SILENCE_MIC in sources else None
 
-    Discord's 'default' input follows this. Capturing *.monitor is why call
-    members hear game/system audio when using device speakers.
+
+def ensure_mic_not_loopback() -> dict[str, Any]:
+    """Voice capture is a microphone, or silence — never a speaker/desktop monitor.
+
+    Discord's 'default' input follows PipeWire's default source. HDMI *.monitor
+    and Vesktop's vencord-screen-share virtmic both dump game/system audio into
+    the voice channel. Game audio belongs on the Go Live track only.
     """
     cur = (_pactl("get-default-source").stdout or "").strip()
     sources = _pulse_sources()
     mic = _pick_real_mic(sources)
+    silent = False
+    if not mic:
+        mic = _ensure_silence_mic()
+        silent = bool(mic)
+        sources = _pulse_sources()
     changed = False
-    if cur and _is_monitor_source(cur):
-        if mic:
-            _pactl("set-default-source", mic)
-            changed = True
-            cur = mic
-        else:
-            decky.logger.warning(f"default source is loopback ({cur}) and no real mic was found")
+    if mic and (not cur or _is_monitor_source(cur)):
+        _pactl("set-default-source", mic)
+        changed = True
+        cur = mic
+    loopback = bool(cur and _is_monitor_source(cur))
     return {
         "source": cur,
-        "mic": mic,
-        "loopback": bool(cur and _is_monitor_source(cur)),
+        "mic": mic if not silent else None,
+        "silent": silent,
+        "loopback": loopback,
         "changed": changed,
         "sources": sources[:12],
     }
@@ -841,7 +888,7 @@ class Plugin:
                 self._audio_hygiene_at = time.monotonic()
                 try:
                     hy = ensure_mic_not_loopback()
-                    cap = {k: hy[k] for k in ("source", "loopback", "mic") if k in hy}
+                    cap = {k: hy[k] for k in ("source", "loopback", "mic", "silent") if k in hy}
                     gs = find_gamescope_node()
                     if gs:
                         cap["gamescope"] = gs
@@ -850,6 +897,8 @@ class Plugin:
                     out["capture"] = cap
                     if hy.get("loopback"):
                         out["phase_label"] = (out.get("phase_label") or "Ready") + " · mic is speakers"
+                    elif hy.get("silent"):
+                        out["phase_label"] = (out.get("phase_label") or "Ready") + " · no mic"
                     await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
                 except Exception as e:
                     decky.logger.warning(f"voice processing: {e}")
@@ -925,6 +974,10 @@ class Plugin:
         except Exception:
             pass
         r = await self._bridge("leaveVoice()")
+        try:
+            ensure_mic_not_loopback()
+        except Exception:
+            pass
         decky.logger.info(f"leave_voice result {r}")
         return self._ok(r)
 
@@ -937,25 +990,56 @@ class Plugin:
         w = int(kwargs.get("width") or width or 1280)
         h = int(kwargs.get("height") or height or 720)
         f = int(kwargs.get("fps") or fps or 30)
-        decky.logger.info(f"start_go_live {w}x{h}@{f}")
+        games = []
+        try:
+            games = list_game_audio_nodes()
+        except Exception as e:
+            decky.logger.warning(f"game audio nodes: {e}")
+        game_audio = []
+        for g in games:
+            for k in ("app", "name", "binary"):
+                v = str(g.get(k) or "").strip()
+                if v and v not in game_audio:
+                    game_audio.append(v)
+        decky.logger.info(f"start_go_live {w}x{h}@{f} game_audio={game_audio}")
         try:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
+        try:
+            ensure_mic_not_loopback()
+        except Exception:
+            pass
         await self._ensure_cdp(inject=True)
         await self._inject_bridge()
         r = await self._eval(
             "window.__deckscord.startGoLive("
-            + json.dumps({"width": w, "height": h, "fps": f})
+            + json.dumps({"width": w, "height": h, "fps": f, "gameAudio": game_audio})
             + ")",
             timeout=28.0,
         )
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+        except Exception:
+            pass
+        try:
+            ensure_mic_not_loopback()
+        except Exception:
+            pass
         decky.logger.info(f"start_go_live result {r}")
         return self._ok(r)
 
     async def stop_go_live(self) -> dict[str, Any]:
         decky.logger.info("stop_go_live")
         r = await self._bridge("stopGoLive()")
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+        except Exception:
+            pass
+        try:
+            ensure_mic_not_loopback()
+        except Exception as e:
+            decky.logger.warning(f"voice capture after stop: {e}")
         decky.logger.info(f"stop_go_live result {r}")
         return self._ok(r)
 
@@ -974,6 +1058,8 @@ class Plugin:
         decky.logger.info(f"set_input_device {did}")
         if not did:
             return {"ok": False, "error": "missing device_id"}
+        if _is_monitor_source(did):
+            return {"ok": False, "error": "that input is desktop/game capture, not a microphone"}
         r = await self._bridge(f"setInputDevice({json.dumps(did)})")
         return self._ok(r)
 

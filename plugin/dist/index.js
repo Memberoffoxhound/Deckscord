@@ -740,14 +740,16 @@ function App() {
     canBack
       ? e(DFL.PanelSectionRow, { key: "back" }, e(DFL.ButtonItem, { layout: "below", onClick: () => back(), ...cancelBind(handleCancel) }, "Back"))
       : null,
-    status && status.capture && status.capture.loopback
+    status && status.capture && (status.capture.loopback || status.capture.silent)
       ? e(
           DFL.PanelSectionRow,
           { key: "loop" },
           e(
             "div",
             { style: { color: "#e4b44c", fontSize: 13, lineHeight: 1.35 } },
-            "Mic is capturing speaker output. Others will hear your game. Plug in a headset or pick a real microphone under Audio."
+            status.capture.silent
+              ? "No microphone. Voice is silent so the call does not hear your speakers. Game audio is only sent while Share game is on."
+              : "Mic is capturing speaker output. Others will hear your desktop. Plug in a headset or pick a real microphone under Audio."
           )
         )
       : null,
@@ -1156,7 +1158,7 @@ function App() {
       ]),
     ]);
   } else if (view.page === "devices") {
-    const inList = (devices.input || []).filter((d) => !/monitor|loopback|stereo mix/i.test(String(d.name || d.id || "")));
+    const inList = (devices.input || []).filter((d) => !/monitor|loopback|stereo mix|vencord-screen-share|venmic/i.test(String(d.name || d.id || "")));
     const outList = devices.output || [];
     body = e("div", { style: FILL }, [
       e(

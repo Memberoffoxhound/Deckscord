@@ -75,15 +75,14 @@ before we even see the node. That needs a gamescope-session hook, not Discord.
 
 Two tracks, never mixed:
 
-| Track | Source |
-|---|---|
-| Voice | Real microphone (never `*.monitor`) |
-| Stream | The game’s `Stream/Output/Audio` PipeWire node, picked in Vesktop’s share modal |
+| Track | When | Source |
+|---|---|---|
+| Voice | Always | Real microphone only. Never `*.monitor`, never Vesktop’s `vencord-screen-share`. If there is no mic, a silent dummy source is used so the call does not hear speakers. |
+| Stream | **Only while Share game is on** | The running game’s PipeWire output, picked in Vesktop’s share modal. Not “Entire system”, not desktop, not Discord. If no game output is found, the share is video-only. |
 
-The QAM auto-confirms Vesktop’s hidden picker for shares **we** started, but
-it will **not** tick “Entire system”. It ticks application rows that look like
-the game (skips vesktop / discord / chrome / steamwebhelper / plasma). If it
-cannot tell, it shares video only rather than leaking call audio.
+The QAM auto-confirms Vesktop’s hidden picker for shares **we** started.
+“Entire system” is never selected. After Go Live starts or stops, voice is
+pinned back onto the microphone so the virtmic cannot steal the call.
 
 ## QAM
 
