@@ -1100,7 +1100,6 @@ class Plugin:
         if self._status_lock.locked() or self._grab_lock.locked():
             return {"ok": True, "frames": self._last_frames, "cached": True, "videoEnabled": True}
         async with self._grab_lock:
-            await self._arm_grab_window()
             t0 = time.monotonic()
             try:
                 r = await self._bridge_hot("grabVideoFrames()", timeout=1.6)
@@ -1110,8 +1109,9 @@ class Plugin:
             ms = int((time.monotonic() - t0) * 1000)
             if isinstance(r, dict) and r.get("ok") and r.get("frames"):
                 frames = r["frames"]
-                if any(not (f or {}).get("jpeg") for f in frames):
-                    await self._fill_frames_from_clips(frames, r.get("clips") or [])
+                clips = r.get("clips") or []
+                if clips and any(not (f or {}).get("jpeg") for f in frames):
+                    await self._fill_frames_from_clips(frames, clips)
                 if any((f or {}).get("kind") == "camera" and not (f or {}).get("jpeg") for f in frames):
                     await self._maybe_show_for_camera(frames)
                     try:
