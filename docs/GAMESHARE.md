@@ -72,9 +72,18 @@ desktop monitor.
 
 Focused Watch grabs a larger JPEG (~960×540). Other tiles stay cheap.
 
-## Later (not this slice)
+## PiP stamp
 
-- Persistent overlay that survives closing the QAM (Steam CEF layer, same
-  idea as other Decky screen overlays).
-- Hardware-decoded overlay (mpv/gamescope) if JPEG can’t hold 30 fps.
+Pin from Watch or from the focused tile. A gamescope external overlay
+window (`plugin/pip_overlay.py`) draws one JPEG stamp in a corner after the
+QAM closes. Audio stays in Discord (`focusStream`) — the overlay is pixels
+only.
+
+Small = 240p (426×240), large = 480p (854×480), both clamped to a fraction
+of output height so a Deck and a 4K panel stay usable. Opacity is
+compositor alpha.
+
+## Later
+
+- Hardware-decoded overlay if JPEG cannot hold 30 fps.
 - Multiple PiP windows. Still spectator-only.

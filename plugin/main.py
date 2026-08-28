@@ -29,23 +29,90 @@ REPO_URL = os.environ.get(
 
 
 def _login_home() -> Path:
-    """Home of the desktop user, even when PluginLoader runs as root."""
-    for attr in ("DECKY_USER_HOME", "DECKY_HOME"):
-        v = getattr(decky, attr, None) or os.environ.get(attr)
-        if v:
-            return Path(v)
+    """Home of the desktop user, even when PluginLoader runs as root.
+
+    DECKY_HOME is ~/homebrew — not a login home. Prefer DECKY_USER_HOME, then
+    the parent of the homebrew tree the plugin lives in. SteamOS is /home/deck.
+    """
+    cands: list[Path] = []
+    v = getattr(decky, "DECKY_USER_HOME", None) or os.environ.get("DECKY_USER_HOME")
+    if v:
+        cands.append(Path(v))
+    user = getattr(decky, "DECKY_USER", None) or os.environ.get("DECKY_USER") or os.environ.get("SUDO_USER")
+    if user and user not in ("root",):
+        cands.append(Path("/home") / str(user))
+        cands.append(Path("/var/home") / str(user))
     plugin = PLUGIN_DIR.resolve()
     for p in [plugin, *plugin.parents]:
         if p.name == "homebrew":
-            return p.parent
+            cands.append(p.parent)
+            break
+    cands.extend([Path("/home/deck"), Path("/var/home/bazzite"), Path("/home/bazzite")])
     h = Path.home()
     if str(h) not in ("/root", "/"):
-        return h
-    return Path("/var/home/bazzite")
+        cands.append(h)
+    seen: set[str] = set()
+    for p in cands:
+        if p.name == "homebrew":
+            p = p.parent
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.name in ("root", "") or key in ("/", "/root"):
+            continue
+        if p.is_dir():
+            return p
+    return Path("/home/deck")
 
 
-DATA_DIR = _login_home() / ".local" / "share" / "deckscord"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_dir(path: Path) -> Path:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".w"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return path
+    except OSError:
+        alt = Path(f"/tmp/deckscord-{os.getuid()}")
+        alt.mkdir(parents=True, exist_ok=True)
+        return alt
+
+
+DATA_DIR = _ensure_dir(_login_home() / ".local" / "share" / "deckscord")
+SETTINGS_PATH = DATA_DIR / "settings.json"
+PIP_DIR = _ensure_dir(DATA_DIR / "pip")
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "pip": {
+        "enabled": False,
+        "corner": "bottom-right",
+        "size": "small",
+        "opacity": 100,
+        "userId": None,
+        "kind": "screenshare",
+        "name": "",
+    },
+    "talking": {
+        "enabled": True,
+        "corner": "top-left",
+        "size": "small",
+        "opacity": 90,
+        "showSelf": True,
+    },
+    "golive": {"width": 1280, "height": 720, "fps": 30},
+}
+
+VESKTOP_AUDIO_DEFAULTS: dict[str, Any] = {
+    "workaround": False,
+    "deviceSelect": False,
+    "granularSelect": False,
+    "ignoreVirtual": False,
+    "ignoreDevices": True,
+    "ignoreInputMedia": True,
+    "onlySpeakers": True,
+    "onlyDefaultSpeakers": True,
+}
 
 # PluginLoader is a PyInstaller binary. Child plugin processes inherit
 # LD_LIBRARY_PATH=/tmp/_MEI... which makes systemctl (and other host
@@ -60,19 +127,238 @@ _PYI_KEYS = (
 )
 
 
+def _login_uid_gid() -> tuple[int, int]:
+    home = _login_home()
+    try:
+        st = home.stat()
+        return int(st.st_uid), int(st.st_gid)
+    except OSError:
+        return 1000, 1000
+
+
 def _subprocess_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _PYI_KEYS}
-    uid = os.getuid()
+    home = _login_home()
+    uid, _gid = _login_uid_gid()
     runtime = f"/run/user/{uid}"
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env.get("PATH") or "")
+    env["HOME"] = str(home)
+    env["USER"] = home.name
+    env["XDG_RUNTIME_DIR"] = runtime
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime}/bus"
+    return env
+
+
+def _system_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _PYI_KEYS}
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    env.pop("XDG_RUNTIME_DIR", None)
+    return env
+
+
+def _chown_tree(path: Path, uid: int, gid: int) -> None:
     try:
-        home = str(Path.home())
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+    if not path.is_dir():
+        return
+    for root, dirs, files in os.walk(path):
+        try:
+            os.chown(root, uid, gid)
+        except OSError:
+            pass
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), uid, gid)
+            except OSError:
+                pass
+
+
+def _chmod_write(path: Path, directory: bool) -> None:
+    try:
+        os.chmod(path, 0o775 if directory else 0o664)
+    except OSError:
+        try:
+            mode = path.stat().st_mode
+            os.chmod(path, mode | (0o220 if not directory else 0o220))
+        except OSError:
+            pass
+
+
+def _force_writable(path: Path, uid: int, gid: int) -> None:
+    if os.geteuid() == 0:
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+    _chmod_write(path, path.is_dir())
+
+
+def _plugin_dst() -> Path:
+    here = Path(getattr(decky, "DECKY_PLUGIN_DIR", None) or PLUGIN_DIR).resolve()
+    if here.name == "plugin" and (here.parent / "plugin.json").is_file():
+        here = here.parent
+    return here
+
+
+def _install_file(src: Path, dst: Path, uid: int, gid: int) -> None:
+    data = src.read_bytes()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _force_writable(dst.parent, uid, gid)
+    tmp = dst.with_name("." + dst.name + ".decknew")
+    try:
+        tmp.write_bytes(data)
+    except OSError:
+        if dst.exists():
+            _force_writable(dst, uid, gid)
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        tmp.write_bytes(data)
+    os.replace(tmp, dst)
+    _force_writable(dst, uid, gid)
+
+
+def _copy_plugin_tree(src: Path, dst: Path, uid: int, gid: int) -> None:
+    """Overlay-copy plugin files. No rsync -a (that preserves root owner and --delete hits EACCES)."""
+    skip_dir = {"__pycache__", "node_modules", ".git"}
+    dst.mkdir(parents=True, exist_ok=True)
+    _force_writable(dst, uid, gid)
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in skip_dir]
+        rel = Path(root).relative_to(src)
+        dest_dir = dst / rel
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        _force_writable(dest_dir, uid, gid)
+        for name in files:
+            if name.endswith(".pyc") or name.endswith(".decknew"):
+                continue
+            _install_file(Path(root) / name, dest_dir / name, uid, gid)
+    for junk in dst.glob("n.*"):
+        try:
+            if junk.is_file() and len(junk.name) < 20:
+                junk.unlink()
+        except OSError:
+            pass
+    for tmp in dst.rglob("*.decknew"):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _load_settings() -> dict[str, Any]:
+    doc: dict[str, Any] = json.loads(json.dumps(DEFAULT_SETTINGS))
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            pip = dict(doc["pip"])
+            pip.update((raw.get("pip") or {}) if isinstance(raw.get("pip"), dict) else {})
+            talking = dict(doc["talking"])
+            talking.update((raw.get("talking") or {}) if isinstance(raw.get("talking"), dict) else {})
+            golive = dict(doc["golive"])
+            golive.update((raw.get("golive") or {}) if isinstance(raw.get("golive"), dict) else {})
+            doc["pip"] = pip
+            doc["talking"] = talking
+            doc["golive"] = golive
     except Exception:
-        home = f"/home/{os.environ.get('USER', 'bazzite')}"
-    env.setdefault("HOME", home)
-    env.setdefault("USER", Path(home).name)
-    env.setdefault("XDG_RUNTIME_DIR", runtime)
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
+        pass
+    return doc
+
+
+def _save_settings(doc: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    tmp.replace(SETTINGS_PATH)
+    uid, gid = _login_uid_gid()
+    try:
+        os.chown(SETTINGS_PATH, uid, gid)
+    except OSError:
+        pass
+
+
+def _vesktop_config_dir() -> Path:
+    home = _login_home()
+    cands = [
+        home / ".var" / "app" / "dev.vencord.Vesktop" / "config" / "vesktop",
+        home / ".config" / "vesktop",
+    ]
+    for p in cands:
+        if (p / "settings.json").is_file() or p.is_dir():
+            return p
+    return cands[0]
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json(path: Path, doc: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=4), encoding="utf-8")
+    tmp.replace(path)
+    uid, gid = _login_uid_gid()
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def _set_nested(doc: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
+    parts = [p for p in str(key).split(".") if p]
+    if not parts:
+        return doc
+    cur: dict[str, Any] = doc
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+    return doc
+
+
+def _pip_dims(size: str) -> tuple[int, int]:
+    if str(size) == "large":
+        return 854, 480
+    return 426, 240
+
+
+def _pick_display() -> Optional[str]:
+    raw = os.environ.get("DISPLAY") or ""
+    if raw:
+        n = raw.lstrip(":").split(".")[0]
+        if Path(f"/tmp/.X11-unix/X{n}").exists():
+            return raw if raw.startswith(":") else f":{n}"
+    for n in range(0, 8):
+        if Path(f"/tmp/.X11-unix/X{n}").exists():
+            return f":{n}"
+    return None
+
+
+def _overlay_env() -> dict[str, str]:
+    env = _subprocess_env()
+    home = _login_home()
+    disp = _pick_display()
+    if disp:
+        env["DISPLAY"] = disp
+    env["GDK_BACKEND"] = "x11"
+    env.pop("WAYLAND_DISPLAY", None)
+    env.pop("GAMESCOPE_WAYLAND_DISPLAY", None)
+    for auth in (home / ".Xauthority", Path("/tmp/.Xauthority"), Path(f"/run/user/{_login_uid_gid()[0]}/gdm/Xauthority")):
+        if auth.is_file():
+            env["XAUTHORITY"] = str(auth)
+            break
     return env
 
 
@@ -536,6 +822,12 @@ class Plugin:
         self._portal_proc: Optional[subprocess.Popen] = None
         self._update: dict[str, Any] = {"phase": "idle", "percent": 0, "message": ""}
         self._update_task: Optional[asyncio.Task] = None
+        self._settings = _load_settings()
+        self._pip_proc: Optional[subprocess.Popen] = None
+        self._pip_task: Optional[asyncio.Task] = None
+        self._talk_hold: dict[str, float] = {}
+        self._talk_last: dict[str, dict[str, Any]] = {}
+        self._talk_in_voice = False
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -553,12 +845,24 @@ class Plugin:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
+        pip = (self._settings.get("pip") or {})
+        if pip.get("enabled") and pip.get("userId"):
+            pip["enabled"] = False
+            pip["userId"] = None
+            self._settings["pip"] = pip
+            _save_settings(self._settings)
+        self._pip_task = asyncio.create_task(self._pip_loop())
 
     async def _unload(self) -> None:
         try:
             await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
         except Exception:
             pass
+        task = self._pip_task
+        self._pip_task = None
+        if task:
+            task.cancel()
+        self._stop_pip_overlay()
         self._stop_portal_shim()
         await self.cdp.close()
 
@@ -799,6 +1103,8 @@ class Plugin:
             "phase_label": "Starting Discord…",
             "videoEnabled": bool(self._video_enabled),
             "update": dict(self._update),
+            "pip": dict((self._settings.get("pip") or {})),
+            "talking": dict((self._settings.get("talking") or {})),
         }
 
         targets: Optional[list] = None
@@ -926,8 +1232,22 @@ class Plugin:
                     await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
                 except Exception as e:
                     decky.logger.warning(f"voice processing: {e}")
+            pip = (self._settings.get("pip") or {})
+            pip_on = bool(pip.get("enabled") and pip.get("userId"))
+            out["pip"] = dict(pip)
+            if pip_on and not vch:
+                pip["enabled"] = False
+                pip["userId"] = None
+                self._settings["pip"] = pip
+                _save_settings(self._settings)
+                self._stop_overlay_if_idle()
+                pip_on = False
+                out["pip"] = dict(pip)
+            talk = dict(self._settings.get("talking") or {})
+            out["talking"] = dict(talk)
+            out["talking"]["live"] = bool(talk.get("enabled") and vch)
             try:
-                if self._video_enabled and time.monotonic() < self._grab_alive_until:
+                if pip_on or (self._video_enabled and time.monotonic() < self._grab_alive_until):
                     pass
                 else:
                     if self._video_enabled and self._grab_alive_until and time.monotonic() >= self._grab_alive_until:
@@ -988,6 +1308,7 @@ class Plugin:
 
     async def leave_voice(self) -> dict[str, Any]:
         decky.logger.info("leave_voice")
+        await self.unpin_pip()
         await self._clear_audio_focus_safe()
         try:
             await self._eval("window.__deckscord && window.__deckscord.stopGoLive()")
@@ -1011,9 +1332,10 @@ class Plugin:
             width = kwargs.get("width", 1280)
             height = kwargs.get("height", height)
             fps = kwargs.get("fps", fps)
-        w = int(kwargs.get("width") or width or 1280)
-        h = int(kwargs.get("height") or height or 720)
-        f = int(kwargs.get("fps") or fps or 30)
+        saved = self._settings.get("golive") if isinstance(self._settings.get("golive"), dict) else {}
+        w = int(kwargs.get("width") or width or saved.get("width") or 1280)
+        h = int(kwargs.get("height") or height or saved.get("height") or 720)
+        f = int(kwargs.get("fps") or fps or saved.get("fps") or 30)
         games = []
         try:
             games = list_game_audio_nodes()
@@ -1204,15 +1526,25 @@ class Plugin:
         )
         return out
 
-    async def get_video_frames(self) -> dict[str, Any]:
+    async def get_video_frames(self, user_id: str = "", w: int = 0, h: int = 0, **kwargs: Any) -> dict[str, Any]:
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("userId") or "")
+        ww = int(kwargs.get("w") or w or 0)
+        hh = int(kwargs.get("h") or h or 0)
         if not self._video_enabled:
             return {"ok": True, "frames": [], "videoEnabled": False}
         if self._status_lock.locked() or self._grab_lock.locked():
             return {"ok": True, "frames": self._last_frames, "cached": True, "videoEnabled": True}
         async with self._grab_lock:
             t0 = time.monotonic()
+            opts: dict[str, Any] = {}
+            if uid:
+                opts["userId"] = uid
+            if ww and hh:
+                opts["w"] = ww
+                opts["h"] = hh
+            call = f"grabVideoFrames({json.dumps(opts)})" if opts else "grabVideoFrames()"
             try:
-                r = await self._bridge_hot("grabVideoFrames()", timeout=1.6)
+                r = await self._bridge_hot(call, timeout=1.6)
             except Exception as e:
                 decky.logger.warning(f"grab: {e}")
                 return {"ok": True, "frames": self._last_frames, "cached": True, "error": "grab_timeout", "videoEnabled": True}
@@ -1225,7 +1557,7 @@ class Plugin:
                 if any((f or {}).get("kind") == "camera" and not (f or {}).get("jpeg") for f in frames):
                     await self._maybe_show_for_camera(frames)
                     try:
-                        r2 = await self._bridge_hot("grabVideoFrames()", timeout=1.6)
+                        r2 = await self._bridge_hot(call, timeout=1.6)
                         if isinstance(r2, dict) and r2.get("frames"):
                             frames = r2["frames"]
                             await self._fill_frames_from_clips(frames, r2.get("clips") or [])
@@ -1365,7 +1697,7 @@ class Plugin:
 
     def _restart_plugin_loader(self) -> None:
         """Detach so restarting plugin_loader does not kill this process first."""
-        env = _subprocess_env()
+        env = _system_env()
         log = DATA_DIR / "update.log"
         cmd = (
             "sleep 1; "
@@ -1388,6 +1720,40 @@ class Plugin:
             close_fds=True,
         )
 
+    def _git(self, args: list[str], cwd: Optional[Path] = None, timeout: int = 90) -> subprocess.CompletedProcess:
+        home = _login_home()
+        uid, _gid = _login_uid_gid()
+        env = _subprocess_env()
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        cmd = ["git", "-c", "safe.directory=*"]
+        if cwd is not None:
+            cmd.extend(["-C", str(cwd)])
+        cmd.extend(args)
+        if os.geteuid() == 0 and uid != 0:
+            runuser = "/usr/sbin/runuser" if Path("/usr/sbin/runuser").is_file() else "/usr/bin/runuser"
+            if Path(runuser).is_file():
+                wrapped = [runuser, "-u", home.name, "--", "env", f"HOME={home}", f"USER={home.name}"] + cmd
+                r = _run(wrapped, timeout=timeout)
+                if r.returncode == 0:
+                    return r
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+
+    def _ensure_plugin_writable(self, dst: Path) -> None:
+        uid, gid = _login_uid_gid()
+        dst.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0:
+            _chown_tree(dst, uid, gid)
+            _force_writable(dst, uid, gid)
+            return
+        if os.access(str(dst), os.W_OK):
+            return
+        _run(["sudo", "-n", "chown", "-R", f"{uid}:{gid}", str(dst)], timeout=15)
+        _run(["sudo", "-n", "chmod", "-R", "u+rwX", str(dst)], timeout=15)
+        if os.access(str(dst), os.W_OK):
+            return
+        # Leave it; _copy_plugin_tree / sudo rsync will try next.
+
     async def get_update_status(self) -> dict[str, Any]:
         return {"ok": True, **self._update}
 
@@ -1401,12 +1767,17 @@ class Plugin:
         return {"ok": True, "started": True, **self._update}
 
     async def _run_update(self) -> None:
+        import shutil
+
         home = _login_home()
+        uid, gid = _login_uid_gid()
         src = Path(os.environ.get("DECKSCORD_SRC") or (DATA_DIR / "src"))
-        dst = home / "homebrew" / "plugins" / "Deckscord"
+        dst = _plugin_dst()
+        if dst == src or src in dst.parents or dst in src.parents:
+            src = DATA_DIR / "src"
         log = DATA_DIR / "update.log"
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        lines: list[str] = [f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---"]
+        lines: list[str] = [f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} euid={os.geteuid()} ---"]
 
         def note(msg: str) -> None:
             lines.append(msg)
@@ -1414,41 +1785,42 @@ class Plugin:
 
         try:
             self._set_update("fetch", 12, "Fetching from GitHub…")
+            src.parent.mkdir(parents=True, exist_ok=True)
+            if os.geteuid() == 0:
+                _chown_tree(DATA_DIR, uid, gid)
+                _force_writable(DATA_DIR, uid, gid)
+                if src.exists():
+                    _chown_tree(src, uid, gid)
             if (src / ".git").is_dir():
-                r = await asyncio.to_thread(
-                    _run, ["git", "-C", str(src), "fetch", "--prune", "origin"], 90
-                )
+                r = await asyncio.to_thread(self._git, ["fetch", "--prune", "origin"], src, 90)
                 if r.returncode != 0:
                     err = (r.stderr or r.stdout or "git fetch failed").strip()
+                    note(err)
                     self._set_update("error", 12, err, ok=False, error=err)
                     return
                 self._set_update("merge", 40, "Applying commits…")
-                r = await asyncio.to_thread(
-                    _run, ["git", "-C", str(src), "merge", "--ff-only", "origin/main"], 30
-                )
+                r = await asyncio.to_thread(self._git, ["merge", "--ff-only", "origin/main"], src, 30)
                 if r.returncode != 0:
-                    r = await asyncio.to_thread(
-                        _run, ["git", "-C", str(src), "pull", "--ff-only"], 30
-                    )
+                    r = await asyncio.to_thread(self._git, ["pull", "--ff-only"], src, 30)
                 if r.returncode != 0:
                     err = (r.stderr or r.stdout or "git pull failed").strip()
+                    note(err)
                     self._set_update("error", 40, err, ok=False, error=err)
                     return
                 note(f"pulled {src}")
             else:
-                src.parent.mkdir(parents=True, exist_ok=True)
+                if src.exists():
+                    shutil.rmtree(src, ignore_errors=True)
                 self._set_update("clone", 20, "Cloning repository…")
-                r = await asyncio.to_thread(
-                    _run, ["git", "clone", "--depth", "1", REPO_URL, str(src)], 120
-                )
+                r = await asyncio.to_thread(self._git, ["clone", "--depth", "1", REPO_URL, str(src)], None, 120)
                 if r.returncode != 0:
                     err = (r.stderr or r.stdout or "git clone failed").strip()
+                    note(err)
                     self._set_update("error", 20, err, ok=False, error=err)
                     return
                 note(f"cloned {REPO_URL}")
-            head = await asyncio.to_thread(
-                _run, ["git", "-C", str(src), "log", "-1", "--oneline"], 5
-            )
+            _chown_tree(src, uid, gid)
+            head = await asyncio.to_thread(self._git, ["log", "-1", "--oneline"], src, 5)
             head_s = (head.stdout or "").strip() or "ok"
             note(head_s)
             self._set_update("copy", 70, "Copying plugin files…", head=head_s)
@@ -1456,44 +1828,62 @@ class Plugin:
             if not (plugin_src / "main.py").is_file():
                 self._set_update("error", 70, "no plugin in repo", ok=False, error="no plugin")
                 return
-            dst.mkdir(parents=True, exist_ok=True)
-            rsync = await asyncio.to_thread(
-                _run,
-                [
-                    "rsync",
-                    "-a",
-                    "--delete",
-                    "--exclude=__pycache__",
-                    "--exclude=*.pyc",
-                    "--exclude=node_modules",
-                    str(plugin_src) + "/",
-                    str(dst) + "/",
-                ],
-                30,
-            )
-            if rsync.returncode != 0:
-                import shutil
-
-                for child in dst.iterdir():
-                    if child.name in (".git",):
-                        continue
-                    if child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink(missing_ok=True)
-                shutil.copytree(plugin_src, dst, dirs_exist_ok=True)
-            uid, gid = home.stat().st_uid, home.stat().st_gid
-            for tree in (dst, src, DATA_DIR):
-                for root, dirs, files in os.walk(tree):
+            note(f"copy {plugin_src} -> {dst} euid={os.geteuid()} owner={dst.stat().st_uid if dst.exists() else '?'}")
+            self._ensure_plugin_writable(dst)
+            copied = False
+            try:
+                await asyncio.to_thread(_copy_plugin_tree, plugin_src, dst, uid, gid)
+                copied = True
+            except OSError as e:
+                note(f"copy: {e}")
+                rsync = await asyncio.to_thread(
+                    _run,
+                    [
+                        "sudo",
+                        "-n",
+                        "rsync",
+                        "-rltD",
+                        "--chmod=Du+rwx,Fu+rw",
+                        "--exclude=__pycache__",
+                        "--exclude=*.pyc",
+                        "--exclude=node_modules",
+                        "--exclude=.git",
+                        str(plugin_src) + "/",
+                        str(dst) + "/",
+                    ],
+                    30,
+                )
+                if rsync.returncode != 0:
+                    err = (rsync.stderr or rsync.stdout or str(e)).strip()
+                    own = "?"
                     try:
-                        os.chown(root, uid, gid)
+                        st = dst.stat()
+                        own = f"uid={st.st_uid} mode={oct(st.st_mode)}"
                     except OSError:
                         pass
-                    for name in dirs + files:
-                        try:
-                            os.chown(os.path.join(root, name), uid, gid)
-                        except OSError:
-                            pass
+                    msg = (
+                        f"Permission denied writing {dst} ({own}, euid={os.geteuid()}). "
+                        f"On the Deck, from Desktop Mode: sudo chown -R deck:deck {dst} "
+                        f"&& sudo chmod -R u+rwX {dst}"
+                    )
+                    note(err)
+                    self._set_update("error", 70, msg, ok=False, error=msg, head=head_s)
+                    return
+                copied = True
+                note("copied with sudo rsync")
+            if not copied:
+                self._set_update("error", 70, "copy failed", ok=False, error="copy failed")
+                return
+            _run(["sudo", "-n", "chown", "-R", f"{uid}:{gid}", str(dst)], timeout=15)
+            for helper in ("launch-vesktop.sh", "update.sh", "uninstall.sh"):
+                hf = src / helper
+                if hf.is_file():
+                    dest_h = DATA_DIR / helper
+                    shutil.copy2(hf, dest_h)
+                    dest_h.chmod(0o755)
+            _chown_tree(dst, uid, gid)
+            _chown_tree(src, uid, gid)
+            _chown_tree(DATA_DIR, uid, gid)
             try:
                 log.write_text("\n".join(lines) + "\n", encoding="utf-8")
             except OSError:
@@ -1501,6 +1891,451 @@ class Plugin:
             self._bridge_hash = ""
             self._set_update("restart", 90, "Restarting Decky…", head=head_s)
             self._restart_plugin_loader()
+        except PermissionError as e:
+            decky.logger.error(f"update_from_github: {e}")
+            self._set_update("error", int(self._update.get("percent") or 70), str(e), ok=False, error=str(e))
         except Exception as e:
             decky.logger.error(f"update_from_github: {e}")
             self._set_update("error", int(self._update.get("percent") or 0), str(e), ok=False, error=str(e))
+
+    def _write_pip_state(self) -> None:
+        PIP_DIR.mkdir(parents=True, exist_ok=True)
+        pip = dict(self._settings.get("pip") or {})
+        _write_json(PIP_DIR / "state.json", pip)
+
+    def _stop_pip_overlay(self) -> None:
+        proc = self._pip_proc
+        self._pip_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _overlay_needed(self) -> bool:
+        pip = self._settings.get("pip") or {}
+        talk = self._settings.get("talking") or {}
+        pip_on = bool(pip.get("enabled") and pip.get("userId"))
+        talk_on = bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
+        return pip_on or talk_on
+
+    def _start_pip_overlay(self) -> None:
+        self._write_pip_state()
+        if not self._overlay_needed():
+            return
+        proc = self._pip_proc
+        if proc is not None and proc.poll() is None:
+            return
+        script = PLUGIN_DIR / "pip_overlay.py"
+        if not script.is_file():
+            decky.logger.warning("pip_overlay.py missing")
+            return
+        log = DATA_DIR / "pip-overlay.log"
+        log_f = open(log, "ab")
+        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        log_f.flush()
+        env = _overlay_env()
+        self._pip_proc = subprocess.Popen(
+            ["/usr/bin/python3", str(script), str(PIP_DIR)],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        decky.logger.info(f"overlay pid={self._pip_proc.pid} display={env.get('DISPLAY')}")
+
+    def _stop_overlay_if_idle(self) -> None:
+        if not self._overlay_needed():
+            self._stop_pip_overlay()
+
+    async def _pip_grab_once(self) -> None:
+        pip = dict(self._settings.get("pip") or {})
+        uid = str(pip.get("userId") or "")
+        if not uid:
+            return
+        w, h = _pip_dims(str(pip.get("size") or "small"))
+        self._grab_alive_until = time.monotonic() + 4.0
+        r = await self.get_video_frames(user_id=uid, w=w, h=h)
+        frames = (r or {}).get("frames") or []
+        hit = None
+        kind = str(pip.get("kind") or "")
+        for f in frames:
+            if not isinstance(f, dict):
+                continue
+            if str(f.get("userId") or "") != uid:
+                continue
+            if kind and str(f.get("kind") or "") == kind:
+                hit = f
+                break
+            if hit is None:
+                hit = f
+        jpeg = (hit or {}).get("jpeg") or ""
+        if not jpeg or (hit or {}).get("black"):
+            return
+        raw = jpeg.split(",", 1)[-1]
+        try:
+            data = base64.b64decode(raw)
+        except Exception:
+            return
+        PIP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PIP_DIR / "frame.jpg.tmp"
+        tmp.write_bytes(data)
+        tmp.replace(PIP_DIR / "frame.jpg")
+
+    def _cache_avatar(self, uid: str, url: str) -> str:
+        if not uid:
+            return ""
+        dest_dir = PIP_DIR / "avatars"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{uid}.png"
+        if dest.is_file() and dest.stat().st_size > 32:
+            return str(dest)
+        if not url or not str(url).startswith("http"):
+            return ""
+        src = str(url).replace(".webp", ".png").replace(".gif", ".png")
+        try:
+            req = urllib.request.Request(src, headers={"User-Agent": "Deckscord/1.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = resp.read()
+            if data:
+                tmp = dest.with_suffix(".tmp")
+                tmp.write_bytes(data)
+                tmp.replace(dest)
+                return str(dest)
+        except Exception:
+            return ""
+        return ""
+
+    def _cache_avatars_batch(self, items: list[tuple[str, str]]) -> None:
+        for uid, url in items:
+            self._cache_avatar(uid, url)
+
+    def _write_talking_state(self, speakers: list[dict[str, Any]], live: bool) -> None:
+        talk = dict(self._settings.get("talking") or {})
+        blob = {
+            "enabled": bool(live and talk.get("enabled", True)),
+            "corner": talk.get("corner") or "top-left",
+            "size": talk.get("size") or "small",
+            "opacity": talk.get("opacity", 90),
+            "speakers": speakers,
+        }
+        _write_json(PIP_DIR / "talking.json", blob)
+
+    async def _talking_tick(self) -> None:
+        talk = dict(self._settings.get("talking") or {})
+        if not talk.get("enabled", True):
+            self._write_talking_state([], False)
+            return
+        try:
+            r = await self.get_speaking()
+        except Exception:
+            r = {}
+        in_voice = bool((r or {}).get("inVoice") or self._last_voice_channel)
+        self._talk_in_voice = in_voice
+        if not in_voice:
+            self._talk_hold.clear()
+            self._talk_last.clear()
+            self._write_talking_state([], False)
+            return
+        now = time.monotonic()
+        show_self = talk.get("showSelf", True) is not False
+        incoming = (r or {}).get("speakers") or []
+        if not incoming and (r or {}).get("ids"):
+            incoming = [{"id": str(i)} for i in (r.get("ids") or [])]
+        need: list[tuple[str, str]] = []
+        fresh: list[dict[str, Any]] = []
+        for sp in incoming:
+            if not isinstance(sp, dict):
+                continue
+            uid = str(sp.get("id") or "")
+            if not uid:
+                continue
+            if sp.get("self") and not show_self:
+                continue
+            dest = PIP_DIR / "avatars" / f"{uid}.png"
+            path = str(dest) if dest.is_file() and dest.stat().st_size > 32 else ""
+            url = str(sp.get("avatar") or "")
+            if not path and url:
+                need.append((uid, url))
+            rec = {
+                "id": uid,
+                "name": str(sp.get("name") or uid),
+                "self": bool(sp.get("self")),
+                "file": path,
+            }
+            fresh.append(rec)
+            self._talk_last[uid] = rec
+            self._talk_hold[uid] = now + 0.6
+        if need:
+            await asyncio.to_thread(self._cache_avatars_batch, need)
+            for rec in fresh:
+                dest = PIP_DIR / "avatars" / f"{rec['id']}.png"
+                if dest.is_file() and dest.stat().st_size > 32:
+                    rec["file"] = str(dest)
+                    self._talk_last[rec["id"]] = rec
+        live = []
+        for uid, until in list(self._talk_hold.items()):
+            if until < now:
+                self._talk_hold.pop(uid, None)
+                self._talk_last.pop(uid, None)
+                continue
+            rec = self._talk_last.get(uid)
+            if rec:
+                live.append(rec)
+        live = live[:5]
+        self._write_talking_state(live, True)
+
+    async def _pip_loop(self) -> None:
+        talk_at = 0.0
+        while True:
+            try:
+                pip = self._settings.get("pip") or {}
+                talk = self._settings.get("talking") or {}
+                pip_on = bool(pip.get("enabled") and pip.get("userId"))
+                talk_pref = talk.get("enabled", True) is not False
+                now = time.monotonic()
+                talk_iv = 0.25 if self._talk_in_voice else 1.0
+                if talk_pref and now - talk_at >= talk_iv:
+                    await self._talking_tick()
+                    talk_at = now
+                elif not talk_pref:
+                    self._write_talking_state([], False)
+                talk_on = bool(talk_pref and self._talk_in_voice)
+                if pip_on:
+                    await self._pip_grab_once()
+                if pip_on or talk_on:
+                    self._start_pip_overlay()
+                    await asyncio.sleep(1.0 / 30.0 if pip_on else 0.25)
+                else:
+                    self._stop_overlay_if_idle()
+                    await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                decky.logger.warning(f"overlay loop: {e}")
+                await asyncio.sleep(1.0)
+
+    def _pip_summary(self) -> dict[str, Any]:
+        return dict(self._settings.get("pip") or {})
+
+    async def get_settings(self) -> dict[str, Any]:
+        self._settings = _load_settings()
+        vdir = _vesktop_config_dir()
+        vesktop = _read_json(vdir / "settings.json")
+        state = _read_json(vdir / "state.json")
+        audio = dict(VESKTOP_AUDIO_DEFAULTS)
+        if isinstance(vesktop.get("audio"), dict):
+            audio.update(vesktop["audio"])
+        vesktop = dict(vesktop)
+        vesktop["audio"] = audio
+        discord: dict[str, Any] = {}
+        try:
+            r = await self._bridge("getDiscordSettings()")
+            if isinstance(r, dict):
+                discord = r
+        except Exception as e:
+            discord = {"ok": False, "error": str(e)}
+        return {
+            "ok": True,
+            "pip": self._pip_summary(),
+            "talking": dict(self._settings.get("talking") or DEFAULT_SETTINGS["talking"]),
+            "golive": dict(self._settings.get("golive") or DEFAULT_SETTINGS["golive"]),
+            "vesktop": vesktop,
+            "vesktopState": state,
+            "discord": discord,
+            "vesktopPath": str(vdir),
+        }
+
+    async def set_pip_settings(self, corner: str = "", size: str = "", opacity: Any = None, **kwargs: Any) -> dict[str, Any]:
+        pip = dict(self._settings.get("pip") or {})
+        corner = str(kwargs.get("corner") or corner or pip.get("corner") or "bottom-right")
+        if corner not in ("top-left", "top-right", "bottom-left", "bottom-right"):
+            corner = "bottom-right"
+        size = str(kwargs.get("size") or size or pip.get("size") or "small")
+        if size not in ("small", "large"):
+            size = "small"
+        op = kwargs.get("opacity") if kwargs.get("opacity") is not None else opacity
+        if op is None:
+            op = pip.get("opacity", 100)
+        try:
+            op_n = int(float(op))
+        except (TypeError, ValueError):
+            op_n = 100
+        op_n = max(20, min(100, op_n))
+        pip["corner"] = corner
+        pip["size"] = size
+        pip["opacity"] = op_n
+        self._settings["pip"] = pip
+        _save_settings(self._settings)
+        self._write_pip_state()
+        if pip.get("enabled") and pip.get("userId"):
+            self._start_pip_overlay()
+        return {"ok": True, "pip": pip}
+
+    async def pin_pip(self, user_id: str = "", kind: str = "screenshare", name: str = "", **kwargs: Any) -> dict[str, Any]:
+        if isinstance(user_id, dict):
+            kwargs.update(user_id)
+            user_id = str(kwargs.get("user_id") or kwargs.get("userId") or "")
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("userId") or "")
+        if not uid:
+            return {"ok": False, "error": "missing user_id"}
+        kind = str(kind or kwargs.get("kind") or "screenshare")
+        name = str(name or kwargs.get("name") or "")
+        try:
+            await self.focus_stream(uid)
+        except Exception as e:
+            decky.logger.warning(f"pin focus: {e}")
+        pip = dict(self._settings.get("pip") or {})
+        pip["enabled"] = True
+        pip["userId"] = uid
+        pip["kind"] = kind
+        pip["name"] = name
+        self._settings["pip"] = pip
+        _save_settings(self._settings)
+        self._write_pip_state()
+        self._grab_alive_until = time.monotonic() + 8.0
+        try:
+            await self._pip_grab_once()
+        except Exception as e:
+            decky.logger.warning(f"pin grab: {e}")
+        self._start_pip_overlay()
+        return {"ok": True, "pip": pip}
+
+    async def unpin_pip(self) -> dict[str, Any]:
+        pip = dict(self._settings.get("pip") or {})
+        pip["enabled"] = False
+        pip["userId"] = None
+        pip["name"] = ""
+        self._settings["pip"] = pip
+        _save_settings(self._settings)
+        self._write_pip_state()
+        self._stop_overlay_if_idle()
+        try:
+            await self._clear_audio_focus_safe()
+        except Exception:
+            pass
+        return {"ok": True, "pip": pip}
+
+    async def set_golive_quality(self, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
+        h = int(kwargs.get("height") or height or 720)
+        f = int(kwargs.get("fps") or fps or 30)
+        if h not in (720, 1080):
+            h = 720
+        if f not in (15, 30):
+            f = 30
+        w = 1280 if h == 720 else 1920
+        self._settings["golive"] = {"width": w, "height": h, "fps": f}
+        _save_settings(self._settings)
+        vdir = _vesktop_config_dir()
+        state = _read_json(vdir / "state.json")
+        state["screenshareQuality"] = {"resolution": str(h), "frameRate": str(f)}
+        _write_json(vdir / "state.json", state)
+        try:
+            await self._bridge(f"setScreenshareQuality({json.dumps(str(h))}, {json.dumps(str(f))})")
+        except Exception as e:
+            decky.logger.warning(f"screenshareQuality: {e}")
+        return {"ok": True, "golive": self._settings["golive"], "needsRestart": False}
+
+    async def set_vesktop_setting(self, key: str = "", value: Any = None, **kwargs: Any) -> dict[str, Any]:
+        if isinstance(key, dict):
+            kwargs.update(key)
+            key = str(kwargs.get("key") or "")
+            if "value" in kwargs:
+                value = kwargs.get("value")
+        key = str(key or kwargs.get("key") or "")
+        if "value" in kwargs:
+            value = kwargs.get("value")
+        if not key:
+            return {"ok": False, "error": "missing key"}
+        vdir = _vesktop_config_dir()
+        path = vdir / "settings.json"
+        doc = _read_json(path)
+        if key.startswith("audio."):
+            audio = dict(VESKTOP_AUDIO_DEFAULTS)
+            if isinstance(doc.get("audio"), dict):
+                audio.update(doc["audio"])
+            audio[key.split(".", 1)[1]] = value
+            doc["audio"] = audio
+        else:
+            doc[key] = value
+        _write_json(path, doc)
+        restart = key in (
+            "hardwareAcceleration",
+            "hardwareVideoAcceleration",
+            "discordBranch",
+            "nativeTitleBar",
+            "enableShadow",
+            "enableRoundedCorners",
+            "disableSmoothScroll",
+            "webRTCIPHandlingPolicy",
+        )
+        return {"ok": True, "key": key, "value": value, "needsRestart": restart, "vesktop": doc}
+
+    async def set_discord_setting(self, key: str = "", value: Any = None, **kwargs: Any) -> dict[str, Any]:
+        if isinstance(key, dict):
+            kwargs.update(key)
+            key = str(kwargs.get("key") or "")
+            if "value" in kwargs:
+                value = kwargs.get("value")
+        key = str(key or kwargs.get("key") or "")
+        if "value" in kwargs:
+            value = kwargs.get("value")
+        if not key:
+            return {"ok": False, "error": "missing key"}
+        r = await self._bridge(f"setDiscordSetting({json.dumps(key)}, {json.dumps(bool(value))})")
+        return self._ok(r)
+
+    async def set_talking_settings(
+        self,
+        enabled: Any = None,
+        corner: str = "",
+        size: str = "",
+        opacity: Any = None,
+        show_self: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if isinstance(enabled, dict):
+            kwargs.update(enabled)
+            enabled = kwargs.get("enabled")
+        talk = dict(self._settings.get("talking") or DEFAULT_SETTINGS["talking"])
+        if enabled is None:
+            enabled = kwargs.get("enabled")
+        if enabled is not None:
+            talk["enabled"] = bool(enabled)
+        corner = str(kwargs.get("corner") or corner or talk.get("corner") or "top-left")
+        if corner not in ("top-left", "top-right", "bottom-left", "bottom-right"):
+            corner = "top-left"
+        talk["corner"] = corner
+        size = str(kwargs.get("size") or size or talk.get("size") or "small")
+        if size not in ("small", "large"):
+            size = "small"
+        talk["size"] = size
+        op = kwargs.get("opacity") if kwargs.get("opacity") is not None else opacity
+        if op is None:
+            op = talk.get("opacity", 90)
+        try:
+            op_n = int(float(op))
+        except (TypeError, ValueError):
+            op_n = 90
+        talk["opacity"] = max(20, min(100, op_n))
+        ss = kwargs.get("showSelf") if kwargs.get("showSelf") is not None else (kwargs.get("show_self") if kwargs.get("show_self") is not None else show_self)
+        if ss is not None:
+            talk["showSelf"] = bool(ss)
+        self._settings["talking"] = talk
+        _save_settings(self._settings)
+        live = bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
+        speakers = list(self._talk_last.values())[:5] if live else []
+        self._write_talking_state(speakers, live)
+        if live or (self._settings.get("pip") or {}).get("enabled"):
+            self._start_pip_overlay()
+        else:
+            self._stop_overlay_if_idle()
+        return {"ok": True, "talking": talk}
+

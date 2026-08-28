@@ -743,7 +743,7 @@
     }
   }
 
-  function jpegFromEngineTrack(s, big) {
+  function jpegFromEngineTrack(s, big, dw, dh) {
     var tracks = videoTracksFor(s.userId);
     var want = s.kind === "screenshare" ? "screenshare" : "camera";
     var hit = null;
@@ -753,9 +753,9 @@
     if (!hit && s.kind === "screenshare" && tracks.length) hit = tracks[0];
     if (!hit) return null;
     var el = attachTrack(s.userId + ":" + s.kind, hit.track);
-    var dw = big ? 960 : 400;
-    var dh = big ? 540 : 225;
-    var q = big ? 0.62 : s.kind === "screenshare" ? 0.5 : 0.4;
+    dw = dw || (big ? 960 : 400);
+    dh = dh || (big ? 540 : 225);
+    var q = big || dw >= 640 ? 0.55 : s.kind === "screenshare" ? 0.5 : 0.4;
     return paintElementToJpeg(el, q, dw, dh);
   }
 
@@ -903,16 +903,22 @@
     gameAudio: [],
   };
 
-  function pinScreenshareQuality() {
+  function pinScreenshareQuality(res, fps) {
     try {
       var f = document.createElement("iframe");
       document.documentElement.appendChild(f);
       var ls = f.contentWindow.localStorage;
       var st = JSON.parse(ls.getItem("VesktopState") || "{}");
-      st.screenshareQuality = { resolution: "720", frameRate: "30" };
+      st.screenshareQuality = {
+        resolution: String(res || (st.screenshareQuality && st.screenshareQuality.resolution) || "720"),
+        frameRate: String(fps || (st.screenshareQuality && st.screenshareQuality.frameRate) || "30"),
+      };
       ls.setItem("VesktopState", JSON.stringify(st));
       f.remove();
-    } catch (ePin) {}
+      return st.screenshareQuality;
+    } catch (ePin) {
+      return null;
+    }
   }
 
   function currentStream() {
@@ -1299,23 +1305,32 @@
       }
     },
 
-    grabVideoFrames: function () {
+    grabVideoFrames: function (opts) {
       try {
+        opts = opts || {};
         var bag = collectStreams();
         try { ensureVideoSinks(true); } catch (eSink) {}
+        var pipId = opts.userId ? String(opts.userId) : "";
+        var pipW = Number(opts.w) || 0;
+        var pipH = Number(opts.h) || 0;
         var copied = (bag.streams || []).filter(function (s) {
+          if (pipId) return s.userId === pipId;
           return !(s.self && s.kind === "screenshare");
-        }).slice(0, 4);
+        });
+        if (pipId) copied = copied.slice(0, 1);
+        else copied = copied.slice(0, 4);
         var focusId = (window.__deckscordAudioFocus && window.__deckscordAudioFocus.kind === "stream" && window.__deckscordAudioFocus.userId) || null;
-        try { muteAllStreamAudioExcept(focusId); } catch (eMute) {}
+        try { muteAllStreamAudioExcept(focusId || pipId || null); } catch (eMute) {}
         var jobs = copied.map(function (s) {
           var key = s.userId + ":" + s.kind;
-          var big = !!(focusId && s.userId === focusId);
-          var jpeg = jpegFromEngineTrack(s, big);
+          var big = !!(focusId && s.userId === focusId) || !!(pipId && pipW >= 640);
+          var dw = pipId && pipW ? pipW : (big ? 960 : 400);
+          var dh = pipId && pipH ? pipH : (big ? 540 : 225);
+          var jpeg = jpegFromEngineTrack(s, big, dw, dh);
           if (!jpeg) {
             var cached = window.__deckscordVideo.canvases[key];
             if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, big ? 0.62 : s.kind === "screenshare" ? 0.5 : 0.4);
+              jpeg = jpegFromCanvas(cached, big ? 0.55 : s.kind === "screenshare" ? 0.5 : 0.4);
             }
           }
           var next = Promise.resolve(jpeg);
@@ -1330,8 +1345,8 @@
               name: s.name,
               avatar: s.avatar,
               jpeg: outJpeg || null,
-              w: 400,
-              h: 225,
+              w: dw,
+              h: dh,
               black: !outJpeg,
               self: !!s.self,
               from: jpeg ? "engine" : (outJpeg ? "preview" : "none"),
@@ -1377,7 +1392,21 @@
         if (meId && Sp && typeof Sp.isCurrentUserSpeaking === "function" && Sp.isCurrentUserSpeaking()) {
           if (ids.indexOf(meId) === -1) ids.push(meId);
         }
-        return { ok: true, ids: ids };
+        var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
+        var voiceChannelId = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
+        var speakers = [];
+        ids.forEach(function (id) {
+          var u = UserStore && UserStore.getUser && UserStore.getUser(id);
+          var av = avatarFromUser(u, 64) || "";
+          if (av) av = String(av).replace(".webp", ".png").replace(".gif", ".png");
+          speakers.push({
+            id: String(id),
+            name: (u && (u.globalName || u.username)) || String(id),
+            avatar: av,
+            self: !!(meId && String(id) === meId),
+          });
+        });
+        return { ok: true, ids: ids, speakers: speakers, inVoice: !!voiceChannelId, channelId: voiceChannelId || null };
       } catch (e) {
         return err(e);
       }
@@ -1964,6 +1993,83 @@
         if (n > 200) n = 200;
         fn(n);
         return { ok: true, volume: n };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    getDiscordSettings: function () {
+      try {
+        var MES = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+        function g(name) {
+          try {
+            return MES && typeof MES[name] === "function" ? MES[name]() : null;
+          } catch (eG) {
+            return null;
+          }
+        }
+        var quality = null;
+        try {
+          var f = document.createElement("iframe");
+          document.documentElement.appendChild(f);
+          var st = JSON.parse(f.contentWindow.localStorage.getItem("VesktopState") || "{}");
+          quality = st.screenshareQuality || null;
+          f.remove();
+        } catch (eQ) {}
+        return {
+          ok: true,
+          muted: !!g("isSelfMute"),
+          deafened: !!g("isSelfDeaf"),
+          echoCancellation: g("getEchoCancellation"),
+          noiseSuppression: g("getNoiseSuppression"),
+          noiseCancellation: g("getNoiseCancellation"),
+          automaticGainControl: g("getAutomaticGainControl"),
+          inputId: g("getInputDeviceId") || "",
+          outputId: g("getOutputDeviceId") || "",
+          inputVolume: g("getInputVolume"),
+          outputVolume: g("getOutputVolume"),
+          screenshareQuality: quality,
+        };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    setDiscordSetting: function (key, value) {
+      try {
+        var map = {
+          echoCancellation: "setEchoCancellation",
+          noiseSuppression: "setNoiseSuppression",
+          noiseCancellation: "setNoiseCancellation",
+          automaticGainControl: "setAutomaticGainControl",
+        };
+        var name = map[String(key)];
+        if (!name) return { ok: false, error: "unknown setting" };
+        var fn = findFn(name);
+        if (!fn) return { ok: false, error: name + " not found" };
+        fn(!!value);
+        return { ok: true, key: String(key), value: !!value };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    setScreenshareQuality: function (res, fps) {
+      try {
+        var q = pinScreenshareQuality(res, fps);
+        return { ok: true, screenshareQuality: q };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    getScreenshareQuality: function () {
+      try {
+        var f = document.createElement("iframe");
+        document.documentElement.appendChild(f);
+        var st = JSON.parse(f.contentWindow.localStorage.getItem("VesktopState") || "{}");
+        f.remove();
+        return { ok: true, screenshareQuality: st.screenshareQuality || { resolution: "720", frameRate: "30" } };
       } catch (e) {
         return err(e);
       }

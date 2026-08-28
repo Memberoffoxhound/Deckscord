@@ -53,6 +53,14 @@ const updateFromGithub = backend("update_from_github");
 const getUpdateStatus = backend("get_update_status");
 const startGoLive = backend("start_go_live");
 const stopGoLive = backend("stop_go_live");
+const getSettings = backend("get_settings");
+const setPipSettings = backend("set_pip_settings");
+const pinPip = backend("pin_pip");
+const unpinPip = backend("unpin_pip");
+const setVesktopSetting = backend("set_vesktop_setting");
+const setDiscordSetting = backend("set_discord_setting");
+const setGoLiveQuality = backend("set_golive_quality");
+const setTalkingSettings = backend("set_talking_settings");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -375,9 +383,11 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function WatchOverlay({ userId, name, kind, closeModal }) {
+function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
+  const onCancel = useContext(BackNav);
   const [jpeg, setJpeg] = useState(null);
   const [hint, setHint] = useState("Starting…");
+  const keepAudio = useRef(false);
   useEffect(() => {
     let stop = false;
     (async () => {
@@ -401,12 +411,22 @@ function WatchOverlay({ userId, name, kind, closeModal }) {
     })();
     return () => {
       stop = true;
-      clearAudioFocus().catch(() => {});
     };
   }, [userId, kind]);
   const close = () => {
-    clearAudioFocus().catch(() => {});
+    if (!keepAudio.current) clearAudioFocus().catch(() => {});
     if (closeModal) closeModal();
+  };
+  const pin = () => {
+    keepAudio.current = true;
+    pinPip(userId, kind || "screenshare", name || "")
+      .then(() => {
+        if (onPinned) onPinned();
+        close();
+      })
+      .catch(() => {
+        keepAudio.current = false;
+      });
   };
   const Inner = closeModal && DFL.ModalRoot ? DFL.ModalRoot : "div";
   return e(
@@ -471,11 +491,25 @@ function WatchOverlay({ userId, name, kind, closeModal }) {
         },
         (name || "Stream") + " · game audio · B to close"
       ),
+      e(
+        DFL.PanelSectionRow,
+        { key: "pin" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: "Keeps a stamp on the game after you close the QAM",
+            onClick: pin,
+            ...cancelBind(onCancel || close),
+          },
+          "Pin to corner"
+        )
+      ),
     ]
   );
 }
 
-function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMember, onWatch }) {
+function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, onOpenMember, onWatch }) {
   const onCancel = useContext(BackNav);
   const go = () => {
     if (stream.self) {
@@ -558,7 +592,7 @@ function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMem
           key: "kind",
           style: { position: "absolute", top: 6, right: 6, pointerEvents: "none", fontSize: 14, opacity: 0.75 },
         },
-        stream.kind === "screenshare" ? "🖥" : "📷"
+        pinned ? "📌" : stream.kind === "screenshare" ? "🖥" : "📷"
       ),
       (focused || speaking) &&
         e(
@@ -585,7 +619,7 @@ function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMem
   );
 }
 
-function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus, onOpenMember, onWatch, onMore }) {
+function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onFocus, onOpenMember, onWatch, onMore, onPin }) {
   const list = streams || [];
   const copied = list.slice(0, max);
   const extra = Math.max(0, list.length - copied.length);
@@ -609,6 +643,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus,
           jpeg: fr.black ? null : fr.jpeg,
           height: h,
           speaking: !!(speakingIds && speakingIds[s.userId]),
+          pinned: pinnedUserId === s.userId,
           onFocus,
           onOpenMember,
           onWatch,
@@ -621,6 +656,92 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus,
             ]
           : []
       )
+      .concat(
+        focusedUserId && onPin
+          ? [
+              e(
+                Row,
+                {
+                  key: "pin",
+                  onClick: () => {
+                    const s = copied.find((x) => x.userId === focusedUserId) || {
+                      userId: focusedUserId,
+                      kind: "screenshare",
+                      name: "",
+                    };
+                    onPin(s);
+                  },
+                },
+                e(Label, null, "Pin focused stream to corner")
+              ),
+            ]
+          : []
+      )
+  );
+}
+
+function cycle(list, cur) {
+  const i = Math.max(0, list.indexOf(cur));
+  return list[(i + 1) % list.length];
+}
+
+function SettingsHub({ push, handleCancel }) {
+  const items = [
+    { page: "settings_pip", title: "Picture in picture", sub: "Corner, stamp size, opacity" },
+    { page: "settings_talk", title: "Who's talking", sub: "Names over the game while someone speaks" },
+    { page: "settings_voice", title: "Discord · Voice", sub: "Mute, devices, echo / noise" },
+    { page: "settings_golive", title: "Discord · Go Live", sub: "Resolution and frame rate" },
+    { page: "settings_vesktop_perf", title: "Vesktop · Performance", sub: "Hardware acceleration" },
+    { page: "settings_vesktop_audio", title: "Vesktop · Linux audio", sub: "Venmic / screenshare capture" },
+    { page: "settings_vesktop_app", title: "Vesktop · App", sub: "Branch, tray, Rich Presence" },
+  ];
+  return e(
+    DFL.PanelSection,
+    { title: "Settings" },
+    items.map((it) =>
+      e(
+        Row,
+        { key: it.page, onClick: () => push({ page: it.page, title: it.title }) },
+        [
+          e("div", { key: "t", style: { minWidth: 0, flex: 1, overflow: "hidden" } }, [
+            e(Label, null, it.title),
+            e(Sub, null, it.sub),
+          ]),
+        ]
+      )
+    )
+  );
+}
+
+function ToggleRow({ label, description, checked, onChange, handleCancel }) {
+  return e(
+    DFL.PanelSectionRow,
+    null,
+    e(DFL.ToggleField, {
+      label,
+      description,
+      checked: !!checked,
+      onChange,
+      ...cancelBind(handleCancel),
+    })
+  );
+}
+
+function CycleRow({ label, value, options, handleCancel, onPick }) {
+  const cur = options.find((o) => o.value === value) || options[0];
+  return e(
+    DFL.PanelSectionRow,
+    null,
+    e(
+      DFL.ButtonItem,
+      {
+        layout: "below",
+        description: cur ? cur.label : String(value),
+        onClick: () => onPick(cycle(options.map((o) => o.value), value)),
+        ...cancelBind(handleCancel),
+      },
+      label
+    )
   );
 }
 
@@ -636,6 +757,7 @@ function App() {
   const [frames, setFrames] = useState([]);
   const [speakingIds, setSpeakingIds] = useState({});
   const [updateProg, setUpdateProg] = useState(null);
+  const [cfg, setCfg] = useState(null);
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const volTimer = useRef(null);
@@ -796,6 +918,20 @@ function App() {
     };
   }, [inVoice]);
 
+  const onSettingsPage = String(view.page || "").indexOf("settings") === 0;
+  useEffect(() => {
+    if (!onSettingsPage) return;
+    let stop = false;
+    getSettings()
+      .then((r) => {
+        if (!stop && r) setCfg(r);
+      })
+      .catch(() => {});
+    return () => {
+      stop = true;
+    };
+  }, [onSettingsPage, view.page, tick]);
+
   const act = async (label, fn, opts) => {
     const quiet = opts && opts.quiet;
     if (!(status && status.ready) && label !== "Starting Discord") return;
@@ -846,6 +982,7 @@ function App() {
       act("Open " + ch.name, () => selectText(ch.id), { quiet: true });
     });
   const openDevices = () => tap(() => push({ page: "devices", title: "Audio" }));
+  const openSettings = () => tap(() => push({ page: "settings", title: "Settings" }));
   const openMember = (m) =>
     tap(() =>
       push({
@@ -889,6 +1026,22 @@ function App() {
       : null,
     error ? e(DFL.PanelSectionRow, { key: "err" }, e("div", { style: { color: "#e4b44c", fontSize: 13 } }, error)) : null,
     busy ? e(DFL.PanelSectionRow, { key: "busy" }, e("div", { style: { opacity: 0.7, fontSize: 12 } }, busy + "…")) : null,
+    ready &&
+      view.page === "home" &&
+      e(
+        DFL.PanelSectionRow,
+        { key: "set" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: "PiP, Discord voice, Vesktop",
+            onClick: openSettings,
+            ...cancelBind(handleCancel),
+          },
+          "Settings"
+        )
+      ),
     view.page === "home" &&
       e(
         DFL.PanelSectionRow,
@@ -980,13 +1133,30 @@ function App() {
   const showLiveVideo = videoEnabled && hasVideo;
   const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
   const onTileFocus = (uid) => act("Watch audio", () => focusStream(uid), { quiet: true });
+  const pip = (status && status.pip) || (cfg && cfg.pip) || {};
+  const pipOn = !!(pip.enabled && pip.userId);
+  const talking = (status && status.talking) || (cfg && cfg.talking) || {};
+  const talkingOn = talking.enabled !== false;
   const onWatchStream = (s) => {
     tap(() => act("Watch", () => focusStream(s.userId), { quiet: true }));
     if (typeof DFL.showModal === "function") {
-      DFL.showModal(e(WatchOverlay, { userId: s.userId, name: s.name, kind: s.kind || "screenshare" }));
+      DFL.showModal(
+        e(WatchOverlay, {
+          userId: s.userId,
+          name: s.name,
+          kind: s.kind || "screenshare",
+          onPinned: () => refresh(),
+        })
+      );
     } else {
       push({ page: "watch", userId: s.userId, kind: s.kind || "screenshare", title: s.name || "Watch" });
     }
+  };
+  const onPinStream = (s) => {
+    if (!s || !s.userId) return;
+    tap(() =>
+      act("Pin", () => pinPip(s.userId, s.kind || "screenshare", s.name || ""), { quiet: false })
+    );
   };
   const onTileMember = (s) => {
     const m = memberById(s.userId) || { id: s.userId, name: s.name, avatar: s.avatar, self: !!s.self };
@@ -1005,10 +1175,39 @@ function App() {
             checked: streaming,
             onChange: () =>
               tap(() =>
-                act(streaming ? "Stop share" : "Share game", () => (streaming ? stopGoLive() : startGoLive(1280, 720, 30)))
+                act(streaming ? "Stop share" : "Share game", () => (streaming ? stopGoLive() : startGoLive((cfg && cfg.golive && cfg.golive.width) || 1280, (cfg && cfg.golive && cfg.golive.height) || 720, (cfg && cfg.golive && cfg.golive.fps) || 30)))
               ),
             ...cancelBind(handleCancel),
           })
+        )
+      : null,
+    voice
+      ? e(
+          DFL.PanelSectionRow,
+          { key: "talk" },
+          e(DFL.ToggleField, {
+            label: "Who's talking",
+            description: talkingOn ? (talking.corner || "top-left") + " · over the game" : "Off",
+            checked: talkingOn,
+            onChange: (v) => tap(() => act("Talking overlay", () => setTalkingSettings(v))),
+            ...cancelBind(handleCancel),
+          })
+        )
+      : null,
+    pipOn
+      ? e(
+          DFL.PanelSectionRow,
+          { key: "unpin" },
+          e(
+            DFL.ButtonItem,
+            {
+              layout: "below",
+              description: (pip.name || "Stream") + " · " + (pip.size || "small") + " · " + (pip.corner || "bottom-right"),
+              onClick: () => tap(() => act("Unpin", () => unpinPip())),
+              ...cancelBind(handleCancel),
+            },
+            "Unpin PiP"
+          )
         )
       : null,
     voice
@@ -1126,15 +1325,22 @@ function App() {
         frames,
         focusedUserId,
         speakingIds,
+        pinnedUserId: pipOn ? pip.userId : null,
         max: 3,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
         onWatch: onWatchStream,
         onMore: openVideoPage,
+        onPin: onPinStream,
       })
     : null;
 
-  const showVoicePanel = ready && view.page !== "chat" && view.page !== "member" && view.page !== "video";
+  const showVoicePanel =
+    ready &&
+    view.page !== "chat" &&
+    view.page !== "member" &&
+    view.page !== "video" &&
+    String(view.page || "").indexOf("settings") !== 0;
   const people = [];
   if (showLiveVideo && view.page !== "devices" && videoStack) people.push(videoStack);
   if (memberRows.length) people.push.apply(people, memberRows);
@@ -1503,10 +1709,12 @@ function App() {
         frames,
         focusedUserId,
         speakingIds,
+        pinnedUserId: pipOn ? pip.userId : null,
         max: 4,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
         onWatch: onWatchStream,
+        onPin: onPinStream,
       }),
     ].concat(compactVoice));
   } else if (view.page === "watch") {
@@ -1515,9 +1723,559 @@ function App() {
       "div",
       { style: { ...FILL, background: "#000", position: "relative", minHeight: 240 } },
       [
-        e(WatchOverlay, { userId: view.userId, name: ws.name || view.title, kind: ws.kind || view.kind || "screenshare" }),
+        e(WatchOverlay, {
+          userId: view.userId,
+          name: ws.name || view.title,
+          kind: ws.kind || view.kind || "screenshare",
+          onPinned: () => {
+            refresh();
+            back();
+          },
+        }),
       ]
     );
+  } else if (view.page === "settings") {
+    body = e(SettingsHub, { push, handleCancel });
+  } else if (String(view.page || "").indexOf("settings_") === 0) {
+    const ves = (cfg && cfg.vesktop) || {};
+    const audio = ves.audio || {};
+    const disc = (cfg && cfg.discord) || {};
+    const golive = (cfg && cfg.golive) || { height: 720, fps: 30 };
+    const pipCfg = (cfg && cfg.pip) || pip || {};
+    const talkCfg = (cfg && cfg.talking) || talking || {};
+    const reload = () =>
+      getSettings()
+        .then((r) => {
+          if (r) setCfg(r);
+        })
+        .catch(() => {});
+    const setVk = (key, value) =>
+      act("Setting", async () => {
+        const r = await setVesktopSetting(key, value);
+        await reload();
+        return r;
+      });
+    const setDs = (key, value) =>
+      act("Setting", async () => {
+        const r = await setDiscordSetting(key, value);
+        await reload();
+        return r;
+      });
+    let kids = [];
+    if (view.page === "settings_pip") {
+      kids = [
+        e(
+          DFL.PanelSectionRow,
+          { key: "h" },
+          e(
+            "div",
+            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
+            "Pin a live tile to a corner over the game. Small is 240p, large is 480p, both clamped to the screen height so a Deck and a 4K TV stay usable. Opacity is compositor alpha — no extra encode."
+          )
+        ),
+        e(
+          CycleRow,
+          {
+            key: "sz",
+            label: "Stamp size",
+            value: pipCfg.size || "small",
+            options: [
+              { value: "small", label: "Small · 240p" },
+              { value: "large", label: "Large · 480p" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("PiP", async () => {
+                const r = await setPipSettings(pipCfg.corner, v, pipCfg.opacity);
+                await reload();
+                return r;
+              }),
+          }
+        ),
+        e(
+          CycleRow,
+          {
+            key: "cr",
+            label: "Corner",
+            value: pipCfg.corner || "bottom-right",
+            options: [
+              { value: "top-left", label: "Top left" },
+              { value: "top-right", label: "Top right" },
+              { value: "bottom-left", label: "Bottom left" },
+              { value: "bottom-right", label: "Bottom right" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("PiP", async () => {
+                const r = await setPipSettings(v, pipCfg.size, pipCfg.opacity);
+                await reload();
+                return r;
+              }),
+          }
+        ),
+        e(
+          DFL.PanelSectionRow,
+          { key: "op" },
+          e(DFL.SliderField, {
+            label: "Opacity",
+            value: pipCfg.opacity != null ? pipCfg.opacity : 100,
+            min: 20,
+            max: 100,
+            step: 5,
+            showValue: true,
+            valueSuffix: "%",
+            onChange: (v) =>
+              slideVol("pipop", v, () => setPipSettings(pipCfg.corner, pipCfg.size, v).then(reload)),
+            ...cancelBind(handleCancel),
+          })
+        ),
+        pipOn
+          ? e(
+              DFL.PanelSectionRow,
+              { key: "un" },
+              e(
+                DFL.ButtonItem,
+                {
+                  layout: "below",
+                  onClick: () => tap(() => act("Unpin", () => unpinPip().then(reload))),
+                  ...cancelBind(handleCancel),
+                },
+                "Unpin " + (pipCfg.name || "stream")
+              )
+            )
+          : e(
+              DFL.PanelSectionRow,
+              { key: "n" },
+              e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Focus a live tile, then Pin. The stamp stays after you close the QAM.")
+            ),
+      ];
+    } else if (view.page === "settings_talk") {
+      kids = [
+        e(
+          DFL.PanelSectionRow,
+          { key: "h" },
+          e(
+            "div",
+            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
+            "While you are in a call, a name and avatar appear over the game only when that person is speaking. Nothing is drawn when the channel is quiet. Same cheap overlay plane as PiP — no extra video encode."
+          )
+        ),
+        e(ToggleRow, {
+          key: "en",
+          label: "Show who's talking",
+          description: "Over Game Mode, not the QAM",
+          checked: talkCfg.enabled !== false,
+          onChange: (v) =>
+            act("Talking overlay", async () => {
+              const r = await setTalkingSettings(v);
+              await reload();
+              return r;
+            }),
+          handleCancel,
+        }),
+        e(
+          CycleRow,
+          {
+            key: "cr",
+            label: "Corner",
+            value: talkCfg.corner || "top-left",
+            options: [
+              { value: "top-left", label: "Top left" },
+              { value: "top-right", label: "Top right" },
+              { value: "bottom-left", label: "Bottom left" },
+              { value: "bottom-right", label: "Bottom right" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("Talking overlay", async () => {
+                const r = await setTalkingSettings({
+                  enabled: talkCfg.enabled !== false,
+                  corner: v,
+                  size: talkCfg.size,
+                  opacity: talkCfg.opacity,
+                  showSelf: talkCfg.showSelf,
+                });
+                await reload();
+                return r;
+              }),
+          }
+        ),
+        e(
+          CycleRow,
+          {
+            key: "sz",
+            label: "Size",
+            value: talkCfg.size || "small",
+            options: [
+              { value: "small", label: "Small" },
+              { value: "large", label: "Large" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("Talking overlay", async () => {
+                const r = await setTalkingSettings({
+                  enabled: talkCfg.enabled !== false,
+                  corner: talkCfg.corner,
+                  size: v,
+                  opacity: talkCfg.opacity,
+                  showSelf: talkCfg.showSelf,
+                });
+                await reload();
+                return r;
+              }),
+          }
+        ),
+        e(
+          DFL.PanelSectionRow,
+          { key: "op" },
+          e(DFL.SliderField, {
+            label: "Opacity",
+            value: talkCfg.opacity != null ? talkCfg.opacity : 90,
+            min: 20,
+            max: 100,
+            step: 5,
+            showValue: true,
+            valueSuffix: "%",
+            onChange: (v) =>
+              slideVol("talkop", v, () =>
+                setTalkingSettings({
+                  enabled: talkCfg.enabled !== false,
+                  corner: talkCfg.corner,
+                  size: talkCfg.size,
+                  opacity: v,
+                  showSelf: talkCfg.showSelf,
+                }).then(reload)
+              ),
+            ...cancelBind(handleCancel),
+          })
+        ),
+        e(ToggleRow, {
+          key: "me",
+          label: "Show me",
+          description: "Include your name when you talk",
+          checked: talkCfg.showSelf !== false,
+          onChange: (v) =>
+            act("Talking overlay", async () => {
+              const r = await setTalkingSettings({
+                enabled: talkCfg.enabled,
+                corner: talkCfg.corner,
+                size: talkCfg.size,
+                opacity: talkCfg.opacity,
+                showSelf: v,
+              });
+              await reload();
+              return r;
+            }),
+          handleCancel,
+        }),
+      ];
+    } else if (view.page === "settings_voice") {
+      kids = [
+        e(ToggleRow, {
+          key: "m",
+          label: "Mute",
+          description: "Microphone",
+          checked: !!(status && status.muted),
+          onChange: () => tap(() => act("Mute", () => toggleMute())),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "d",
+          label: "Deafen",
+          description: "Speakers and microphone",
+          checked: !!(status && status.deafened),
+          onChange: () => tap(() => act("Deafen", () => toggleDeafen())),
+          handleCancel,
+        }),
+        e(
+          DFL.PanelSectionRow,
+          { key: "dev" },
+          e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")
+        ),
+        e(ToggleRow, {
+          key: "ec",
+          label: "Echo cancellation",
+          description: disc.echoCancellation == null ? "Discord did not expose this flag" : "MediaEngine",
+          checked: !!disc.echoCancellation,
+          onChange: (v) => setDs("echoCancellation", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ns",
+          label: "Noise suppression",
+          checked: !!disc.noiseSuppression,
+          onChange: (v) => setDs("noiseSuppression", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "nc",
+          label: "Noise cancellation",
+          description: "Krisp if Discord has it",
+          checked: !!disc.noiseCancellation,
+          onChange: (v) => setDs("noiseCancellation", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "agc",
+          label: "Automatic gain",
+          checked: !!disc.automaticGainControl,
+          onChange: (v) => setDs("automaticGainControl", v),
+          handleCancel,
+        }),
+      ];
+    } else if (view.page === "settings_golive") {
+      kids = [
+        e(
+          DFL.PanelSectionRow,
+          { key: "h" },
+          e(
+            "div",
+            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
+            "Outbound Share game uses Discord’s encoder. 720p30 is the handheld default. 1080p needs Nitro on the watching side."
+          )
+        ),
+        e(
+          CycleRow,
+          {
+            key: "res",
+            label: "Resolution",
+            value: String(golive.height || 720),
+            options: [
+              { value: "720", label: "720p" },
+              { value: "1080", label: "1080p" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("Go Live", async () => {
+                const r = await setGoLiveQuality(Number(v), golive.fps || 30);
+                await reload();
+                return r;
+              }),
+          }
+        ),
+        e(
+          CycleRow,
+          {
+            key: "fps",
+            label: "Frame rate",
+            value: String(golive.fps || 30),
+            options: [
+              { value: "15", label: "15 fps" },
+              { value: "30", label: "30 fps" },
+            ],
+            handleCancel,
+            onPick: (v) =>
+              act("Go Live", async () => {
+                const r = await setGoLiveQuality(golive.height || 720, Number(v));
+                await reload();
+                return r;
+              }),
+          }
+        ),
+      ];
+    } else if (view.page === "settings_vesktop_perf") {
+      kids = [
+        e(
+          DFL.PanelSectionRow,
+          { key: "n" },
+          e("div", { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } }, "Written to Vesktop settings.json. Hardware acceleration needs a Vesktop restart.")
+        ),
+        e(ToggleRow, {
+          key: "ha",
+          label: "Hardware acceleration",
+          description: "Restart Vesktop after changing",
+          checked: ves.hardwareAcceleration !== false,
+          onChange: (v) => setVk("hardwareAcceleration", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "hva",
+          label: "Video hardware acceleration",
+          description: "Helps screenshare; can glitch streams",
+          checked: !!ves.hardwareVideoAcceleration,
+          onChange: (v) => setVk("hardwareVideoAcceleration", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ss",
+          label: "Disable smooth scrolling",
+          checked: !!ves.disableSmoothScroll,
+          onChange: (v) => setVk("disableSmoothScroll", v),
+          handleCancel,
+        }),
+      ];
+    } else if (view.page === "settings_vesktop_audio") {
+      kids = [
+        e(
+          DFL.PanelSectionRow,
+          { key: "n" },
+          e(
+            "div",
+            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
+            "Vesktop venmic flags for Linux screenshare audio. Deckscord still refuses speaker-monitor as the voice mic."
+          )
+        ),
+        e(ToggleRow, {
+          key: "w",
+          label: "Microphone workaround",
+          description: "Only if share sends mic instead of game audio",
+          checked: !!audio.workaround,
+          onChange: (v) => setVk("audio.workaround", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "iim",
+          label: "Ignore input media",
+          description: "Do not capture microphones into the share",
+          checked: audio.ignoreInputMedia !== false,
+          onChange: (v) => setVk("audio.ignoreInputMedia", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "iv",
+          label: "Ignore virtual nodes",
+          checked: !!audio.ignoreVirtual,
+          onChange: (v) => setVk("audio.ignoreVirtual", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "id",
+          label: "Ignore devices",
+          description: "Skip hardware speaker/mic nodes",
+          checked: audio.ignoreDevices !== false,
+          onChange: (v) => setVk("audio.ignoreDevices", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "gs",
+          label: "Granular selection",
+          checked: !!audio.granularSelect,
+          onChange: (v) => setVk("audio.granularSelect", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ds",
+          label: "Device selection",
+          description: "Requires Ignore devices off",
+          checked: !!audio.deviceSelect,
+          onChange: (v) => setVk("audio.deviceSelect", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "os",
+          label: "Only speakers",
+          checked: audio.onlySpeakers !== false,
+          onChange: (v) => setVk("audio.onlySpeakers", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ods",
+          label: "Only default speakers",
+          checked: audio.onlyDefaultSpeakers !== false,
+          onChange: (v) => setVk("audio.onlyDefaultSpeakers", v),
+          handleCancel,
+        }),
+      ];
+    } else if (view.page === "settings_vesktop_app") {
+      kids = [
+        e(
+          CycleRow,
+          {
+            key: "br",
+            label: "Discord branch",
+            value: ves.discordBranch || "stable",
+            options: [
+              { value: "stable", label: "Stable" },
+              { value: "canary", label: "Canary" },
+              { value: "ptb", label: "PTB" },
+            ],
+            handleCancel,
+            onPick: (v) => setVk("discordBranch", v),
+          }
+        ),
+        e(ToggleRow, {
+          key: "tr",
+          label: "Tray icon",
+          checked: ves.tray !== false,
+          onChange: (v) => setVk("tray", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "mt",
+          label: "Minimize to tray",
+          checked: ves.minimizeToTray !== false,
+          onChange: (v) => setVk("minimizeToTray", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ct",
+          label: "Hide/show on tray click",
+          checked: !!ves.clickTrayToShowHide,
+          onChange: (v) => setVk("clickTrayToShowHide", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "rpc",
+          label: "Rich Presence (arRPC)",
+          checked: ves.arRPC !== false,
+          onChange: (v) => setVk("arRPC", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "ol",
+          label: "Open links in app",
+          checked: !!ves.openLinksWithElectron,
+          onChange: (v) => setVk("openLinksWithElectron", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "nt",
+          label: "Native titlebar",
+          description: "Restart Vesktop",
+          checked: !!ves.nativeTitleBar,
+          onChange: (v) => setVk("nativeTitleBar", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "st",
+          label: "Static title",
+          checked: !!ves.staticTitle,
+          onChange: (v) => setVk("staticTitle", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "em",
+          label: "Enable menu bar",
+          checked: !!ves.enableMenu,
+          onChange: (v) => setVk("enableMenu", v),
+          handleCancel,
+        }),
+        e(ToggleRow, {
+          key: "sp",
+          label: "Splash screen",
+          checked: ves.enableSplashScreen !== false,
+          onChange: (v) => setVk("enableSplashScreen", v),
+          handleCancel,
+        }),
+        e(
+          CycleRow,
+          {
+            key: "webrtc",
+            label: "WebRTC IP handling",
+            value: ves.webRTCIPHandlingPolicy || "default",
+            options: [
+              { value: "default", label: "Default" },
+              { value: "default_public_interface_only", label: "Public interface only" },
+              { value: "default_public_and_private_interfaces", label: "Public and private" },
+              { value: "disable_non_proxied_udp", label: "Disable non-proxied UDP" },
+            ],
+            handleCancel,
+            onPick: (v) => setVk("webRTCIPHandlingPolicy", v),
+          }
+        ),
+      ];
+    }
+    body = e(DFL.PanelSection, { title: view.title || "Settings" }, kids);
   }
 
   const rootProps = {

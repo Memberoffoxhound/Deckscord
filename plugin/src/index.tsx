@@ -19,5 +19,8 @@
  * Live video: edge-to-edge JPEG tiles (VideoStack first in voice),
  * exclusive local-mute on tile A, 🔊 pill on the focused stream.
  * Member-row A still opens the mixer; Solo is a ToggleField there.
+ * Pin to corner starts pip_overlay.py on gamescope's overlay plane.
+ * Who's-talking roster uses the same overlay (speakers only, avatar + name).
+ * Settings hub maps Vesktop settings.json + MediaEngine voice flags.
  */
 export {};

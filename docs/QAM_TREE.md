@@ -17,6 +17,7 @@ Deckscord
    ├─ Status
    │  ├─ phase label
    │  ├─ Back                   (any nested page)
+   │  ├─ Settings ──────────────► Settings hub
    │  └─ Update from GitHub     (home only; until Decky store)
    │
    ├─ Voice strip               (hidden on Chat / Member / Live video)
@@ -65,10 +66,20 @@ Deckscord
    │  ├─ Input list
    │  └─ Output list
    │
-   └─ Live video
-      ├─ Tiles (max 4, edge-to-edge)
-      ├─ Leave / Mute / Deafen
-      └─ overflow people as placeholders
+   ├─ Live video
+   │  ├─ Tiles (max 4, edge-to-edge)
+   │  ├─ Pin focused stream to corner
+   │  ├─ Leave / Mute / Deafen
+   │  └─ overflow people as placeholders
+   │
+   └─ Settings
+      ├─ Picture in picture     corner / small 240p / large 480p / opacity
+      ├─ Who's talking          names over the game, corner / size / opacity
+      ├─ Discord · Voice        mute, devices, echo / noise / AGC
+      ├─ Discord · Go Live      720/1080 · 15/30 (Vesktop screenshareQuality)
+      ├─ Vesktop · Performance  hardware accel (restart)
+      ├─ Vesktop · Linux audio  venmic flags
+      └─ Vesktop · App          branch, tray, arRPC, WebRTC IP
 ```
 
 ## What feels heavy today

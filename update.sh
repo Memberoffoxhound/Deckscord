@@ -44,25 +44,6 @@ bar() {
   printf '\r%s\n' "${out}] ${pct}%  ${msg}"
 }
 
-ensure_plugin_writable() {
-  if [[ -d "${PLUGIN_DIR}" && -w "${PLUGIN_DIR}/." ]]; then
-    return 0
-  fi
-  if mkdir -p "${PLUGIN_DIR}" 2>/dev/null && [[ -w "${PLUGIN_DIR}/." ]]; then
-    return 0
-  fi
-  echo -e "${YELLOW}Plugin dir is not writable (old installs used sudo chown root).${NC}"
-  echo "One-time, then updates are just git:"
-  echo "  sudo chown -R $(whoami) ${PLUGIN_DIR}"
-  if sudo -n true 2>/dev/null; then
-    sudo mkdir -p "${PLUGIN_DIR}"
-    sudo chown -R "$(id -u):$(id -g)" "${PLUGIN_DIR}"
-    return 0
-  fi
-  sudo mkdir -p "${PLUGIN_DIR}"
-  sudo chown -R "$(id -u):$(id -g)" "${PLUGIN_DIR}"
-}
-
 sync_plugin() {
   bar 70 "Copying plugin files…"
   local src="$1"
@@ -70,15 +51,38 @@ sync_plugin() {
     echo -e "${RED}No plugin at ${src}${NC}" >&2
     exit 1
   fi
-  ensure_plugin_writable
   mkdir -p "${DATA_DIR}"
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete \
-      --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' \
-      "${src}/" "${PLUGIN_DIR}/"
+  mkdir -p "${PLUGIN_DIR}" 2>/dev/null || true
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  if [[ -d "${PLUGIN_DIR}" && -w "${PLUGIN_DIR}/." ]]; then
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -rltD --chmod=Du+rwx,Fu+rw \
+        --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' --exclude '.git' \
+        "${src}/" "${PLUGIN_DIR}/"
+    else
+      cp -R "${src}/." "${PLUGIN_DIR}/"
+    fi
+  elif sudo -n true 2>/dev/null; then
+    echo "Plugin dir is root-owned; copying with sudo, then giving it back to $(whoami)."
+    sudo -n mkdir -p "${PLUGIN_DIR}"
+    if command -v rsync >/dev/null 2>&1; then
+      sudo -n rsync -rltD --chmod=Du+rwx,Fu+rw \
+        --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' --exclude '.git' \
+        "${src}/" "${PLUGIN_DIR}/"
+    else
+      sudo -n cp -R "${src}/." "${PLUGIN_DIR}/"
+    fi
+    sudo -n chown -R "${uid}:${gid}" "${PLUGIN_DIR}"
+    sudo -n chmod -R u+rwX "${PLUGIN_DIR}"
   else
-    find "${PLUGIN_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-    cp -a "${src}/." "${PLUGIN_DIR}/"
+    echo -e "${YELLOW}Cannot write ${PLUGIN_DIR} (owned by root).${NC}"
+    echo "SteamOS / Decky installed it as root. One-time:"
+    echo "  sudo chown -R ${uid}:${gid} ${PLUGIN_DIR}"
+    echo "  sudo chmod -R u+rwX ${PLUGIN_DIR}"
+    echo "Then re-run this updater."
+    exit 1
   fi
   if [[ -f "${src}/../launch-vesktop.sh" ]]; then
     cp "${src}/../launch-vesktop.sh" "${DATA_DIR}/launch-vesktop.sh"
@@ -139,11 +143,6 @@ if systemctl restart plugin_loader.service 2>/dev/null || systemctl restart plug
   restarted=1
 elif sudo -n systemctl restart plugin_loader.service 2>/dev/null || sudo -n systemctl restart plugin_loader 2>/dev/null; then
   restarted=1
-else
-  echo "Need sudo once to relaunch Decky so the new plugin loads."
-  if sudo systemctl restart plugin_loader.service 2>/dev/null || sudo systemctl restart plugin_loader 2>/dev/null; then
-    restarted=1
-  fi
 fi
 if [[ "${restarted}" -eq 1 ]]; then
   bar 100 "Decky relaunched"
