@@ -24,6 +24,7 @@ Deckscord
    │  │  └─ tile A: solo audio; A again: Member mixer
    │  ├─ People in call         (no duplicate of anyone already on a tile)
    │  │  └─ row A → Member mixer
+   │  ├─ Share game             (720p 30 Go Live; game screen + game audio)
    │  ├─ Leave voice
    │  ├─ Mute
    │  ├─ Deafen

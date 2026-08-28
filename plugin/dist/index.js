@@ -49,6 +49,8 @@ const getSpeaking = backend("get_speaking");
 const focusAudio = backend("focus_audio");
 const clearAudioFocus = backend("clear_audio_focus");
 const updateFromGithub = backend("update_from_github");
+const startGoLive = backend("start_go_live");
+const stopGoLive = backend("stop_go_live");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -790,7 +792,24 @@ function App() {
     openMember(m);
   };
 
+  const streaming = !!(status && (status.streaming || (status.stream && status.stream.active) || (voice && voice.streaming)));
   const compactVoice = [
+    voice
+      ? e(
+          DFL.PanelSectionRow,
+          { key: "share" },
+          e(DFL.ToggleField, {
+            label: "Share game",
+            description: streaming ? "Live · 720p 30" : "720p 30 · game screen + game audio",
+            checked: streaming,
+            onChange: () =>
+              tap(() =>
+                act(streaming ? "Stop share" : "Share game", () => (streaming ? stopGoLive() : startGoLive(1280, 720, 30)))
+              ),
+            ...cancelBind(handleCancel),
+          })
+        )
+      : null,
     voice
       ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
       : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),

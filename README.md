@@ -10,9 +10,8 @@ Repository: https://github.com/Memberoffoxhound/Deckscord
 - **Decky plugin** in the QAM:
   - **Voice** — servers, voice channels, join/leave, mute, deafen, who’s in the call
   - **Text** — servers / DMs, channel list, read messages, send messages
+  - **Share game** — 720p 30 Go Live of the gamescope framebuffer + game audio (not the desktop, not speaker loopback)
 - Log in once. Session persists across Game Mode and reboot.
-
-Speaking overlay, toasts, per-user volume, and screen share come after chat + calls are solid.
 
 ## Install (Desktop Mode terminal)
 

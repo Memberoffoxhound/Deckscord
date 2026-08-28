@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""ScreenCast portal for gamescope — Discord Go Live sees the game, not X11.
+
+gamescope publishes its framebuffer as a PipeWire video node (the same one
+Steam Game Recording uses) but ships no xdg-desktop-portal backend. Chromium
+getDisplayMedia then either hangs or captures a black Xwayland root.
+
+This process owns org.freedesktop.portal.Desktop only while a gamescope
+session is the active session, implements ScreenCast v2, and hands Vesktop
+that PipeWire node. Desktop Mode releases the name so KWin's portal stays in
+charge. Auto-approve is Vesktop/Vencord only.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+os.environ.setdefault(
+    "DBUS_SESSION_BUS_ADDRESS",
+    f"unix:path={os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus",
+)
+
+# PluginLoader's PyInstaller env breaks system GI/OpenSSL. Always scrub.
+for _k in (
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_LINUX_PROCESS_NAME",
+):
+    os.environ.pop(_k, None)
+
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(levelname)s portal: %(message)s",
+    force=True,
+)
+log = logging.getLogger("portal")
+
+try:
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    gi.require_version("GLib", "2.0")
+    from gi.repository import Gio, GLib
+except Exception as e:
+    log.error("gi/Gio missing: %s", e)
+    sys.exit(1)
+
+PORTAL_NAME = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SC_IFACE = "org.freedesktop.portal.ScreenCast"
+REQ_IFACE = "org.freedesktop.portal.Request"
+SESS_IFACE = "org.freedesktop.portal.Session"
+PROXY_IFACE = "org.freedesktop.portal.ProxyResolver"
+NET_IFACE = "org.freedesktop.portal.NetworkMonitor"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+FD_RELEASE_S = 30.0
+KWIN = {"kwin_wayland", "kwin_x11"}
+GAMESCOPE = {"gamescope", "gamescope-wl"}
+
+XML = f"""
+<node>
+  <interface name="{SC_IFACE}">
+    <method name="CreateSession">
+      <arg type="a{{sv}}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="SelectSources">
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="a{{sv}}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="Start">
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="a{{sv}}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="OpenPipeWireRemote">
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="a{{sv}}" name="options" direction="in"/>
+      <arg type="h" name="fd" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+    <property name="AvailableSourceTypes" type="u" access="read"/>
+    <property name="AvailableCursorModes" type="u" access="read"/>
+  </interface>
+  <interface name="{PROXY_IFACE}">
+    <method name="Lookup">
+      <arg type="s" name="uri" direction="in"/>
+      <arg type="as" name="proxies" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="{NET_IFACE}">
+    <method name="GetAvailable">
+      <arg type="b" name="available" direction="out"/>
+    </method>
+    <method name="GetMetered">
+      <arg type="b" name="metered" direction="out"/>
+    </method>
+    <method name="GetConnectivity">
+      <arg type="u" name="connectivity" direction="out"/>
+    </method>
+    <method name="CanReach">
+      <arg type="s" name="hostname" direction="in"/>
+      <arg type="u" name="port" direction="in"/>
+      <arg type="b" name="reachable" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>
+"""
+
+
+def _runtime() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+
+
+def _comms() -> set[str]:
+    names: set[str] = set()
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                names.add((p / "comm").read_text().strip())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return names
+
+
+def in_game_mode() -> bool:
+    # Nested gamescope under KWin is still Desktop Mode.
+    names = _comms()
+    if names & KWIN:
+        return False
+    return bool(names & GAMESCOPE)
+
+
+def sender_token(sender: str) -> str:
+    return (sender or "").lstrip(":").replace(".", "_")
+
+
+def opt_str(options, key: str, default: str = "") -> str:
+    if not options:
+        return default
+    v = options.get(key)
+    if v is None:
+        return default
+    if isinstance(v, GLib.Variant):
+        try:
+            v = v.unpack()
+        except Exception:
+            return default
+    return str(v) if v else default
+
+
+def node_size(info: dict):
+    try:
+        for plist in (info.get("params") or {}).values():
+            if not isinstance(plist, list):
+                continue
+            for prm in plist:
+                if isinstance(prm, dict) and isinstance(prm.get("size"), dict):
+                    s = prm["size"]
+                    if s.get("width") and s.get("height"):
+                        return int(s["width"]), int(s["height"])
+    except Exception:
+        pass
+    return None
+
+
+def find_screen_node():
+    """Return (node_id, (w,h)|None) for the gamescope framebuffer, else (None, None)."""
+    try:
+        proc = subprocess.run(
+            ["pw-dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"},
+        )
+        data = json.loads(proc.stdout or "[]")
+    except subprocess.TimeoutExpired:
+        log.warning("pw-dump silent (5s) — PipeWire may be wedged")
+        return None, None
+    except Exception as e:
+        log.warning("pw-dump: %r", e)
+        return None, None
+
+    vids = []
+    for n in data:
+        if not str(n.get("type", "")).endswith("Node"):
+            continue
+        info = n.get("info") or {}
+        props = info.get("props") or {}
+        mc = str(props.get("media.class", ""))
+        name = str(props.get("node.name", ""))
+        desc = str(props.get("node.description", ""))
+        blob = f"{mc} {name} {desc}".lower()
+        if any(x in blob for x in ("v4l2", "loopback", "video42", "deckscord")):
+            continue
+        if "video/source" in mc.lower() or "gamescope" in blob or "screen" in blob:
+            vids.append((n.get("id"), name, mc, info))
+    for nid, name, mc, info in vids:
+        if "gamescope" in name.lower() or "screen" in name.lower():
+            return int(nid), node_size(info)
+    for nid, name, mc, info in vids:
+        if "video/source" in mc.lower():
+            return int(nid), node_size(info)
+    return None, None
+
+
+def _safe_close(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class Portal:
+    def __init__(self) -> None:
+        self.conn: Gio.DBusConnection | None = None
+        self.regs: list[int] = []
+        self.sessions: dict[str, dict] = {}
+        self.owner_id = 0
+        self._stopping_portal = False
+
+    def sender_is_vesktop(self, sender: str) -> bool:
+        if not self.conn or not sender:
+            return False
+        try:
+            reply = self.conn.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID",
+                GLib.Variant("(s)", (sender,)),
+                GLib.VariantType.new("(u)"),
+                Gio.DBusCallFlags.NONE,
+                1000,
+                None,
+            )
+            pid = int(reply.unpack()[0])
+            cmd = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode(errors="replace")
+                .lower()
+            )
+            if any(k in cmd for k in ("vesktop", "vencord", "discord")):
+                return True
+            cg = Path(f"/proc/{pid}/cgroup").read_text(errors="replace").lower()
+            if any(k in cg for k in ("vesktop", "vencord")):
+                return True
+            log.warning("refused sender %s pid=%s cmd=%r", sender, pid, cmd[:120])
+        except Exception as e:
+            log.warning("sender check %s: %r", sender, e)
+        return False
+
+    def request_path(self, sender: str, options) -> str:
+        token = opt_str(options, "handle_token", "t") or "t"
+        return f"/org/freedesktop/portal/desktop/request/{sender_token(sender)}/{token}"
+
+    def emit_response(self, sender: str, path: str, code: int, results: dict) -> None:
+        if not self.conn:
+            return
+        try:
+            self.conn.emit_signal(
+                sender,
+                path,
+                REQ_IFACE,
+                "Response",
+                GLib.Variant("(ua{sv})", (code, results)),
+            )
+        except Exception as e:
+            log.warning("Response emit: %r", e)
+
+    def close_session(self, path: str) -> None:
+        sess = self.sessions.pop(path, None)
+        if not sess:
+            return
+        for fd in list(sess.get("fds") or []):
+            _safe_close(fd)
+        sender = sess.get("sender")
+        if sender and self.conn:
+            try:
+                self.conn.emit_signal(
+                    sender, path, SESS_IFACE, "Closed", GLib.Variant("(a{sv})", ({},))
+                )
+            except Exception:
+                pass
+        log.info("session closed %s", path)
+
+    def close_all(self) -> None:
+        for p in list(self.sessions):
+            self.close_session(p)
+
+    def release_fd(self, session: str, fd: int) -> bool:
+        sess = self.sessions.get(session)
+        if sess and fd in sess.get("fds", []):
+            sess["fds"].remove(fd)
+            _safe_close(fd)
+        return False
+
+    def on_method(self, _conn, sender, _path, iface, method, params, invocation):
+        try:
+            if iface == SC_IFACE:
+                return self._screencast(sender, method, params, invocation)
+            if iface == PROXY_IFACE and method == "Lookup":
+                invocation.return_value(GLib.Variant("(as)", (["direct://"],)))
+                return
+            if iface == NET_IFACE:
+                if method == "GetAvailable":
+                    invocation.return_value(GLib.Variant("(b)", (True,)))
+                    return
+                if method == "GetMetered":
+                    invocation.return_value(GLib.Variant("(b)", (False,)))
+                    return
+                if method == "GetConnectivity":
+                    invocation.return_value(GLib.Variant("(u)", (4,)))
+                    return
+                if method == "CanReach":
+                    invocation.return_value(GLib.Variant("(b)", (True,)))
+                    return
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                f"{iface}.{method} not implemented by Deckscord",
+            )
+        except Exception as e:
+            log.error("%s.%s: %r", iface, method, e)
+            invocation.return_dbus_error("org.freedesktop.portal.Error.Failed", str(e))
+
+    def _screencast(self, sender, method, params, invocation):
+        if method == "CreateSession":
+            (options,) = params.unpack()
+            req = self.request_path(sender, options)
+            st = opt_str(options, "session_handle_token", "s") or "s"
+            session = f"/org/freedesktop/portal/desktop/session/{sender_token(sender)}/{st}"
+            invocation.return_value(GLib.Variant("(o)", (req,)))
+            if not self.sender_is_vesktop(sender):
+                GLib.idle_add(self.emit_response, sender, req, 2, {})
+                return
+            prefix = f"/org/freedesktop/portal/desktop/session/{sender_token(sender)}/"
+            for old in [p for p in self.sessions if p.startswith(prefix) and p != session]:
+                self.close_session(old)
+            self.sessions[session] = {"fds": [], "sender": sender}
+            log.info("CreateSession %s", session)
+            GLib.idle_add(
+                self.emit_response,
+                sender,
+                req,
+                0,
+                {"session_handle": GLib.Variant("s", session)},
+            )
+            return
+
+        if method == "SelectSources":
+            session, options = params.unpack()
+            req = self.request_path(sender, options)
+            invocation.return_value(GLib.Variant("(o)", (req,)))
+            GLib.idle_add(self.emit_response, sender, req, 0, {})
+            return
+
+        if method == "Start":
+            session, _parent, options = params.unpack()
+            req = self.request_path(sender, options)
+            invocation.return_value(GLib.Variant("(o)", (req,)))
+            GLib.idle_add(self._start, sender, session, req, 0)
+            return
+
+        if method == "OpenPipeWireRemote":
+            session = params.unpack()[0]
+            if session not in self.sessions:
+                invocation.return_dbus_error(
+                    "org.freedesktop.portal.Error.Failed", "unknown session"
+                )
+                return
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                remote = os.environ.get("PIPEWIRE_REMOTE", "pipewire-0")
+                sock.connect(os.path.join(_runtime(), remote))
+            except OSError as e:
+                sock.close()
+                invocation.return_dbus_error(
+                    "org.freedesktop.portal.Error.Failed", str(e)
+                )
+                return
+            fd = sock.detach()
+            fd_list = Gio.UnixFDList.new()
+            fd_list.append(fd)
+            self.sessions[session]["fds"].append(fd)
+            GLib.timeout_add_seconds(int(FD_RELEASE_S), self.release_fd, session, fd)
+            log.info("OpenPipeWireRemote session=%s", session)
+            invocation.return_value_with_unix_fd_list(
+                GLib.Variant("(h)", (0,)), fd_list
+            )
+            return
+
+        invocation.return_dbus_error(
+            "org.freedesktop.DBus.Error.UnknownMethod", method
+        )
+
+    def _start(self, sender: str, session: str, req: str, attempt: int = 0) -> bool:
+        node, size = find_screen_node()
+        if node is None and attempt < 12:
+            GLib.timeout_add(400, self._start, sender, session, req, attempt + 1)
+            return False
+        if node is None or session not in self.sessions:
+            log.warning("Start: no gamescope video node")
+            self.emit_response(sender, req, 2, {})
+            return False
+        props = {
+            "position": GLib.Variant("(ii)", (0, 0)),
+            "source_type": GLib.Variant("u", 1),
+        }
+        if size:
+            props["size"] = GLib.Variant("(ii)", (size[0], size[1]))
+        log.info("Start node=%s size=%s", node, size)
+        self.emit_response(
+            sender,
+            req,
+            0,
+            {"streams": GLib.Variant("a(ua{sv})", [(int(node), props)])},
+        )
+        return False
+
+    def on_get_prop(self, _conn, _sender, _path, iface, name):
+        if name == "version":
+            if iface == SC_IFACE:
+                return GLib.Variant("u", 2)
+            return GLib.Variant("u", 1)
+        if name == "AvailableSourceTypes":
+            return GLib.Variant("u", 1)  # MONITOR
+        if name == "AvailableCursorModes":
+            return GLib.Variant("u", 3)  # HIDDEN | EMBEDDED
+        return None
+
+    def on_filter(self, conn, message, incoming):
+        if not incoming:
+            return message
+        iface = message.get_interface()
+        member = message.get_member()
+        path = message.get_object_path() or ""
+        if member == "Close" and iface == SESS_IFACE and path in self.sessions:
+            self.close_session(path)
+            try:
+                conn.send_message(
+                    Gio.DBusMessage.new_method_reply(message)
+                )
+            except Exception:
+                pass
+            return None
+        if member == "Close" and iface == REQ_IFACE and path.startswith(
+            "/org/freedesktop/portal/desktop/request/"
+        ):
+            try:
+                conn.send_message(Gio.DBusMessage.new_method_reply(message))
+            except Exception:
+                pass
+            return None
+        if (
+            path.startswith("/org/freedesktop/portal/")
+            and iface
+            and not iface.startswith("org.freedesktop.DBus")
+            and iface not in (SC_IFACE, PROXY_IFACE, NET_IFACE, REQ_IFACE, SESS_IFACE)
+            and message.get_message_type() == Gio.DBusMessageType.METHOD_CALL
+        ):
+            log.warning("refused %s %s.%s", message.get_sender(), iface, member)
+        return message
+
+    def register(self, conn: Gio.DBusConnection) -> None:
+        self.conn = conn
+        conn.add_filter(self.on_filter)
+        info = Gio.DBusNodeInfo.new_for_xml(XML)
+        for iface in info.interfaces:
+            rid = conn.register_object(
+                PORTAL_PATH, iface, self.on_method, self.on_get_prop, None
+            )
+            self.regs.append(rid)
+        log.info("ScreenCast objects on %s", PORTAL_PATH)
+
+    def unregister(self) -> None:
+        self.close_all()
+        if self.conn:
+            for rid in self.regs:
+                try:
+                    self.conn.unregister_object(rid)
+                except Exception:
+                    pass
+        self.regs = []
+
+    def try_own(self) -> None:
+        if self.owner_id:
+            return
+        self.owner_id = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            PORTAL_NAME,
+            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            self.on_bus_acquired,
+            self.on_name_acquired,
+            self.on_name_lost,
+        )
+
+    def drop_name(self) -> None:
+        if self.owner_id:
+            Gio.bus_unown_name(self.owner_id)
+            self.owner_id = 0
+        self.unregister()
+        log.info("released %s", PORTAL_NAME)
+
+    def on_bus_acquired(self, conn, _name):
+        self.register(conn)
+
+    def on_name_acquired(self, _conn, _name):
+        self._stopping_portal = False
+        log.info("owned %s — Game Mode Go Live uses the gamescope node", PORTAL_NAME)
+
+    def on_name_lost(self, _conn, _name):
+        log.info("name lost")
+        self.unregister()
+        self.owner_id = 0
+        if in_game_mode() and not self._stopping_portal:
+            self._stopping_portal = True
+            log.info("stopping leftover xdg-desktop-portal so Game Mode can capture")
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", "xdg-desktop-portal.service"],
+                    timeout=8,
+                    capture_output=True,
+                )
+            except Exception as e:
+                log.warning("stop portal: %r", e)
+
+    def tick(self) -> bool:
+        want = in_game_mode()
+        if want and not self.owner_id:
+            self.try_own()
+        elif not want and self.owner_id:
+            self.drop_name()
+        return True
+
+
+def main() -> int:
+    portal = Portal()
+    GLib.timeout_add_seconds(3, portal.tick)
+    portal.tick()
+    log.info("watching for gamescope (idle in Desktop Mode)")
+    loop = GLib.MainLoop()
+
+    def _quit(*_a):
+        portal.drop_name()
+        loop.quit()
+        return False
+
+    def _on_signal(sig, cb=_quit):
+        try:
+            from gi.repository import GLibUnix  # type: ignore
+
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, cb)
+        except Exception:
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, cb)
+
+    _on_signal(signal.SIGINT)
+    _on_signal(signal.SIGTERM)
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

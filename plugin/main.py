@@ -139,6 +139,101 @@ def ensure_mic_not_loopback() -> dict[str, Any]:
     }
 
 
+_AUDIO_SKIP = (
+    "vesktop",
+    "vencord",
+    "discord",
+    "chrome",
+    "chromium",
+    "firefox",
+    "steamwebhelper",
+    "plasmashell",
+    "pipewire",
+    "wireplumber",
+    "pulseaudio",
+    "deckscord",
+)
+
+
+def _pw_dump() -> list[Any]:
+    try:
+        r = _run(["/usr/bin/pw-dump"], timeout=5)
+        if r.returncode != 0:
+            r = _run(["pw-dump"], timeout=5)
+        return json.loads(r.stdout or "[]")
+    except Exception as e:
+        decky.logger.warning(f"pw-dump: {e}")
+        return []
+
+
+def find_gamescope_node() -> Optional[dict[str, Any]]:
+    vids: list[dict[str, Any]] = []
+    for n in _pw_dump():
+        if not str(n.get("type") or "").endswith("Node"):
+            continue
+        info = n.get("info") or {}
+        props = info.get("props") or {}
+        mc = str(props.get("media.class") or "")
+        name = str(props.get("node.name") or "")
+        desc = str(props.get("node.description") or "")
+        blob = f"{mc} {name} {desc}".lower()
+        if any(x in blob for x in ("v4l2", "loopback", "video42", "deckscord")):
+            continue
+        if "video/source" in mc.lower() or "gamescope" in blob or "screen" in blob:
+            vids.append({"id": n.get("id"), "name": name, "class": mc, "description": desc})
+    for v in vids:
+        nm = (v.get("name") or "").lower()
+        if "gamescope" in nm or "screen" in nm:
+            return v
+    return vids[0] if vids else None
+
+
+def list_game_audio_nodes() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for n in _pw_dump():
+        if not str(n.get("type") or "").endswith("Node"):
+            continue
+        props = ((n.get("info") or {}).get("props")) or {}
+        mc = str(props.get("media.class") or "")
+        if "stream/output/audio" not in mc.lower():
+            continue
+        name = str(props.get("node.name") or "")
+        app = str(props.get("application.name") or props.get("node.description") or "")
+        binary = str(props.get("application.process.binary") or "")
+        blob = f"{name} {app} {binary}".lower()
+        if any(s in blob for s in _AUDIO_SKIP):
+            continue
+        out.append({
+            "id": n.get("id"),
+            "name": name,
+            "app": app,
+            "binary": binary,
+        })
+    return out[:8]
+
+
+def in_game_mode() -> bool:
+    kwin = False
+    gamescope = False
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                comm = (p / "comm").read_text().strip()
+            except OSError:
+                continue
+            if comm in ("kwin_wayland", "kwin_x11"):
+                kwin = True
+            if comm in ("gamescope", "gamescope-wl"):
+                gamescope = True
+    except OSError:
+        pass
+    if kwin:
+        return False
+    return gamescope
+
+
 class Cdp:
     """Minimal CDP client. Stdlib only — no extra Python deps."""
 
@@ -370,6 +465,7 @@ class Plugin:
         self._last_voice_channel: Optional[str] = None
         self._grab_log_at = 0.0
         self._audio_hygiene_at = 0.0
+        self._portal_proc: Optional[subprocess.Popen] = None
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -383,13 +479,56 @@ class Plugin:
             decky.logger.info(f"capture source: {hy}")
         except Exception as e:
             decky.logger.warning(f"capture source: {e}")
+        try:
+            self._ensure_portal_shim()
+        except Exception as e:
+            decky.logger.warning(f"portal shim: {e}")
 
     async def _unload(self) -> None:
         try:
             await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
         except Exception:
             pass
+        self._stop_portal_shim()
         await self.cdp.close()
+
+    def _ensure_portal_shim(self) -> None:
+        proc = self._portal_proc
+        if proc is not None and proc.poll() is None:
+            return
+        script = PLUGIN_DIR / "portal_shim.py"
+        if not script.is_file():
+            decky.logger.warning("portal_shim.py missing")
+            return
+        log = DATA_DIR / "portal-shim.log"
+        log_f = open(log, "ab")
+        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        log_f.flush()
+        env = _subprocess_env()
+        self._portal_proc = subprocess.Popen(
+            ["/usr/bin/python3", str(script)],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        decky.logger.info(f"portal shim pid={self._portal_proc.pid} log={log}")
+
+    def _stop_portal_shim(self) -> None:
+        proc = self._portal_proc
+        self._portal_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     async def _ensure_vesktop(self, wait: bool = False) -> dict[str, Any]:
         try:
@@ -702,7 +841,13 @@ class Plugin:
                 self._audio_hygiene_at = time.monotonic()
                 try:
                     hy = ensure_mic_not_loopback()
-                    out["capture"] = {k: hy[k] for k in ("source", "loopback", "mic") if k in hy}
+                    cap = {k: hy[k] for k in ("source", "loopback", "mic") if k in hy}
+                    gs = find_gamescope_node()
+                    if gs:
+                        cap["gamescope"] = gs
+                    cap["game_audio"] = list_game_audio_nodes()
+                    cap["game_mode"] = in_game_mode()
+                    out["capture"] = cap
                     if hy.get("loopback"):
                         out["phase_label"] = (out.get("phase_label") or "Ready") + " · mic is speakers"
                     await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
@@ -772,11 +917,46 @@ class Plugin:
         decky.logger.info("leave_voice")
         await self._clear_audio_focus_safe()
         try:
+            await self._eval("window.__deckscord && window.__deckscord.stopGoLive()")
+        except Exception:
+            pass
+        try:
             await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
         except Exception:
             pass
         r = await self._bridge("leaveVoice()")
         decky.logger.info(f"leave_voice result {r}")
+        return self._ok(r)
+
+    async def start_go_live(self, width: int = 1280, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
+        if isinstance(width, dict):
+            kwargs.update(width)
+            width = kwargs.get("width", 1280)
+            height = kwargs.get("height", height)
+            fps = kwargs.get("fps", fps)
+        w = int(kwargs.get("width") or width or 1280)
+        h = int(kwargs.get("height") or height or 720)
+        f = int(kwargs.get("fps") or fps or 30)
+        decky.logger.info(f"start_go_live {w}x{h}@{f}")
+        try:
+            self._ensure_portal_shim()
+        except Exception as e:
+            decky.logger.warning(f"portal shim: {e}")
+        await self._ensure_cdp(inject=True)
+        await self._inject_bridge()
+        r = await self._eval(
+            "window.__deckscord.startGoLive("
+            + json.dumps({"width": w, "height": h, "fps": f})
+            + ")",
+            timeout=28.0,
+        )
+        decky.logger.info(f"start_go_live result {r}")
+        return self._ok(r)
+
+    async def stop_go_live(self) -> dict[str, Any]:
+        decky.logger.info("stop_go_live")
+        r = await self._bridge("stopGoLive()")
+        decky.logger.info(f"stop_go_live result {r}")
         return self._ok(r)
 
     async def toggle_mute(self) -> dict[str, Any]:

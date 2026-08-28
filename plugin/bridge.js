@@ -69,6 +69,22 @@
     return null;
   }
 
+  function findByCode(snippet) {
+    var wp = W();
+    var m = null;
+    try {
+      if (typeof wp.findByCode === "function") m = wp.findByCode(snippet);
+    } catch (e) {}
+    if (typeof m === "function") return m;
+    if (m && typeof m === "object") {
+      var keys = Object.keys(m);
+      for (var i = 0; i < keys.length; i++) {
+        if (typeof m[keys[i]] === "function") return m[keys[i]];
+      }
+    }
+    return null;
+  }
+
   function absUrl(u) {
     if (!u) return null;
     u = String(u);
@@ -633,6 +649,107 @@
     }).catch(function () { return null; });
   }
 
+  var GO_LIVE = {
+    width: 1280,
+    height: 720,
+    fps: 30,
+    active: false,
+    pending: false,
+    stopRequested: false,
+    gen: 0,
+    lastStop: 0,
+  };
+
+  function pinScreenshareQuality() {
+    try {
+      var f = document.createElement("iframe");
+      document.documentElement.appendChild(f);
+      var ls = f.contentWindow.localStorage;
+      var st = JSON.parse(ls.getItem("VesktopState") || "{}");
+      st.screenshareQuality = { resolution: "720", frameRate: "30" };
+      ls.setItem("VesktopState", JSON.stringify(st));
+      f.remove();
+    } catch (ePin) {}
+  }
+
+  function currentStream() {
+    try {
+      var ASS = store("ApplicationStreamingStore") || byProps("getCurrentUserActiveStream");
+      if (ASS && ASS.getCurrentUserActiveStream) return ASS.getCurrentUserActiveStream() || null;
+    } catch (e) {}
+    try {
+      var MES = store("MediaEngineStore") || byProps("getGoLiveSource");
+      if (MES && MES.getGoLiveSource && MES.getGoLiveSource()) return { source: "media-engine" };
+    } catch (e2) {}
+    return null;
+  }
+
+  function clickSharePicker() {
+    if (!GO_LIVE.active) return;
+    var roots = document.querySelectorAll(".vcd-screen-picker, [class*='screen-picker']");
+    var root = null;
+    for (var i = 0; i < roots.length; i++) {
+      if (!roots[i].dataset.deckscordAuto) {
+        root = roots[i];
+        break;
+      }
+    }
+    if (!root) {
+      var footers = document.querySelectorAll(".vcd-screen-picker-footer");
+      for (var f = 0; f < footers.length; f++) {
+        if (!footers[f].dataset.deckscordAuto) {
+          root = footers[f].closest(".vcd-screen-picker") || footers[f].parentElement || footers[f];
+          break;
+        }
+      }
+    }
+    if (!root) return;
+
+    var skip = /vesktop|vencord|discord|chrome|chromium|firefox|steamwebhelper|plasmashell|pipewire|entire system|entire computer|also share/i;
+    var boxes = root.querySelectorAll("input[type=checkbox], input[type=radio]");
+    var gameBox = null;
+    var boxCount = 0;
+    for (var b = 0; b < boxes.length; b++) {
+      var el = boxes[b];
+      var label = "";
+      try {
+        label = (el.labels && el.labels[0] && el.labels[0].textContent) || el.getAttribute("aria-label") || el.parentElement.textContent || "";
+      } catch (eL) {}
+      if (skip.test(label) || skip.test(el.value || "")) {
+        if (el.checked) {
+          try { el.click(); } catch (eUn) {}
+        }
+        continue;
+      }
+      boxCount++;
+      if (!gameBox) gameBox = el;
+    }
+    if (gameBox && !gameBox.checked && boxCount <= 4) {
+      try { gameBox.click(); } catch (eCk) {}
+    }
+
+    var buttons = root.querySelectorAll("button");
+    var go = null;
+    for (var k = 0; k < buttons.length; k++) {
+      var t = String(buttons[k].textContent || "").replace(/\s+/g, " ").trim();
+      if (/go live|share|live/i.test(t) && !/cancel|stop|back/i.test(t)) {
+        go = buttons[k];
+        break;
+      }
+    }
+    if (!go && buttons.length) go = buttons[buttons.length - 1];
+    if (!go) return;
+    root.dataset.deckscordAuto = "1";
+    try { go.click(); } catch (eClick) {}
+  }
+
+  if (!window.__deckscordPickerWatch) {
+    pinScreenshareQuality();
+    window.__deckscordPickerWatch = setInterval(function () {
+      try { clickSharePicker(); } catch (eW) {}
+    }, 400);
+  }
+
   function kindOf(type, name) {
     var t = String(type || "").toLowerCase();
     var n = String(name || "").toLowerCase();
@@ -708,6 +825,7 @@
             af = window.__deckscordAudioFocus || { userId: null, saved: {} };
           }
           window.__deckscordLastVoice = String(voiceChannelId);
+          var mine = currentStream();
           voice = {
             channelId: String(voiceChannelId),
             name: vc ? vc.name : String(voiceChannelId),
@@ -716,6 +834,7 @@
             hasVideo: !!(bag.streams && bag.streams.length),
             focusedUserId: (af && af.userId) || null,
             streams: bag.streams || [],
+            streaming: !!mine || GO_LIVE.active,
           };
         } else {
           window.__deckscordLastVoice = null;
@@ -785,6 +904,7 @@
         }
 
         var textId = SelectedChannelStore && SelectedChannelStore.getChannelId && SelectedChannelStore.getChannelId();
+        var mineStream = currentStream();
 
         return {
           ok: true,
@@ -793,6 +913,14 @@
           user: userLite(me),
           muted: muted,
           deafened: deafened,
+          streaming: !!(mineStream || (voice && voice.streaming) || GO_LIVE.active),
+          stream: {
+            active: !!(mineStream || GO_LIVE.active),
+            pending: !!GO_LIVE.pending,
+            width: GO_LIVE.width,
+            height: GO_LIVE.height,
+            fps: GO_LIVE.fps,
+          },
           voice: voice,
           text_channel_id: textId || null,
           guilds: guilds,
@@ -875,7 +1003,9 @@
       try {
         var bag = collectStreams();
         try { ensureVideoSinks(true); } catch (eSink) {}
-        var copied = (bag.streams || []).slice(0, 4);
+        var copied = (bag.streams || []).filter(function (s) {
+          return !(s.self && s.kind === "screenshare");
+        }).slice(0, 4);
         var jobs = copied.map(function (s) {
           var key = s.userId + ":" + s.kind;
           var cached = window.__deckscordVideo.canvases[key];
@@ -1109,12 +1239,132 @@
 
     leaveVoice: function () {
       try {
+        try { window.__deckscord.stopGoLive(); } catch (eStop) {}
         var fn =
           findFn("selectVoiceChannel") ||
           (common("ChannelActionCreators") && common("ChannelActionCreators").selectVoiceChannel);
         if (!fn) throw new Error("selectVoiceChannel not found");
         fn(null);
         return { ok: true };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    startGoLive: function (opts) {
+      opts = opts || {};
+      var width = Number(opts.width) || GO_LIVE.width;
+      var height = Number(opts.height) || GO_LIVE.height;
+      var fps = Number(opts.fps) || GO_LIVE.fps;
+      GO_LIVE.width = width;
+      GO_LIVE.height = height;
+      GO_LIVE.fps = fps;
+      pinScreenshareQuality();
+
+      var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId");
+      var ChannelStore = store("ChannelStore") || byProps("getChannel");
+      var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
+      if (!cid) return Promise.resolve({ ok: false, error: "not in a voice channel" });
+      var ch = ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(cid);
+      var guildId = ch ? (ch.guild_id || ch.guildId || null) : null;
+
+      var startFn = findByCode('"STREAM_START",streamType') || findByCode('"STREAM_START"');
+      if (!startFn) return Promise.resolve({ ok: false, error: "STREAM_START not found" });
+
+      if (GO_LIVE.pending) return Promise.resolve({ ok: true, pending: true, note: "already starting" });
+      if (currentStream()) return Promise.resolve({ ok: true, already: true });
+
+      var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+      var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
+      GO_LIVE.active = true;
+      GO_LIVE.stopRequested = false;
+
+      function finishStart(srcId) {
+        if (GO_LIVE.stopRequested) {
+          GO_LIVE.active = false;
+          try { eng && eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eD) {}
+          return { ok: false, error: "cancelled" };
+        }
+        startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: "Deckscord" });
+        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps };
+      }
+
+      if (!eng || typeof eng.getDesktopSource !== "function") {
+        try {
+          startFn(guildId, cid, {});
+          return Promise.resolve({ ok: true, legacy: true, warning: "no getDesktopSource — viewers may see black" });
+        } catch (eLeg) {
+          GO_LIVE.active = false;
+          return Promise.resolve(err(eLeg));
+        }
+      }
+
+      GO_LIVE.pending = true;
+      var myGen = ++GO_LIVE.gen;
+
+      function waitTeardown() {
+        var t0 = Date.now();
+        return new Promise(function (resolve) {
+          (function tick() {
+            var busy = currentStream();
+            var since = Date.now() - (GO_LIVE.lastStop || 0);
+            if ((!busy && since >= 1200) || GO_LIVE.stopRequested || Date.now() - t0 > 5000) {
+              resolve();
+              return;
+            }
+            setTimeout(tick, 200);
+          })();
+        });
+      }
+
+      return waitTeardown().then(function () {
+        if (GO_LIVE.stopRequested) {
+          GO_LIVE.active = false;
+          return { ok: false, error: "cancelled" };
+        }
+        var constraints = { width: width, height: height, frameRate: fps };
+        var acq = eng.getDesktopSource(constraints, true);
+        var timed = new Promise(function (_, rej) {
+          setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
+        });
+        return Promise.race([acq, timed]).then(function (srcId) {
+          if (myGen !== GO_LIVE.gen) {
+            try { eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eOld) {}
+            return { ok: false, error: "superseded" };
+          }
+          return finishStart(srcId);
+        });
+      }).catch(function (e) {
+        if (myGen === GO_LIVE.gen) GO_LIVE.active = false;
+        return err(e);
+      }).then(function (r) {
+        if (myGen === GO_LIVE.gen) {
+          GO_LIVE.pending = false;
+          GO_LIVE.stopRequested = false;
+        }
+        return r;
+      });
+    },
+
+    stopGoLive: function () {
+      try {
+        if (GO_LIVE.pending) GO_LIVE.stopRequested = true;
+        else GO_LIVE.active = false;
+        GO_LIVE.lastStop = Date.now();
+        var s = currentStream();
+        var stopFn = findByCode('"STREAM_STOP"');
+        if (s && stopFn) {
+          var ownerId = s.ownerId || s.owner_id;
+          var channelId = s.channelId || s.channel_id;
+          var gid = s.guildId || s.guild_id;
+          var key = gid
+            ? "guild:" + gid + ":" + channelId + ":" + ownerId
+            : "call:" + channelId + ":" + ownerId;
+          try { stopFn(key); } catch (eKey) {
+            try { stopFn(s); } catch (e2) {}
+          }
+        }
+        return { ok: true, streaming: false };
       } catch (e) {
         return err(e);
       }
