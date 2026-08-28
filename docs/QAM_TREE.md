@@ -21,7 +21,8 @@ Deckscord
    │
    ├─ Voice strip               (hidden on Chat / Member / Live video)
    │  ├─ Live tiles             (only if someone has camera or Go Live)
-   │  │  └─ tile A: solo audio; A again: Member mixer
+   │  │  └─ tile A: focus stream (game audio); A again: large Watch overlay
+   │  │     B on Watch: close overlay, mute stream audio, party voice stays
    │  ├─ People in call         (no duplicate of anyone already on a tile)
    │  │  └─ row A → Member mixer
    │  ├─ Share game             (720p 30 Go Live; game screen + game audio)

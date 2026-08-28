@@ -356,6 +356,42 @@
     return "noop";
   }
 
+  function setStreamVolume(userId, vol) {
+    var fn = findFn("setLocalVolume");
+    if (!fn) return false;
+    var n = Number(vol);
+    if (isNaN(n)) n = 0;
+    if (n < 0) n = 0;
+    if (n > 200) n = 200;
+    try {
+      fn(String(userId), n, "stream");
+      return true;
+    } catch (e1) {
+      try {
+        fn(String(userId), n, { type: "stream" });
+        return true;
+      } catch (e2) {
+        return false;
+      }
+    }
+  }
+
+  function muteAllStreamAudioExcept(keepId) {
+    var bag = collectStreams();
+    var ok = false;
+    (bag.streams || []).forEach(function (s) {
+      if (s.self) return;
+      var vol = keepId && s.userId === String(keepId) ? 100 : 0;
+      if (setStreamVolume(s.userId, vol)) ok = true;
+    });
+    (bag.members || []).forEach(function (m) {
+      if (m.self) return;
+      if (keepId && m.id === String(keepId)) return;
+      setStreamVolume(m.id, 0);
+    });
+    return ok;
+  }
+
   function collectStreams() {
     var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
     var ChannelStore = store("ChannelStore") || byProps("getChannel", "getDMFromUserId");
@@ -684,7 +720,7 @@
     window.__deckscordVideo.canvases[key] = c;
   }
 
-  function paintElementToJpeg(el, q) {
+  function paintElementToJpeg(el, q, dw, dh) {
     if (!el) return null;
     try {
       var w = el.videoWidth || el.width || 0;
@@ -697,9 +733,9 @@
       if (w < 64 || h < 64) return null;
       if (w === 240 && h === 240) return null;
       var c = document.createElement("canvas");
-      c.width = 400;
-      c.height = 225;
-      c.getContext("2d").drawImage(el, 0, 0, 400, 225);
+      c.width = dw || 400;
+      c.height = dh || 225;
+      c.getContext("2d").drawImage(el, 0, 0, c.width, c.height);
       if (lumaBlack(c)) return null;
       return jpegFromCanvas(c, q || 0.45);
     } catch (e) {
@@ -707,7 +743,7 @@
     }
   }
 
-  function jpegFromEngineTrack(s) {
+  function jpegFromEngineTrack(s, big) {
     var tracks = videoTracksFor(s.userId);
     var want = s.kind === "screenshare" ? "screenshare" : "camera";
     var hit = null;
@@ -717,7 +753,10 @@
     if (!hit && s.kind === "screenshare" && tracks.length) hit = tracks[0];
     if (!hit) return null;
     var el = attachTrack(s.userId + ":" + s.kind, hit.track);
-    return paintElementToJpeg(el, s.kind === "screenshare" ? 0.5 : 0.4);
+    var dw = big ? 960 : 400;
+    var dh = big ? 540 : 225;
+    var q = big ? 0.62 : s.kind === "screenshare" ? 0.5 : 0.4;
+    return paintElementToJpeg(el, q, dw, dh);
   }
 
   function cameraStreamId(userId) {
@@ -1267,13 +1306,16 @@
         var copied = (bag.streams || []).filter(function (s) {
           return !(s.self && s.kind === "screenshare");
         }).slice(0, 4);
+        var focusId = (window.__deckscordAudioFocus && window.__deckscordAudioFocus.kind === "stream" && window.__deckscordAudioFocus.userId) || null;
+        try { muteAllStreamAudioExcept(focusId); } catch (eMute) {}
         var jobs = copied.map(function (s) {
           var key = s.userId + ":" + s.kind;
-          var jpeg = jpegFromEngineTrack(s);
+          var big = !!(focusId && s.userId === focusId);
+          var jpeg = jpegFromEngineTrack(s, big);
           if (!jpeg) {
             var cached = window.__deckscordVideo.canvases[key];
             if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, s.kind === "screenshare" ? 0.5 : 0.4);
+              jpeg = jpegFromCanvas(cached, big ? 0.62 : s.kind === "screenshare" ? 0.5 : 0.4);
             }
           }
           var next = Promise.resolve(jpeg);
@@ -1293,6 +1335,7 @@
               black: !outJpeg,
               self: !!s.self,
               from: jpeg ? "engine" : (outJpeg ? "preview" : "none"),
+              big: !!big,
             };
           });
         });
@@ -1356,6 +1399,29 @@
       }
     },
 
+    focusStream: function (userId) {
+      try {
+        var bag = collectStreams();
+        var id = String(userId || "");
+        if (!id || id === String(bag.meId || "")) {
+          muteAllStreamAudioExcept(null);
+          window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null };
+          return { ok: true, cleared: true };
+        }
+        var s = null;
+        (bag.streams || []).forEach(function (x) {
+          if (x.userId === id && !s) s = x;
+          if (x.userId === id && x.kind === "screenshare") s = x;
+        });
+        if (s && s.kind === "screenshare") watchScreenShare(s);
+        muteAllStreamAudioExcept(id);
+        window.__deckscordAudioFocus = { userId: id, saved: (window.__deckscordAudioFocus && window.__deckscordAudioFocus.saved) || {}, kind: "stream" };
+        return { ok: true, user_id: id, kind: "stream", streamAudio: true, focus: window.__deckscordAudioFocus };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
     focusAudio: function (userId) {
       try {
         var bag = collectStreams();
@@ -1364,10 +1430,10 @@
         if (!id || id === String(bag.meId || "")) {
           return window.__deckscord.clearAudioFocus();
         }
-        if (af.userId === id) {
+        if (af.userId === id && af.kind === "voice") {
           return { ok: true, user_id: id, already: true };
         }
-        if (af.userId) window.__deckscord.clearAudioFocus();
+        if (af.userId && af.kind === "voice") window.__deckscord.clearAudioFocus();
         var MediaEngineStore = store("MediaEngineStore") || byProps("isLocalMute", "getLocalVolume");
         var saved = {};
         bag.members.forEach(function (m) {
@@ -1377,7 +1443,7 @@
             volume: (MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(m.id)) || 100,
           };
         });
-        window.__deckscordAudioFocus = { userId: id, saved: saved };
+        window.__deckscordAudioFocus = { userId: id, saved: saved, kind: "voice" };
         var used = setLocalMuteSafe(id, false);
         var vol = MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(id);
         if (typeof vol === "number" && vol <= 0) {
@@ -1388,7 +1454,7 @@
           if (m.self || m.id === id) return;
           setLocalMuteSafe(m.id, true);
         });
-        return { ok: true, user_id: id, method: used, focus: window.__deckscordAudioFocus };
+        return { ok: true, user_id: id, method: used, kind: "voice", focus: window.__deckscordAudioFocus };
       } catch (e) {
         return err(e);
       }
@@ -1406,7 +1472,8 @@
             if (sv) sv(uid, st.volume);
           }
         });
-        window.__deckscordAudioFocus = { userId: null, saved: {} };
+        try { muteAllStreamAudioExcept(null); } catch (eSt) {}
+        window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null };
         return { ok: true, cleared: true };
       } catch (e) {
         return err(e);
@@ -1512,6 +1579,7 @@
         if (!fn) throw new Error("selectVoiceChannel not found");
         fn(id);
         try { window.__deckscord.ensureVoiceProcessing(); } catch (eProc) {}
+        try { muteAllStreamAudioExcept(null); } catch (eSt) {}
         return { ok: true, channel_id: id };
       } catch (e) {
         return err(e);

@@ -1269,6 +1269,16 @@ class Plugin:
                 return {"ok": False, "ids": [], "error": str(e)}
         return r if isinstance(r, dict) else {"ok": False, "ids": []}
 
+    async def focus_stream(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        r = await self._bridge(f"focusStream({json.dumps(uid)})")
+        if isinstance(r, dict) and r.get("focus"):
+            self._audio_focus = r["focus"]
+        elif isinstance(r, dict) and r.get("ok") and uid:
+            self._audio_focus = {"userId": uid, "saved": (self._audio_focus or {}).get("saved") or {}, "kind": "stream"}
+        decky.logger.info(f"focus_stream {uid} {r if isinstance(r, dict) else ''}")
+        return self._ok(r)
+
     async def focus_audio(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
         uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
         if not uid:

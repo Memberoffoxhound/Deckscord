@@ -11,6 +11,7 @@ Repository: https://github.com/Memberoffoxhound/Deckscord
   - **Voice** — servers, voice channels, join/leave, mute, deafen, who’s in the call
   - **Text** — servers / DMs, channel list, read messages, send messages
   - **Share game** — 720p 30 Go Live of the gamescope framebuffer + game audio (not the desktop, not speaker loopback)
+  - **Watch** — large spectator overlay of a friend’s Go Live (game audio only while focused; party voice stays). Not Nintendo GameShare: we do not let you play a game you don’t own.
 - Log in once. Session persists across Game Mode and reboot.
 
 ## Install (Desktop Mode terminal)

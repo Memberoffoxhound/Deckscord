@@ -47,6 +47,7 @@ const startVesktop = backend("start_vesktop");
 const getVideoFrames = backend("get_video_frames");
 const getSpeaking = backend("get_speaking");
 const focusAudio = backend("focus_audio");
+const focusStream = backend("focus_stream");
 const clearAudioFocus = backend("clear_audio_focus");
 const updateFromGithub = backend("update_from_github");
 const startGoLive = backend("start_go_live");
@@ -373,14 +374,114 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMember }) {
+function WatchOverlay({ userId, name, kind, closeModal }) {
+  const [jpeg, setJpeg] = useState(null);
+  const [hint, setHint] = useState("Starting…");
+  useEffect(() => {
+    let stop = false;
+    (async () => {
+      try {
+        await focusStream(userId);
+      } catch (_) {}
+      while (!stop) {
+        try {
+          const r = await getVideoFrames();
+          const frames = (r && r.frames) || [];
+          const hit =
+            frames.find((f) => f.userId === userId && f.kind === kind) ||
+            frames.find((f) => f.userId === userId);
+          if (hit && hit.jpeg && !hit.black) {
+            setJpeg(hit.jpeg);
+            setHint("");
+          }
+        } catch (_) {}
+        await new Promise((res) => setTimeout(res, 120));
+      }
+    })();
+    return () => {
+      stop = true;
+      clearAudioFocus().catch(() => {});
+    };
+  }, [userId, kind]);
+  const close = () => {
+    clearAudioFocus().catch(() => {});
+    if (closeModal) closeModal();
+  };
+  const Inner = closeModal && DFL.ModalRoot ? DFL.ModalRoot : "div";
+  return e(
+    Inner,
+    {
+      closeModal: close,
+      onCancel: close,
+      onCancelButton: close,
+      bDisableBackgroundDismiss: false,
+      ...cancelBind(close),
+      style: {
+        width: "100%",
+        height: "100%",
+        background: "#000",
+        padding: 0,
+        margin: 0,
+      },
+    },
+    [
+      jpeg
+        ? e("img", {
+            key: "v",
+            src: jpeg,
+            alt: "",
+            style: {
+              width: "100%",
+              height: "100%",
+              maxHeight: "90vh",
+              objectFit: "contain",
+              display: "block",
+              background: "#000",
+            },
+          })
+        : e(
+            "div",
+            {
+              key: "ph",
+              style: {
+                width: "100%",
+                minHeight: 240,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: "#ccc",
+              },
+            },
+            hint || "Waiting for video…"
+          ),
+      e(
+        "div",
+        {
+          key: "cap",
+          style: {
+            position: "absolute",
+            left: 12,
+            bottom: 12,
+            color: "#fff",
+            fontSize: 14,
+            textShadow: "0 1px 4px #000",
+            pointerEvents: "none",
+          },
+        },
+        (name || "Stream") + " · game audio · B to close"
+      ),
+    ]
+  );
+}
+
+function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMember, onWatch }) {
   const onCancel = useContext(BackNav);
   const go = () => {
     if (stream.self) {
       if (onOpenMember) onOpenMember(stream);
       return;
     }
-    if (focused && onOpenMember) onOpenMember(stream);
+    if (focused && onWatch) onWatch(stream);
     else if (onFocus) onFocus(stream.userId);
   };
   return e(
@@ -483,7 +584,7 @@ function VideoTile({ stream, focused, jpeg, height, speaking, onFocus, onOpenMem
   );
 }
 
-function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus, onOpenMember, onMore }) {
+function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus, onOpenMember, onWatch, onMore }) {
   const list = streams || [];
   const copied = list.slice(0, max);
   const extra = Math.max(0, list.length - copied.length);
@@ -509,6 +610,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, max, onFocus,
           speaking: !!(speakingIds && speakingIds[s.userId]),
           onFocus,
           onOpenMember,
+          onWatch,
         });
       })
       .concat(
@@ -628,13 +730,14 @@ function App() {
       grabBusy.current = false;
     };
     pull();
-    const fps = streamCount <= 1 ? 5 : streamCount === 2 ? 4 : 3;
-    const id = setInterval(pull, Math.max(220, Math.floor(1000 / fps)));
+    const focused = !!(status && status.voice && status.voice.focusedUserId);
+    const fps = focused ? 8 : streamCount <= 1 ? 5 : streamCount === 2 ? 4 : 3;
+    const id = setInterval(pull, Math.max(focused ? 120 : 220, Math.floor(1000 / fps)));
     return () => {
       stop = true;
       clearInterval(id);
     };
-  }, [videoOn, streamCount]);
+  }, [videoOn, streamCount, status && status.voice && status.voice.focusedUserId]);
 
   const inVoice = !!(status && status.ready && status.voice && status.voice.channelId);
   useEffect(() => {
@@ -788,7 +891,15 @@ function App() {
   const focusedUserId = (voice && voice.focusedUserId) || null;
   const showLiveVideo = videoEnabled && hasVideo;
   const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
-  const onTileFocus = (uid) => act("Focus", () => focusAudio(uid), { quiet: true });
+  const onTileFocus = (uid) => act("Watch audio", () => focusStream(uid), { quiet: true });
+  const onWatchStream = (s) => {
+    tap(() => act("Watch", () => focusStream(s.userId), { quiet: true }));
+    if (typeof DFL.showModal === "function") {
+      DFL.showModal(e(WatchOverlay, { userId: s.userId, name: s.name, kind: s.kind || "screenshare" }));
+    } else {
+      push({ page: "watch", userId: s.userId, kind: s.kind || "screenshare", title: s.name || "Watch" });
+    }
+  };
   const onTileMember = (s) => {
     const m = memberById(s.userId) || { id: s.userId, name: s.name, avatar: s.avatar, self: !!s.self };
     openMember(m);
@@ -930,6 +1041,7 @@ function App() {
         max: 3,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
+        onWatch: onWatchStream,
         onMore: openVideoPage,
       })
     : null;
@@ -1306,8 +1418,18 @@ function App() {
         max: 4,
         onFocus: onTileFocus,
         onOpenMember: onTileMember,
+        onWatch: onWatchStream,
       }),
     ].concat(compactVoice));
+  } else if (view.page === "watch") {
+    const ws = liveStreams.find((s) => s.userId === view.userId) || { userId: view.userId, name: view.title, kind: view.kind };
+    body = e(
+      "div",
+      { style: { ...FILL, background: "#000", position: "relative", minHeight: 240 } },
+      [
+        e(WatchOverlay, { userId: view.userId, name: ws.name || view.title, kind: ws.kind || view.kind || "screenshare" }),
+      ]
+    );
   }
 
   const rootProps = {

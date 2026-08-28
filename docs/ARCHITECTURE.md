@@ -46,4 +46,6 @@ The Python backend is stdlib-only (asyncio + a tiny WebSocket client). No pip pa
 
 QAM live video copies JPEG tiles from Discord’s media engine after `STREAM_WATCH` (the actual Go Live/camera tracks), not from a screenshot of the Vesktop window. Call audio stays in PipeWire. Vesktop stays minimized unless a camera has no pixels yet.
 
+Watch overlay (Switch 2 GameShare *as a spectator*): A on a live tile focuses that stream — game audio only for them, larger JPEG — then a large Watch view. Party mics stay. We do **not** guest-play a game the watcher doesn’t own. See [GAMESHARE.md](GAMESHARE.md).
+
 Outbound **Share game** is a different pipe: gamescope’s PipeWire node → ScreenCast portal shim → Discord’s own 720p30 encoder. Documented in [GO_LIVE.md](GO_LIVE.md). Self screenshare is not JPEG-copied back into the QAM.
