@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Keep Vesktop running for Deckscord (Game Mode + Desktop).
 #
-# Electron SIGSEGVs on gamescope's Wayland socket. This process always
-# prefers X11/Xwayland and starts minimized — the QAM is the UI.
+# Render on X11/Xwayland — Electron SIGSEGVs on gamescope's Wayland socket.
+# Capture is a different path: Chromium only talks to our ScreenCast portal
+# (portal_shim.py → gamescope PipeWire node) when it thinks it is on Wayland.
+# Deckcord/Steamcord use this split: --ozone-platform=x11 for the window,
+# XDG_SESSION_TYPE=wayland + WAYLAND_DISPLAY for getDisplayMedia.
 set -euo pipefail
 
 FLATPAK_ID="dev.vencord.Vesktop"
@@ -30,10 +33,18 @@ pick_display() {
   return 1
 }
 
-# Drop gamescope Wayland even if we later fall back to a desktop compositor.
+# Never render on gamescope's Wayland socket (Electron SIGSEGV). Capture
+# still gets a dummy WAYLAND_DISPLAY later so Chromium uses the portal.
 if [[ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]] || [[ "${WAYLAND_DISPLAY:-}" == gamescope-* ]]; then
   unset WAYLAND_DISPLAY
   unset GAMESCOPE_WAYLAND_DISPLAY
+fi
+
+in_gamescope=false
+if { pgrep -x gamescope >/dev/null 2>&1 || pgrep -x gamescope-wl >/dev/null 2>&1; } \
+  && ! pgrep -x kwin_wayland >/dev/null 2>&1 \
+  && ! pgrep -x kwin_x11 >/dev/null 2>&1; then
+  in_gamescope=true
 fi
 
 flags=(
@@ -71,7 +82,6 @@ fi
 
 if DISPLAY_VAL="$(pick_display)"; then
   export DISPLAY="${DISPLAY_VAL}"
-  unset WAYLAND_DISPLAY
   unset GAMESCOPE_WAYLAND_DISPLAY
   export ELECTRON_OZONE_PLATFORM_HINT=x11
   export GDK_BACKEND=x11
@@ -80,9 +90,26 @@ if DISPLAY_VAL="$(pick_display)"; then
     --socket=x11
     --nosocket=wayland
     --env=DISPLAY="${DISPLAY}"
-    --env=WAYLAND_DISPLAY=
     --env=ELECTRON_OZONE_PLATFORM_HINT=x11
+    --env=GDK_BACKEND=x11
   )
+  if [[ "${in_gamescope}" == true ]]; then
+    # Dummy name is enough for Chromium IsRunningUnderWayland. Do not point
+    # this at gamescope-* or ozone would try to render there.
+    export XDG_SESSION_TYPE=wayland
+    export WAYLAND_DISPLAY=wayland-0
+    flatpak_extra+=(
+      --env=XDG_SESSION_TYPE=wayland
+      --env=WAYLAND_DISPLAY=wayland-0
+    )
+  else
+    unset WAYLAND_DISPLAY
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+    flatpak_extra+=(
+      --env=WAYLAND_DISPLAY=
+      --env=XDG_SESSION_TYPE="${XDG_SESSION_TYPE}"
+    )
+  fi
 else
   export ELECTRON_OZONE_PLATFORM_HINT="${ELECTRON_OZONE_PLATFORM_HINT:-auto}"
 fi

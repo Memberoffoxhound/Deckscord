@@ -990,6 +990,7 @@
     gen: 0,
     lastStop: 0,
     gameAudio: [],
+    debug: { picker: "idle" },
   };
 
   function pinScreenshareQuality(res, fps) {
@@ -1059,24 +1060,6 @@
   function clickSharePicker() {
     if (currentStream() && !GO_LIVE.pending) return;
     if (!GO_LIVE.active && !GO_LIVE.pending) return;
-    var roots = document.querySelectorAll(".vcd-screen-picker, [class*='screen-picker']");
-    var root = null;
-    for (var i = 0; i < roots.length; i++) {
-      if (!roots[i].dataset.deckscordAuto) {
-        root = roots[i];
-        break;
-      }
-    }
-    if (!root) {
-      var footers = document.querySelectorAll(".vcd-screen-picker-footer");
-      for (var f = 0; f < footers.length; f++) {
-        if (!footers[f].dataset.deckscordAuto) {
-          root = footers[f].closest(".vcd-screen-picker") || footers[f].parentElement || footers[f];
-          break;
-        }
-      }
-    }
-    if (!root) return;
 
     function txt(el) {
       try {
@@ -1090,87 +1073,78 @@
         return "";
       }
     }
-    function isOn(el) {
-      if (!el) return false;
-      if (el.checked) return true;
-      var a = el.getAttribute && el.getAttribute("aria-checked");
-      return a === "true" || a === "mixed";
-    }
-    function clickIf(el, wantOn) {
-      if (!el) return;
-      if (isOn(el) !== !!wantOn) {
-        try { el.click(); } catch (eC) {}
-      }
-    }
-    function looksLikeGame(label) {
-      var n = String(label || "").toLowerCase();
-      if (!n) return false;
-      if (/vesktop|vencord|discord|chrome|chromium|firefox|steamwebhelper|plasmashell|pipewire|pulse|entire system|entire computer|none|monitor|loopback/.test(n)) {
-        return false;
-      }
-      var names = GO_LIVE.gameAudio || [];
-      for (var g = 0; g < names.length; g++) {
-        var want = String(names[g] || "").toLowerCase();
-        if (want.length < 2) continue;
-        if (n.indexOf(want) !== -1 || want.indexOf(n) !== -1) return true;
-      }
-      return false;
-    }
 
-    var skipAudio = /entire system|entire computer|also share|system audio|desktop audio/i;
-    var boxes = root.querySelectorAll("input[type=checkbox], input[type=radio], [role='switch'], [role='checkbox']");
-    var pickedGame = false;
-    for (var b = 0; b < boxes.length; b++) {
-      var el = boxes[b];
-      var label = txt(el);
-      try {
-        if (el.labels && el.labels[0]) label = txt(el.labels[0]) || label;
-        else if (el.parentElement) label = label || txt(el.parentElement);
-      } catch (eL) {}
-      if (/stream with audio/i.test(label)) continue;
-      if (skipAudio.test(label) || skipAudio.test(el.value || "")) {
-        clickIf(el, false);
-        continue;
-      }
-      if (looksLikeGame(label)) {
-        clickIf(el, true);
-        pickedGame = true;
-      } else if (isOn(el) && !/stream with audio/i.test(label)) {
-        clickIf(el, false);
+    var footers = document.querySelectorAll(".vcd-screen-picker-footer, [class*='screen-picker-footer']");
+    var footer = null;
+    for (var f = 0; f < footers.length; f++) {
+      if (!footers[f].dataset.deckscordAuto) {
+        footer = footers[f];
+        break;
       }
     }
-
-    var options = root.querySelectorAll("[role='option'], option");
-    if (!pickedGame) {
-      for (var n = 0; n < options.length; n++) {
-        if (/^none$/i.test(txt(options[n]))) {
-          try { options[n].click(); } catch (eN) {}
+    var root = footer
+      ? (footer.closest(".vcd-screen-picker") || footer.closest("[class*='screen-picker']") || footer.parentElement || footer)
+      : null;
+    if (!root) {
+      var roots = document.querySelectorAll(".vcd-screen-picker, [class*='screen-picker']");
+      for (var i = 0; i < roots.length; i++) {
+        if (!roots[i].dataset.deckscordAuto) {
+          root = roots[i];
           break;
         }
       }
     }
-
-    var switches = root.querySelectorAll("[role='switch'], input[type=checkbox]");
-    for (var s = 0; s < switches.length; s++) {
-      var sl = txt(switches[s]) || txt(switches[s].parentElement);
-      if (/stream with audio/i.test(sl)) {
-        clickIf(switches[s], pickedGame);
-      }
+    if (!root) {
+      if (GO_LIVE.debug.picker === "idle") GO_LIVE.debug = { picker: "waiting" };
+      return;
     }
+    GO_LIVE.debug = { picker: "found" };
 
     var buttons = root.querySelectorAll("button");
     var go = null;
     for (var k = 0; k < buttons.length; k++) {
       var t = txt(buttons[k]);
-      if (/go live|share|live/i.test(t) && !/cancel|stop|back/i.test(t)) {
+      if (/go live/i.test(t) && !/cancel|stop|back/i.test(t)) {
         go = buttons[k];
         break;
       }
     }
-    if (!go && buttons.length) go = buttons[buttons.length - 1];
+    if (!go) {
+      for (var k2 = 0; k2 < buttons.length; k2++) {
+        var t2 = txt(buttons[k2]);
+        if (/share|live/i.test(t2) && !/cancel|stop|back|audio/i.test(t2)) {
+          go = buttons[k2];
+          break;
+        }
+      }
+    }
+
+    if (go && go.disabled) {
+      var tiles = root.querySelectorAll("img, [role='button'], button");
+      for (var n = 0; n < tiles.length; n++) {
+        var tile = tiles[n];
+        if (tile === go) continue;
+        var tt = txt(tile);
+        if (/go live|cancel|back|close|audio|settings/i.test(tt)) continue;
+        try { tile.click(); } catch (eTile) {}
+        GO_LIVE.debug = { picker: "picked-source" };
+        return;
+      }
+      return;
+    }
     if (!go) return;
+
+    try {
+      var vm = window.VesktopNative && window.VesktopNative.virtmic;
+      if (vm && typeof vm.startSystem === "function" && GO_LIVE.gameAudio && GO_LIVE.gameAudio.length) {
+        vm.startSystem(GO_LIVE.gameAudio);
+      }
+    } catch (eVm) {}
+
+    if (footer) footer.dataset.deckscordAuto = "1";
     root.dataset.deckscordAuto = "1";
     try { go.click(); } catch (eClick) {}
+    GO_LIVE.debug = { picker: "clicked" };
   }
 
   if (!window.__deckscordPickerWatch) {
@@ -1846,8 +1820,11 @@
 
       var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
       var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
-      GO_LIVE.active = false;
+      // Flag BEFORE getDesktopSource so the picker watcher will auto-click.
+      // Same as Deckcord/Steamcord: a hidden Vesktop modal otherwise hangs forever.
+      GO_LIVE.active = true;
       GO_LIVE.stopRequested = false;
+      GO_LIVE.debug = { picker: "starting" };
 
       function finishStart(srcId) {
         if (GO_LIVE.stopRequested) {
@@ -1855,9 +1832,9 @@
           try { eng && eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eD) {}
           return { ok: false, error: "cancelled" };
         }
-        startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: "Deckscord" });
+        startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: null });
         GO_LIVE.active = true;
-        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true };
+        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true, picker: GO_LIVE.debug };
       }
 
       if (!eng || typeof eng.getDesktopSource !== "function") {
@@ -1894,21 +1871,32 @@
           return { ok: false, error: "cancelled" };
         }
         var constraints = { width: width, height: height, frameRate: fps };
-        var wantAudio = GO_LIVE.gameAudio.length > 0;
+        var wantAudio = true;
         var acq = eng.getDesktopSource(constraints, wantAudio);
+        var raced = false;
+        acq.then(function (id) {
+          if (!raced) return;
+          try { eng.desktopInputPool && eng.desktopInputPool.get(id) && eng.desktopInputPool.get(id).destroy(); } catch (eLate) {}
+        }).catch(function () {});
         var timed = new Promise(function (_, rej) {
           setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
         });
         return Promise.race([acq, timed]).then(function (srcId) {
+          raced = true;
           if (myGen !== GO_LIVE.gen) {
             try { eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eOld) {}
             return { ok: false, error: "superseded" };
           }
           return finishStart(srcId);
+        }, function (e) {
+          raced = true;
+          throw e;
         });
       }).catch(function (e) {
         if (myGen === GO_LIVE.gen) GO_LIVE.active = false;
-        return err(e);
+        var out = err(e);
+        out.picker = GO_LIVE.debug;
+        return out;
       }).then(function (r) {
         if (myGen === GO_LIVE.gen) {
           GO_LIVE.pending = false;

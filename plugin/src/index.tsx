@@ -12,7 +12,8 @@
  * mixer with volume, local mute, server mute/deafen.
  *
  * Chat packs attachments, embeds, gifv, stickers (images + video).
- * A on a picture or video opens a Watch-style overlay (B closes).
+ * A on a picture or video opens a Watch-style overlay. B closes the overlay
+ * and stays in that chat. Thumbs are 240px webp; the video file loads in the overlay.
  * Messages show timestamps and d-pad-scroll in the thread pane.
  * B / onCancel pops the view stack until home, then QAM closes.
  *

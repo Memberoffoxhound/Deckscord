@@ -100,14 +100,18 @@ function phaseOf(status) {
   return status.phase || (status.ready ? "ready" : "loading");
 }
 
-function mediaUrl(url, full) {
+function mediaUrl(url, full, kind) {
   if (!url) return url;
   let u = String(url);
+  if (full) {
+    return u.replace("media.discordapp.net/attachments", "cdn.discordapp.com/attachments");
+  }
   if (u.indexOf("cdn.discordapp.com/attachments") !== -1) {
     u = u.replace("cdn.discordapp.com/attachments", "media.discordapp.net/attachments");
   }
-  if (!full && u.indexOf("media.discordapp.net") !== -1) {
-    u += (u.indexOf("?") >= 0 ? "&" : "?") + "width=380&height=380";
+  if (u.indexOf("media.discordapp.net") !== -1) {
+    const extra = kind === "video" ? "format=webp&width=240" : "width=240&format=webp";
+    u += (u.indexOf("?") >= 0 ? "&" : "?") + extra;
   }
   return u;
 }
@@ -257,43 +261,44 @@ function Media({ item, kind, video, onOpen }) {
   const go = () => {
     if (onOpen) onOpen({ item, kind: isVid ? "video" : "image" });
   };
-  if (bad) {
-    return e("div", { style: { opacity: 0.7, fontSize: 12, marginTop: 6 } }, item.name || "Can't load media");
-  }
-  const thumb = isVid
-    ? e("video", {
-        src: item.url,
-        muted: true,
-        playsInline: true,
-        preload: "metadata",
-        style: {
-          width: "100%",
-          maxWidth: "100%",
-          maxHeight: 180,
-          marginTop: 6,
-          borderRadius: 6,
-          background: "#000",
-          display: "block",
-          pointerEvents: "none",
+  const poster = e("img", {
+    src: mediaUrl(item.url, false, isVid ? "video" : "image"),
+    alt: item.name || "",
+    loading: "lazy",
+    decoding: "async",
+    onError: () => setBad(true),
+    style: {
+      width: "100%",
+      maxWidth: "100%",
+      maxHeight: 160,
+      objectFit: "contain",
+      marginTop: 6,
+      borderRadius: 6,
+      background: "rgba(0,0,0,0.35)",
+      display: bad ? "none" : "block",
+      pointerEvents: "none",
+    },
+  });
+  const fallback = bad
+    ? e(
+        "div",
+        {
+          style: {
+            width: "100%",
+            minHeight: isVid ? 90 : 48,
+            marginTop: 6,
+            borderRadius: 6,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 12,
+            opacity: 0.85,
+          },
         },
-        onError: () => setBad(true),
-      })
-    : e("img", {
-        src: mediaUrl(item.url),
-        alt: item.name || "",
-        style: {
-          width: "100%",
-          maxWidth: "100%",
-          maxHeight: 180,
-          objectFit: "contain",
-          marginTop: 6,
-          borderRadius: 6,
-          background: "rgba(0,0,0,0.35)",
-          display: "block",
-          pointerEvents: "none",
-        },
-        onError: () => setBad(true),
-      });
+        isVid ? "▶  " + (item.name || "Video") : item.name || "Image"
+      )
+    : null;
   return e(
     Focusable,
     {
@@ -305,7 +310,8 @@ function Media({ item, kind, video, onOpen }) {
       style: { ...FILL, position: "relative" },
     },
     [
-      thumb,
+      poster,
+      fallback,
       e(
         "div",
         {
@@ -444,7 +450,6 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
 }
 
 function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outputVolume }) {
-  const onCancel = useContext(BackNav);
   const [jpeg, setJpeg] = useState(null);
   const [hint, setHint] = useState("Starting…");
   const [vol, setVol] = useState(defaultStreamVol(outputVolume));
@@ -551,14 +556,13 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
             pointerEvents: "none",
           },
         },
-        (name || "Stream") + " · game audio · B to close"
+        (name || "Stream") + " · B to close"
       ),
       e(
         DFL.PanelSectionRow,
         { key: "svol" },
         e(DFL.SliderField, {
           label: "Stream volume",
-          description: "Default is 30% of output volume",
           value: vol,
           min: 0,
           max: 200,
@@ -569,7 +573,7 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
             setVol(v);
             setStreamVolume(v).catch(() => {});
           },
-          ...cancelBind(onCancel || close),
+          ...cancelBind(close),
         })
       ),
       e(
@@ -579,9 +583,8 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "Keeps a stamp on the game after you close the QAM",
             onClick: pin,
-            ...cancelBind(onCancel || close),
+            ...cancelBind(close),
           },
           "Pin to corner"
         )
@@ -590,10 +593,10 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
   );
 }
 
-function MediaOverlay({ item, kind, outputVolume, closeModal }) {
-  const onCancel = useContext(BackNav);
+function MediaOverlay({ item, kind, outputVolume, closeModal, onClosed }) {
   const [volPct, setVolPct] = useState(defaultStreamVol(outputVolume));
   const close = () => {
+    if (onClosed) onClosed();
     if (closeModal) closeModal();
   };
   const htmlVol = Math.min(1, Math.max(0, (Number(volPct) || 0) / 100));
@@ -606,7 +609,7 @@ function MediaOverlay({ item, kind, outputVolume, closeModal }) {
       onCancel: close,
       onCancelButton: close,
       bDisableBackgroundDismiss: false,
-      ...cancelBind(onCancel || close),
+      ...cancelBind(close),
       style: {
         width: "100%",
         height: "100%",
@@ -624,6 +627,7 @@ function MediaOverlay({ item, kind, outputVolume, closeModal }) {
             controls: true,
             autoPlay: true,
             playsInline: true,
+            preload: "auto",
             volume: htmlVol,
             onLoadedMetadata: (ev) => {
               try {
@@ -662,7 +666,7 @@ function MediaOverlay({ item, kind, outputVolume, closeModal }) {
             textShadow: "0 1px 4px #000",
           },
         },
-        ((item && item.name) || (isVid ? "Video" : "Image")) + (isVid ? " · B to close" : " · B to close")
+        ((item && item.name) || (isVid ? "Video" : "Image")) + " · B to close"
       ),
       isVid
         ? e(
@@ -670,7 +674,6 @@ function MediaOverlay({ item, kind, outputVolume, closeModal }) {
             { key: "svol" },
             e(DFL.SliderField, {
               label: "Volume",
-              description: "Default is 30% of voice output",
               value: volPct,
               min: 0,
               max: 200,
@@ -684,7 +687,7 @@ function MediaOverlay({ item, kind, outputVolume, closeModal }) {
                   if (el) el.volume = Math.min(1, Math.max(0, Number(v) / 100));
                 } catch (_) {}
               },
-              ...cancelBind(onCancel || close),
+              ...cancelBind(close),
             })
           )
         : null,
@@ -831,7 +834,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           DFL.ButtonItem,
           {
             layout: "below",
-            description: pinnedUserId ? "Removes the corner stamp and stream audio" : "Mutes stream audio, party voice stays",
+            description: pinnedUserId ? "Unpin and stop" : "Stop",
             onClick: onStop,
             ...cancelBind(onCancel),
           },
@@ -846,7 +849,6 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           { key: "svol" },
           e(DFL.SliderField, {
             label: "Stream volume",
-            description: "Game audio for the focused stream. Default is 30% of output volume so voice stays louder.",
             value: streamVolume == null ? 30 : streamVolume,
             min: 0,
             max: 200,
@@ -869,7 +871,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "Keep listening, drop the stamp",
+            description: "Keep listening",
             onClick: onUnpin,
             ...cancelBind(onCancel),
           },
@@ -886,7 +888,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "Keeps a stamp on the game after you close the QAM",
+            description: "Stay on screen after QAM closes",
             onClick: () => onPin(focusedStream),
             ...cancelBind(onCancel),
           },
@@ -1004,6 +1006,9 @@ function App() {
   const [shareLocal, setShareLocal] = useState(null);
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
+  const cancelLock = useRef(0);
+  const modalOpen = useRef(false);
+  const msgCache = useRef({});
   const volTimer = useRef(null);
   const grabBusy = useRef(false);
   const reloadOnce = useRef(false);
@@ -1014,12 +1019,16 @@ function App() {
   const back = () => setStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
 
   const handleCancel = (evt) => {
-    if (!canBack) return;
     if (evt) {
       if (typeof evt.preventDefault === "function") evt.preventDefault();
       if (typeof evt.stopPropagation === "function") evt.stopPropagation();
       if (evt.detail && typeof evt.detail.preventDefault === "function") evt.detail.preventDefault();
     }
+    if (modalOpen.current) return;
+    if (!canBack) return;
+    const now = Date.now();
+    if (now - cancelLock.current < 450) return;
+    cancelLock.current = now;
     back();
   };
 
@@ -1117,14 +1126,30 @@ function App() {
   useEffect(() => {
     if (!chatId || !(status && status.ready)) return;
     let stop = false;
+    if (msgCache.current[chatId]) setMessages(msgCache.current[chatId]);
     const pull = async () => {
       try {
-        const r = await getMessages(chatId, 50);
-        if (!stop && r && r.ok) setMessages(r.messages || []);
+        const r = await getMessages(chatId, 30);
+        if (stop || !(r && r.ok)) return;
+        const next = r.messages || [];
+        msgCache.current[chatId] = next;
+        setMessages((prev) => {
+          if (
+            prev.length === next.length &&
+            prev.length &&
+            prev[0] &&
+            next[0] &&
+            prev[0].id === next[0].id &&
+            prev[prev.length - 1].id === next[next.length - 1].id
+          ) {
+            return prev;
+          }
+          return next;
+        });
       } catch (_) {}
     };
     pull();
-    const id = setInterval(pull, 2500);
+    const id = setInterval(pull, 4000);
     return () => {
       stop = true;
       clearInterval(id);
@@ -1195,7 +1220,7 @@ function App() {
 
   const onSettingsPage = String(view.page || "").indexOf("settings") === 0;
   useEffect(() => {
-    if (!onSettingsPage) return;
+    if (!onSettingsPage && cfg) return;
     let stop = false;
     getSettings()
       .then((r) => {
@@ -1244,7 +1269,7 @@ function App() {
   const openDms = () => tap(() => push({ page: "dms", title: "Direct Messages" }));
   const openChat = (ch, extra) =>
     tap(() => {
-      setMessages([]);
+      setMessages(msgCache.current[ch.id] || []);
       setDraft("");
       push({
         page: "chat",
@@ -1294,8 +1319,8 @@ function App() {
             "div",
             { style: { color: "#e4b44c", fontSize: 13, lineHeight: 1.35 } },
             status.capture.silent
-              ? "No microphone. Voice is silent so the call does not hear your speakers. Game audio is only sent while Share game is on."
-              : "Mic is capturing speaker output. Others will hear your desktop. Plug in a headset or pick a real microphone under Audio."
+              ? "No microphone. Voice is silent."
+              : "Mic is capturing speaker output. Pick a real microphone under Audio."
           )
         )
       : null,
@@ -1411,10 +1436,22 @@ function App() {
       : voice && voice.streamVolume != null
         ? voice.streamVolume
         : defaultStreamVol(outVol);
+  const closeOverlay = () => {
+    modalOpen.current = false;
+    cancelLock.current = Date.now();
+  };
   const openMedia = (payload) => {
     if (!payload || !payload.item) return;
     if (typeof DFL.showModal === "function") {
-      DFL.showModal(e(MediaOverlay, { item: payload.item, kind: payload.kind || "image", outputVolume: outVol }));
+      modalOpen.current = true;
+      DFL.showModal(
+        e(MediaOverlay, {
+          item: payload.item,
+          kind: payload.kind || "image",
+          outputVolume: outVol,
+          onClosed: closeOverlay,
+        })
+      );
     } else {
       push({ page: "media", item: payload.item, kind: payload.kind || "image", title: (payload.item && payload.item.name) || "Media" });
     }
@@ -1428,6 +1465,7 @@ function App() {
   const onWatchStream = (s) => {
     tap(() => act("Watch", () => focusStream(s.userId), { quiet: true }));
     if (typeof DFL.showModal === "function") {
+      modalOpen.current = true;
       DFL.showModal(
         e(WatchOverlay, {
           userId: s.userId,
@@ -1435,6 +1473,7 @@ function App() {
           kind: s.kind || "screenshare",
           outputVolume: outVol,
           onPinned: () => refresh(),
+          onClosed: closeOverlay,
         })
       );
     } else {
@@ -1463,6 +1502,8 @@ function App() {
   const streaming = streamFlag || !!(voice && voice.streaming);
   const shareOn = shareLocal == null ? streaming : shareLocal;
   const sharePending = !!(status && status.stream && status.stream.pending) || (shareOn && !streaming);
+  const gl = (status && status.golive) || (cfg && cfg.golive) || {};
+  const shareQual = (Number(gl.height) === 1080 ? "1080p" : "720p") + " " + String(gl.fps || 30);
   const compactVoice = [
     voice
       ? e(
@@ -1470,11 +1511,7 @@ function App() {
           { key: "share" },
           e(DFL.ToggleField, {
             label: "Share game",
-            description: shareOn
-              ? sharePending
-                ? "Starting… game audio only for viewers"
-                : "Live · 720p 30 · viewers hear game audio, voice stays on your mic"
-              : "720p 30 · game screen + game audio for stream viewers only",
+            description: shareOn ? (sharePending ? "Starting…" : "Live · " + shareQual) : shareQual,
             checked: shareOn,
             onChange: () =>
               tap(() => {
@@ -2371,15 +2408,6 @@ function App() {
       ];
     } else if (view.page === "settings_golive") {
       kids = [
-        e(
-          DFL.PanelSectionRow,
-          { key: "h" },
-          e(
-            "div",
-            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
-            "Outbound Share game uses Discord’s encoder. 720p30 is the handheld default. 1080p needs Nitro on the watching side."
-          )
-        ),
         e(
           CycleRow,
           {

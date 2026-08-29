@@ -27,7 +27,7 @@ Deckscord
    │  │     B on Watch: close overlay, mute stream audio, party voice stays
    │  ├─ People in call         (no duplicate of anyone already on a tile)
    │  │  └─ row A → Member mixer
-   │  ├─ Share game             (720p 30 Go Live; game screen + game audio)
+   │  ├─ Share game             (720p 30 / 1080p 30 — FPS and resolution only)
    │  ├─ Leave voice
    │  ├─ Mute
    │  ├─ Deafen
@@ -51,7 +51,7 @@ Deckscord
    │
    ├─ Chat  (#channel or DM)
    │  ├─ Messages (timestamps, d-pad scroll)
-   │  │  └─ A on picture/video → overlay (same 30% audio as streams)
+   │  │  └─ A on picture/video → overlay; B closes overlay and stays in this chat
    │  ├─ Message field + Send   (Steam keyboard)
    │  ├─ Start voice call       (DMs only)
    │  ├─ Live video (N) ───────► Live video

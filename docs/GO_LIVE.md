@@ -66,6 +66,12 @@ Voice capture is a microphone (or silence) only — never a speaker monitor
 or Vesktop’s screenshare virtmic. Game audio rides the Go Live track so
 **only people watching the stream** hear it, same as desktop Discord.
 
+Vesktop is launched with `--ozone-platform=x11` so Electron does not SIGSEGV
+on gamescope’s Wayland socket, **and** `XDG_SESSION_TYPE=wayland` plus a dummy
+`WAYLAND_DISPLAY=wayland-0` so Chromium’s capturer takes the PipeWire portal
+path (same split Deckcord/Steamcord use). Without those two env vars
+`getDesktopSource` never talks to the portal and times out.
+
 Chromium then reads DMA-BUF frames from PipeWire. We do not convert, scale, or
 JPEG them. Resolution/FPS are handed to Discord as capture constraints
 (`getDesktopSource({ width: 1280, height: 720, frameRate: 30 })` plus
@@ -116,6 +122,7 @@ No software x264, no GStreamer, no v4l2loopback, no extra 1080p scaler.
 | Symptom | Likely cause |
 |---|---|
 | Black for viewers, LIVE in QAM | `STREAM_START` without `getDesktopSource` (Discord ≥ 2026-07) |
+| `getDesktopSource timeout`, portal never logs CreateSession | Vesktop launched as X11 capture. Need `XDG_SESSION_TYPE=wayland` + dummy `WAYLAND_DISPLAY` (restart Discord after update) |
 | Black in Game Mode, works on desktop | Portal shim not owning the name / gamescope node missing |
 | Toggle on then off, viewers never see it | Leftover portal shims fighting for the D-Bus name — only one shim is allowed now |
 | Viewers hear the call twice | Stream audio fell back to default sink monitor — refuse that |

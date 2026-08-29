@@ -617,7 +617,7 @@ class Portal:
             log.warning("unmask portal: %r", e)
 
     def try_own(self, force: bool = False) -> None:
-        if self.owner_id and not force:
+        if self.owner_id:
             return
         now = time.monotonic()
         if not force and self._own_at and (now - self._own_at) < 1.0:
@@ -730,6 +730,9 @@ def main() -> int:
         log.info("SIGUSR1 — take ScreenCast name now")
         portal._gm_since = portal._gm_since or time.monotonic()
         portal._stable_gm = True
+        if portal.owner_id:
+            log.info("already owns ScreenCast name")
+            return True
         portal.try_own(force=True)
         return True
 

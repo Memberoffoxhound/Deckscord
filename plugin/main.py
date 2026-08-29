@@ -516,6 +516,64 @@ def _pip_dims(size: str) -> tuple[int, int]:
     return 426, 240
 
 
+def _vesktop_pids() -> list[int]:
+    found: list[int] = []
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
+            except OSError:
+                continue
+            if "vesktop" not in cmd and "vencord" not in cmd:
+                continue
+            if "portal_shim" in cmd or "deckscord" in cmd:
+                continue
+            found.append(int(p.name))
+    except OSError:
+        pass
+    return found
+
+
+def _proc_environ(pid: int) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return out
+    for item in raw:
+        if not item or b"=" not in item:
+            continue
+        k, _, v = item.partition(b"=")
+        try:
+            out[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+        except Exception:
+            continue
+    return out
+
+
+def vesktop_portal_env() -> dict[str, Any]:
+    """Whether the running Vesktop process will take the PipeWire portal path."""
+    pids = _vesktop_pids()
+    if not pids:
+        return {"ok": False, "running": False, "wayland": False}
+    env = _proc_environ(pids[0])
+    session = str(env.get("XDG_SESSION_TYPE") or "")
+    wayland = str(env.get("WAYLAND_DISPLAY") or "")
+    ozone = str(env.get("ELECTRON_OZONE_PLATFORM_HINT") or "")
+    portal = session == "wayland" and bool(wayland) and not wayland.startswith("gamescope")
+    return {
+        "ok": True,
+        "running": True,
+        "pid": pids[0],
+        "wayland": portal,
+        "session": session,
+        "WAYLAND_DISPLAY": wayland,
+        "ozone": ozone,
+    }
+
+
 def _pick_display() -> Optional[str]:
     raw = os.environ.get("DISPLAY") or ""
     if raw:
@@ -1087,6 +1145,7 @@ class Plugin:
         self._mic_pin_until = 0.0
         self._go_live_until = 0.0
         self._go_live_pending = False
+        self._capture_env_restarted = False
         self._grab_at = 0.0
 
     async def _main(self) -> None:
@@ -1375,6 +1434,7 @@ class Plugin:
             "update": dict(self._update),
             "pip": dict((self._settings.get("pip") or {})),
             "talking": dict((self._settings.get("talking") or {})),
+            "golive": dict((self._settings.get("golive") or {"width": 1280, "height": 720, "fps": 30})),
         }
 
         targets: Optional[list] = None
@@ -1494,6 +1554,7 @@ class Plugin:
                         cap["gamescope"] = gs
                     cap["game_audio"] = list_game_audio_nodes()
                     cap["game_mode"] = in_game_mode()
+                    cap["portal_env"] = vesktop_portal_env()
                     out["capture"] = cap
                     if hy.get("loopback"):
                         out["phase_label"] = (out.get("phase_label") or "Ready") + " · mic is speakers"
@@ -1619,6 +1680,17 @@ class Plugin:
         decky.logger.info(f"leave_voice result {r}")
         return self._ok(r)
 
+    async def _restart_vesktop_for_capture(self) -> None:
+        decky.logger.info("restarting Vesktop so Chromium uses the Game Mode ScreenCast portal")
+        try:
+            await self.cdp.close()
+        except Exception:
+            pass
+        try:
+            _systemctl("restart", SERVICE, timeout=20)
+        except Exception as e:
+            decky.logger.warning(f"vesktop restart: {e}")
+
     async def start_go_live(self, width: int = 1280, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
         if isinstance(width, dict):
             kwargs.update(width)
@@ -1649,22 +1721,43 @@ class Plugin:
         pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
         _nudge_portal_hard(pid)
         owned = await self._wait_portal_owned(12.0)
+        cap = vesktop_portal_env()
         decky.logger.info(
             f"start_go_live portal_owned={owned} game_mode={in_game_mode()} "
-            f"dbus_pid={_dbus_portal_owner_pid()} shim={pid}"
+            f"dbus_pid={_dbus_portal_owner_pid()} shim={pid} capture={cap}"
         )
+        if in_game_mode() and cap.get("running") and not cap.get("wayland"):
+            if not self._capture_env_restarted:
+                self._capture_env_restarted = True
+                self._go_live_pending = False
+                await self._restart_vesktop_for_capture()
+                return {
+                    "ok": False,
+                    "restarting": True,
+                    "error": "Restarting Discord so Share game can capture the game. Join voice and tap Share game again.",
+                }
         try:
             ensure_mic_not_loopback()
         except Exception:
             pass
         await self._ensure_cdp(inject=True)
         await self._inject_bridge()
+        # Vesktop's picker lives in the renderer. A minimized window often never
+        # mounts it, so getDesktopSource hangs and the portal never sees a call.
+        try:
+            await self.set_window_mode("offscreen")
+        except Exception as e:
+            decky.logger.warning(f"raise for share: {e}")
         r = await self._eval(
             "window.__deckscord.startGoLive("
             + json.dumps({"width": w, "height": h, "fps": f, "gameAudio": game_audio})
             + ")",
             timeout=28.0,
         )
+        try:
+            await self._hide_window()
+        except Exception:
+            pass
         ok = isinstance(r, dict) and r.get("ok") is not False
         if not isinstance(r, dict):
             r = {"ok": False, "error": str(r)}
