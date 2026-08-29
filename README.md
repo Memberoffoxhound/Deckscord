@@ -1,6 +1,6 @@
 # Deckscord
 
-**Discord in Steam Game Mode**, in the Quick Access Menu. Voice calls and text chat without leaving a game. Inspired by the Xbox and PS5 Discord apps.
+**Discord in Steam Game Mode**, in the Quick Access Menu. Voice calls and text chat without leaving a game. Inspired by the Xbox and PS5 Discord apps. Share game is 720p Go Live from the gamescope framebuffer. No inbound live-video tiles.
 
 Repository: https://github.com/Memberoffoxhound/Deckscord
 
@@ -10,11 +10,9 @@ Repository: https://github.com/Memberoffoxhound/Deckscord
 - **Decky plugin** in the QAM:
   - **Voice** — servers, voice channels, join/leave, mute, deafen, who’s in the call
   - **Text** — servers / DMs, channel list, read messages, send messages
-  - **Share game** — 720p 30 Go Live of the gamescope framebuffer + game audio (not the desktop, not speaker loopback)
-  - **Watch** — large spectator overlay of a friend’s Go Live (game audio only while focused; party voice stays). Not Nintendo GameShare: we do not let you play a game you don’t own.
-  - **PiP** — pin a stamp (240p or 480p, any corner, opacity) over the game after you close the QAM (Game Mode / gamescope only; off on desktop)
+  - **Share game** — 720p Go Live of the gamescope framebuffer (Steam Game Recording must be off)
   - **Who's talking** — opt-in avatar + name over Game Mode only while that person speaks
-  - **Settings** — Vesktop + Discord voice/Go Live tree in the QAM
+  - **Settings** — Vesktop + Discord voice tree in the QAM
 - Log in once. Session persists across Game Mode and reboot.
 
 ## Install (Desktop Mode terminal)

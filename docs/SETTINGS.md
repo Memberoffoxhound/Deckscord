@@ -5,11 +5,6 @@ MediaEngine flags we can actually set over CDP.
 
 ```
 Settings
-├─ Picture in picture
-│  ├─ Stamp size     small 240p / large 480p (height-clamped)
-│  ├─ Corner         top-left / top-right / bottom-left / bottom-right
-│  ├─ Opacity        20–100% compositor alpha
-│  └─ Unpin
 ├─ Who's talking
 │  ├─ Enable         names over the game while someone speaks
 │  ├─ Corner / size / opacity
@@ -21,9 +16,6 @@ Settings
 │  ├─ Noise suppression
 │  ├─ Noise cancellation (Krisp if present)
 │  └─ Automatic gain
-├─ Discord · Go Live
-│  ├─ Resolution     720 / 1080  → Vesktop State.screenshareQuality
-│  └─ Frame rate     15 / 30
 ├─ Vesktop · Performance     (~/.config/vesktop/settings.json)
 │  ├─ Hardware acceleration          restart Vesktop
 │  ├─ Video hardware acceleration    restart Vesktop
@@ -49,5 +41,5 @@ Settings
 Vesktop booleans are written to `settings.json` (Flatpak:
 `~/.var/app/dev.vencord.Vesktop/config/vesktop/settings.json`). Hardware
 acceleration and branch apply on the next Vesktop start. Discord voice
-processing is live via MediaEngine. Deckscord PiP prefs live in
+processing is live via MediaEngine. Deckscord talking-overlay prefs live in
 `~/.local/share/deckscord/settings.json`.

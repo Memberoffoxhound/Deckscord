@@ -1,6 +1,5 @@
 # Deckscord QAM menu tree
 
-Snapshot of the current Quick Access Menu so we can flatten it tomorrow.
 B pops one level until **Servers**; B on Servers closes the QAM.
 
 ```
@@ -20,15 +19,12 @@ Deckscord
    │  ├─ Settings ──────────────► Settings hub
    │  └─ Update from GitHub     (home only; until Decky store)
    │
-   ├─ Voice strip               (hidden on Chat / Member / Live video)
-   │  ├─ Live tiles             (only if someone has camera or Go Live)
-   │  │  └─ tile A: focus stream (game audio at 30% of output); A again: large Watch overlay
-   │  │     Stream volume slider while watching
-   │  │     B on Watch: close overlay, mute stream audio, party voice stays
-   │  ├─ People in call         (no duplicate of anyone already on a tile)
+   ├─ Voice strip               (hidden on Chat / Member)
+   │  ├─ People in call
    │  │  └─ row A → Member mixer
-   │  ├─ Share game             (720p 30 / 1080p 30 — FPS and resolution only)
+   │  ├─ Who's talking          (names over the game)
    │  ├─ Leave voice
+   │  ├─ Share game / Stop sharing   (720p Go Live; Game Recording must be off)
    │  ├─ Mute
    │  ├─ Deafen
    │  ├─ Output volume
@@ -54,7 +50,6 @@ Deckscord
    │  │  └─ A on picture/video → overlay; B closes overlay and stays in this chat
    │  ├─ Message field + Send   (Steam keyboard)
    │  ├─ Start voice call       (DMs only)
-   │  ├─ Live video (N) ───────► Live video
    │  └─ Leave voice            (if connected)
    │
    ├─ Member mixer
@@ -68,38 +63,10 @@ Deckscord
    │  ├─ Input list
    │  └─ Output list
    │
-   ├─ Live video
-   │  ├─ Tiles (max 4, edge-to-edge)
-   │  ├─ Pin focused stream to corner
-   │  ├─ Leave / Mute / Deafen
-   │  └─ overflow people as placeholders
-   │
    └─ Settings
-      ├─ Picture in picture     corner / small 240p / large 480p / opacity
       ├─ Who's talking          names over the game, corner / size / opacity
       ├─ Discord · Voice        mute, devices, echo / noise / AGC
-      ├─ Discord · Go Live      720/1080 · 15/30 (Vesktop screenshareQuality)
       ├─ Vesktop · Performance  hardware accel (restart)
       ├─ Vesktop · Linux audio  venmic flags
       └─ Vesktop · App          branch, tray, arRPC, WebRTC IP
 ```
-
-## What feels heavy today
-
-- Voice strip + Servers on the same home page: people, leave/mute/deafen, two sliders, devices, then the server list.
-- Chat hides the voice strip and only offers Leave + Live video at the bottom.
-- Member mixer is a full page for one person.
-- Live video is a second page even though tiles already sit on home.
-
-## Leaner tree to try tomorrow
-
-```
-Deckscord
-├─ People (in call)     tiles + one row per user, 🔊 speaks, A opens a thin mixer
-├─ Call bar             Leave · Mute · Deafen   (one row, always)
-└─ Browse
-   ├─ Servers → channels → chat
-   └─ DMs → chat
-```
-
-Keep Devices and sliders behind a single “Audio” row. Keep server mute/deafen inside the mixer, not on the call bar.

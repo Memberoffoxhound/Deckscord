@@ -86,9 +86,35 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 PIP_DIR = _ensure_dir(DATA_DIR / "pip")
 WANT_PORTAL = DATA_DIR / "want-portal"
 PORTAL_STATUS = DATA_DIR / "portal.status"
-WEBRTC_PORT_PATH = DATA_DIR / "webrtc.port"
-WEBRTC_DEFAULT_PORT = 18765
-PIP_WIN_TITLE = "Deckscord PiP"
+
+
+def _kill_legacy_video_helpers() -> None:
+    """Stop leftover inbound WebRTC helpers from older Deckscord builds."""
+    me = os.getpid()
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            pid = int(p.name)
+            if pid == me:
+                continue
+            try:
+                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            blob = cmd.lower()
+            if "steamcord" in blob:
+                continue
+            if "webrtc_hub.py" in cmd:
+                if "deckscord" not in blob and "Deckscord" not in cmd:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    decky.logger.info(f"stopped leftover video helper pid={pid}")
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def _nudge_portal() -> None:
@@ -154,69 +180,7 @@ def _nudge_portal_hard(pid: int = 0) -> None:
             pass
 
 
-def _dbus_portal_owner_pid() -> int:
-    r = _run(
-        ["busctl", "--user", "get-name-owner", "org.freedesktop.portal.Desktop"],
-        timeout=2,
-    )
-    name = (r.stdout or "").strip().strip('"')
-    if not name:
-        return 0
-    r2 = _run(
-        [
-            "busctl",
-            "--user",
-            "call",
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "GetConnectionUnixProcessID",
-            "s",
-            name,
-        ],
-        timeout=2,
-    )
-    text = (r2.stdout or "").strip()
-    for tok in text.replace("u ", "").split():
-        if tok.isdigit():
-            return int(tok)
-    return 0
-
-
-def _portal_owned() -> bool:
-    try:
-        raw = json.loads(PORTAL_STATUS.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and raw.get("owned"):
-            ts = float(raw.get("ts") or 0)
-            pid = int(raw.get("pid") or 0)
-            if ts and time.time() - ts < 30 and pid and Path(f"/proc/{pid}").exists():
-                return True
-    except Exception:
-        pass
-    owner = _dbus_portal_owner_pid()
-    if not owner:
-        return False
-    try:
-        cmd = (
-            Path(f"/proc/{owner}/cmdline")
-            .read_bytes()
-            .replace(b"\0", b" ")
-            .decode(errors="replace")
-        )
-    except OSError:
-        return False
-    return "portal_shim.py" in cmd and "Deckscord" in cmd
-
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "pip": {
-        "enabled": False,
-        "corner": "bottom-right",
-        "size": "small",
-        "opacity": 100,
-        "userId": None,
-        "kind": "screenshare",
-        "name": "",
-    },
     "talking": {
         "enabled": False,
         "corner": "top-left",
@@ -440,14 +404,11 @@ def _load_settings() -> dict[str, Any]:
     try:
         raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            pip = dict(doc["pip"])
-            pip.update((raw.get("pip") or {}) if isinstance(raw.get("pip"), dict) else {})
             talking = dict(doc["talking"])
             talking.update((raw.get("talking") or {}) if isinstance(raw.get("talking"), dict) else {})
+            doc["talking"] = talking
             golive = dict(doc["golive"])
             golive.update((raw.get("golive") or {}) if isinstance(raw.get("golive"), dict) else {})
-            doc["pip"] = pip
-            doc["talking"] = talking
             doc["golive"] = golive
     except Exception:
         pass
@@ -512,71 +473,6 @@ def _set_nested(doc: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
     cur[parts[-1]] = value
     return doc
 
-
-def _pip_dims(size: str) -> tuple[int, int]:
-    if str(size) == "large":
-        return 854, 480
-    return 426, 240
-
-
-def _vesktop_pids() -> list[int]:
-    found: list[int] = []
-    try:
-        for p in Path("/proc").iterdir():
-            if not p.name.isdigit():
-                continue
-            try:
-                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
-            except OSError:
-                continue
-            if "vesktop" not in cmd and "vencord" not in cmd:
-                continue
-            if "portal_shim" in cmd or "deckscord" in cmd:
-                continue
-            found.append(int(p.name))
-    except OSError:
-        pass
-    return found
-
-
-def _proc_environ(pid: int) -> dict[str, str]:
-    out: dict[str, str] = {}
-    try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return out
-    for item in raw:
-        if not item or b"=" not in item:
-            continue
-        k, _, v = item.partition(b"=")
-        try:
-            out[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
-        except Exception:
-            continue
-    return out
-
-
-def vesktop_portal_env() -> dict[str, Any]:
-    """Whether the running Vesktop process will take the PipeWire portal path."""
-    pids = _vesktop_pids()
-    if not pids:
-        return {"ok": False, "running": False, "wayland": False}
-    env = _proc_environ(pids[0])
-    session = str(env.get("XDG_SESSION_TYPE") or "")
-    wayland = str(env.get("WAYLAND_DISPLAY") or "")
-    ozone = str(env.get("ELECTRON_OZONE_PLATFORM_HINT") or "")
-    portal = session == "wayland" and bool(wayland) and not wayland.startswith("gamescope")
-    return {
-        "ok": True,
-        "running": True,
-        "pid": pids[0],
-        "wayland": portal,
-        "session": session,
-        "WAYLAND_DISPLAY": wayland,
-        "ozone": ozone,
-    }
-
-
 def _pick_display() -> Optional[str]:
     raw = os.environ.get("DISPLAY") or ""
     if raw:
@@ -613,6 +509,41 @@ WantedBy=default.target
 """
 
 
+def _install_launch_script() -> None:
+    """Keep systemd's launch-vesktop.sh in sync with the plugin copy."""
+    dest = DATA_DIR / "launch-vesktop.sh"
+    srcs = [
+        PLUGIN_DIR / "launch-vesktop.sh",
+        PLUGIN_DIR.parent / "launch-vesktop.sh",
+        Path(__file__).resolve().parents[1] / "launch-vesktop.sh",
+        DATA_DIR / "src" / "launch-vesktop.sh",
+    ]
+    src = next((p for p in srcs if p.is_file()), None)
+    if src is None:
+        return
+    data = src.read_text(encoding="utf-8")
+    try:
+        cur = dest.read_text(encoding="utf-8") if dest.is_file() else ""
+    except OSError:
+        cur = ""
+    if cur == data:
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".sh.tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(dest)
+    try:
+        dest.chmod(0o755)
+    except OSError:
+        pass
+    uid, gid = _login_uid_gid()
+    try:
+        os.chown(dest, uid, gid)
+    except OSError:
+        pass
+    decky.logger.info(f"updated {dest} from {src}")
+
+
 def _harden_vesktop_unit() -> None:
     """Wait for a compositor before Electron starts, so linger cannot grab DRM at boot."""
     path = _login_home() / ".config" / "systemd" / "user" / SERVICE
@@ -646,111 +577,6 @@ def _overlay_env() -> dict[str, str]:
             break
     return env
 
-
-def _webrtc_port() -> int:
-    try:
-        n = int(WEBRTC_PORT_PATH.read_text(encoding="utf-8").strip())
-        if 1 <= n <= 65535:
-            return n
-    except Exception:
-        pass
-    return WEBRTC_DEFAULT_PORT
-
-
-def _webrtc_url() -> str:
-    return f"http://127.0.0.1:{_webrtc_port()}"
-
-
-def _screen_size() -> tuple[int, int]:
-    env = _overlay_env()
-    try:
-        r = subprocess.run(
-            ["xdotool", "getdisplaygeometry"],
-            capture_output=True, text=True, timeout=2, env=env,
-        )
-        parts = (r.stdout or "").split()
-        if len(parts) >= 2:
-            return max(640, int(parts[0])), max(400, int(parts[1]))
-    except Exception:
-        pass
-    return 1280, 800
-
-
-def _pip_geom(pip: Optional[dict] = None) -> dict[str, int]:
-    pip = pip or {}
-    sw, sh = _screen_size()
-    w, h = _pip_dims(str(pip.get("size") or "small"))
-    frac = 0.42 if str(pip.get("size") or "") == "large" else 0.30
-    h = min(h, max(90, int(sh * frac)))
-    w = int(h * 16 / 9)
-    pad = max(10, int(min(sw, sh) * 0.012))
-    corner = str(pip.get("corner") or "bottom-right")
-    if corner == "top-left":
-        x, y = pad, pad
-    elif corner == "top-right":
-        x, y = sw - w - pad, pad
-    elif corner == "bottom-left":
-        x, y = pad, sh - h - pad
-    else:
-        x, y = sw - w - pad, sh - h - pad
-    return {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "sw": sw, "sh": sh}
-
-
-def _find_xwin(title: str) -> int:
-    env = _overlay_env()
-    try:
-        r = subprocess.run(
-            ["xdotool", "search", "--name", title],
-            capture_output=True, text=True, timeout=2, env=env,
-        )
-        for line in (r.stdout or "").splitlines():
-            line = line.strip()
-            if line.isdigit():
-                return int(line)
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(
-            ["xwininfo", "-root", "-tree"],
-            capture_output=True, text=True, timeout=3, env=env,
-        )
-        needle = title.lower()
-        for line in (r.stdout or "").splitlines():
-            if needle not in line.lower():
-                continue
-            tok = line.strip().split()
-            if tok and tok[0].startswith("0x"):
-                return int(tok[0], 16)
-    except Exception:
-        pass
-    return 0
-
-
-def _set_overlay_xid(xid: int) -> bool:
-    if not xid:
-        return False
-    env = _overlay_env()
-    try:
-        subprocess.run(
-            [
-                "xprop", "-id", str(xid),
-                "-f", "GAMESCOPE_EXTERNAL_OVERLAY", "32c",
-                "-set", "GAMESCOPE_EXTERNAL_OVERLAY", "1",
-            ],
-            check=False, timeout=2, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["xprop", "-id", str(xid), "-f", "_NET_WM_STATE", "32a",
-             "-set", "_NET_WM_STATE", "_NET_WM_STATE_ABOVE"],
-            check=False, timeout=2, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        return True
-    except Exception:
-        return False
-
-
 def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -764,6 +590,60 @@ def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
 
 def _systemctl(*args: str, timeout: int = 8) -> subprocess.CompletedProcess:
     return _run(["/usr/bin/systemctl", "--user", *args], timeout=timeout)
+
+
+def _dbus_portal_owner_pid() -> int:
+    r = _run(
+        ["busctl", "--user", "get-name-owner", "org.freedesktop.portal.Desktop"],
+        timeout=2,
+    )
+    name = (r.stdout or "").strip().strip('"')
+    if not name:
+        return 0
+    r2 = _run(
+        [
+            "busctl",
+            "--user",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            "s",
+            name,
+        ],
+        timeout=2,
+    )
+    text = (r2.stdout or "").strip()
+    for tok in text.replace("u ", "").split():
+        if tok.isdigit():
+            return int(tok)
+    return 0
+
+
+def _portal_owned() -> bool:
+    try:
+        raw = json.loads(PORTAL_STATUS.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("owned"):
+            ts = float(raw.get("ts") or 0)
+            pid = int(raw.get("pid") or 0)
+            if ts and time.time() - ts < 30 and pid and Path(f"/proc/{pid}").exists():
+                return True
+    except Exception:
+        pass
+    owner = _dbus_portal_owner_pid()
+    if not owner:
+        return False
+    try:
+        cmd = (
+            Path(f"/proc/{owner}/cmdline")
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode(errors="replace")
+        )
+    except OSError:
+        return False
+    return "portal_shim.py" in cmd and "Deckscord" in cmd
 
 
 def _pactl(*args: str, timeout: int = 5) -> subprocess.CompletedProcess:
@@ -873,7 +753,7 @@ def ensure_mic_not_loopback() -> dict[str, Any]:
 
     Discord's 'default' input follows PipeWire's default source. HDMI *.monitor
     and Vesktop's vencord-screen-share virtmic both dump game/system audio into
-    the voice channel. Game audio belongs on the Go Live track only.
+    the voice channel.
     """
     cur = (_pactl("get-default-source").stdout or "").strip()
     sources = _pulse_sources()
@@ -897,6 +777,43 @@ def ensure_mic_not_loopback() -> dict[str, Any]:
         "changed": changed,
         "sources": sources[:12],
     }
+
+
+def _proc_comms() -> set[str]:
+    names: set[str] = set()
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                names.add((p / "comm").read_text().strip())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return names
+
+
+def _has_gamescope(names: Optional[set[str]] = None) -> bool:
+    names = names if names is not None else _proc_comms()
+    return any(n == "gamescope" or n.startswith("gamescope") for n in names)
+
+
+def _has_kwin(names: Optional[set[str]] = None) -> bool:
+    names = names if names is not None else _proc_comms()
+    return "kwin_wayland" in names or "kwin_x11" in names
+
+
+def in_game_mode() -> bool:
+    """True when gamescope is the session compositor (Steam Game Mode).
+
+    Nested gamescope under KWin/Plasma is Desktop Mode — do not cover :0.
+    Match gamescope* comms (gamescope-session truncates).
+    """
+    names = _proc_comms()
+    if _has_kwin(names):
+        return False
+    return _has_gamescope(names)
 
 
 _AUDIO_SKIP = (
@@ -963,50 +880,124 @@ def list_game_audio_nodes() -> list[dict[str, Any]]:
         blob = f"{name} {app} {binary}".lower()
         if any(s in blob for s in _AUDIO_SKIP):
             continue
-        out.append({
-            "id": n.get("id"),
-            "name": name,
-            "app": app,
-            "binary": binary,
-        })
+        out.append({"id": n.get("id"), "name": name, "app": app, "binary": binary})
     return out[:8]
 
 
-def _proc_comms() -> set[str]:
-    names: set[str] = set()
+def game_recording_consumers(data: Optional[list[Any]] = None) -> list[dict[str, Any]]:
+    """Steam Game Recording (or anything else) already reading gamescope video."""
+    data = data if data is not None else _pw_dump()
+    by_id = {n.get("id"): n for n in data}
+    gamescope_ids: set[Any] = set()
+    for n in data:
+        props = ((n.get("info") or {}).get("props")) or {}
+        name = str(props.get("node.name") or "").lower()
+        mc = str(props.get("media.class") or "").lower()
+        if name == "gamescope" and "video/source" in mc:
+            gamescope_ids.add(n.get("id"))
+    if not gamescope_ids:
+        return []
+    skip = ("vesktop", "vencord", "discord", "deckscord", "gst-launch", "pipewiresrc")
+    found: list[dict[str, Any]] = []
+    for n in data:
+        if "Link" not in str(n.get("type") or ""):
+            continue
+        props = ((n.get("info") or {}).get("props")) or {}
+        if props.get("link.output.node") not in gamescope_ids:
+            continue
+        inp = props.get("link.input.node")
+        node = by_id.get(inp) or {}
+        ip = ((node.get("info") or {}).get("props")) or {}
+        app = str(ip.get("application.name") or "")
+        binary = str(ip.get("application.process.binary") or "")
+        name = str(ip.get("node.name") or "")
+        blob = f"{app} {binary} {name}".lower()
+        if any(s in blob for s in skip):
+            continue
+        found.append({"id": inp, "app": app, "binary": binary, "name": name})
+    if found:
+        return found
+    # Linked or not: a Steam video capture stream means recording is armed.
+    for n in data:
+        if not str(n.get("type") or "").endswith("Node"):
+            continue
+        props = ((n.get("info") or {}).get("props")) or {}
+        mc = str(props.get("media.class") or "").lower()
+        if "stream/input/video" not in mc and "video/sink" not in mc:
+            continue
+        app = str(props.get("application.name") or "")
+        binary = str(props.get("application.process.binary") or "")
+        name = str(props.get("node.name") or "")
+        blob = f"{app} {binary} {name}".lower()
+        if any(s in blob for s in skip):
+            continue
+        if "steam" in blob or "game record" in blob or "gamerecording" in blob:
+            found.append({"id": n.get("id"), "app": app, "binary": binary, "name": name})
+    return found
+
+
+def _vesktop_pids() -> list[int]:
+    found: list[int] = []
     try:
         for p in Path("/proc").iterdir():
             if not p.name.isdigit():
                 continue
             try:
-                names.add((p / "comm").read_text().strip())
+                cmd = (
+                    (p / "cmdline")
+                    .read_bytes()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                    .lower()
+                )
             except OSError:
                 continue
+            if "vesktop" not in cmd and "vencord" not in cmd:
+                continue
+            if "portal_shim" in cmd or "deckscord" in cmd:
+                continue
+            found.append(int(p.name))
     except OSError:
         pass
-    return names
+    return found
 
 
-def _has_gamescope(names: Optional[set[str]] = None) -> bool:
-    names = names if names is not None else _proc_comms()
-    return any(n == "gamescope" or n.startswith("gamescope") for n in names)
+def _proc_environ(pid: int) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return out
+    for item in raw:
+        if not item or b"=" not in item:
+            continue
+        k, _, v = item.partition(b"=")
+        try:
+            out[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+        except Exception:
+            continue
+    return out
 
 
-def _has_kwin(names: Optional[set[str]] = None) -> bool:
-    names = names if names is not None else _proc_comms()
-    return "kwin_wayland" in names or "kwin_x11" in names
-
-
-def in_game_mode() -> bool:
-    """True when gamescope is the session compositor (Steam Game Mode).
-
-    Nested gamescope under KWin/Plasma is Desktop Mode — do not steal the
-    portal or cover :0. Match gamescope* comms (gamescope-session truncates).
-    """
-    names = _proc_comms()
-    if _has_kwin(names):
-        return False
-    return _has_gamescope(names)
+def vesktop_portal_env() -> dict[str, Any]:
+    """Whether the running Vesktop process will take the PipeWire portal path."""
+    pids = _vesktop_pids()
+    if not pids:
+        return {"ok": False, "running": False, "wayland": False}
+    env = _proc_environ(pids[0])
+    session = str(env.get("XDG_SESSION_TYPE") or "")
+    wayland = str(env.get("WAYLAND_DISPLAY") or "")
+    ozone = str(env.get("ELECTRON_OZONE_PLATFORM_HINT") or "")
+    portal = session == "wayland" and bool(wayland) and not wayland.startswith("gamescope")
+    return {
+        "ok": True,
+        "running": True,
+        "pid": pids[0],
+        "wayland": portal,
+        "session": session,
+        "WAYLAND_DISPLAY": wayland,
+        "ozone": ozone,
+    }
 
 
 class Cdp:
@@ -1222,9 +1213,6 @@ def _pick_target(targets: list[dict]) -> Optional[dict]:
     return scored[0][1]
 
 
-SINK_ID = "deckscord-qam"
-
-
 class Plugin:
     def __init__(self) -> None:
         self.cdp = Cdp()
@@ -1232,15 +1220,9 @@ class Plugin:
         self._injecting = asyncio.Lock()
         self._status_lock = asyncio.Lock()
         self._can_hide_window = True
-        self._video_enabled = True
-        self._grab_alive_until = 0.0
-        self._last_frames: list[dict[str, Any]] = []
         self._audio_focus: dict[str, Any] = {"userId": None, "saved": {}}
-        self._grab_lock = asyncio.Lock()
         self._last_voice_channel: Optional[str] = None
-        self._grab_log_at = 0.0
         self._audio_hygiene_at = 0.0
-        self._portal_proc: Optional[subprocess.Popen] = None
         self._update: dict[str, Any] = {"phase": "idle", "percent": 0, "message": ""}
         self._update_task: Optional[asyncio.Task] = None
         self._settings = _load_settings()
@@ -1250,13 +1232,10 @@ class Plugin:
         self._talk_last: dict[str, dict[str, Any]] = {}
         self._talk_in_voice = False
         self._mic_pin_until = 0.0
+        self._portal_proc: Optional[subprocess.Popen] = None
         self._go_live_until = 0.0
         self._go_live_pending = False
         self._capture_env_restarted = False
-        self._grab_at = 0.0
-        self._hub_proc: Optional[subprocess.Popen] = None
-        self._pip_xid = 0
-        self._rtc_ok = False
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -1264,6 +1243,10 @@ class Plugin:
             _harden_vesktop_unit()
         except Exception as e:
             decky.logger.warning(f"vesktop unit: {e}")
+        try:
+            _install_launch_script()
+        except Exception as e:
+            decky.logger.warning(f"launch script: {e}")
         try:
             svc = await self._ensure_vesktop(wait=True)
             decky.logger.info(f"vesktop service: {svc}")
@@ -1275,126 +1258,23 @@ class Plugin:
         except Exception as e:
             decky.logger.warning(f"capture source: {e}")
         try:
+            _kill_legacy_video_helpers()
+        except Exception as e:
+            decky.logger.warning(f"legacy video helpers: {e}")
+        try:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
-        try:
-            self._ensure_webrtc_hub()
-        except Exception as e:
-            decky.logger.warning(f"webrtc hub: {e}")
-        pip = (self._settings.get("pip") or {})
-        if pip.get("enabled") and pip.get("userId"):
-            pip["enabled"] = False
-            pip["userId"] = None
-            self._settings["pip"] = pip
-            _save_settings(self._settings)
         self._pip_task = asyncio.create_task(self._pip_loop())
 
     async def _unload(self) -> None:
-        try:
-            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
-        except Exception:
-            pass
         task = self._pip_task
         self._pip_task = None
         if task:
             task.cancel()
-        try:
-            await self._eval("window.__deckscord && window.__deckscord.closePipViewer()")
-        except Exception:
-            pass
-        self._stop_pip_overlay()
         self._stop_portal_shim()
-        self._stop_webrtc_hub()
+        self._stop_pip_overlay()
         await self.cdp.close()
-
-    def _ensure_portal_shim(self) -> None:
-        proc = self._portal_proc
-        if proc is not None and proc.poll() is None:
-            _kill_stale_portal_shims(keep=int(proc.pid))
-            return
-        script = PLUGIN_DIR / "portal_shim.py"
-        if not script.is_file():
-            decky.logger.warning("portal_shim.py missing")
-            return
-        _kill_stale_portal_shims()
-        log = DATA_DIR / "portal-shim.log"
-        log_f = open(log, "ab")
-        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
-        log_f.flush()
-        env = _subprocess_env()
-        self._portal_proc = subprocess.Popen(
-            ["/usr/bin/python3", str(script)],
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-            close_fds=True,
-        )
-        try:
-            (DATA_DIR / "portal.pid").write_text(str(self._portal_proc.pid), encoding="utf-8")
-        except OSError:
-            pass
-        decky.logger.info(f"portal shim pid={self._portal_proc.pid} log={log}")
-
-    def _ensure_webrtc_hub(self) -> None:
-        proc = self._hub_proc
-        if proc is not None and proc.poll() is None:
-            return
-        script = PLUGIN_DIR / "webrtc_hub.py"
-        if not script.is_file():
-            script = DATA_DIR / "webrtc_hub.py"
-        if not script.is_file():
-            decky.logger.warning("webrtc_hub.py missing")
-            return
-        log = DATA_DIR / "webrtc-hub.log"
-        log_f = open(log, "ab")
-        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
-        log_f.flush()
-        env = _subprocess_env()
-        self._hub_proc = subprocess.Popen(
-            ["/usr/bin/python3", str(script)],
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-            close_fds=True,
-        )
-        for _ in range(20):
-            time.sleep(0.05)
-            if WEBRTC_PORT_PATH.is_file():
-                break
-        decky.logger.info(f"webrtc hub pid={self._hub_proc.pid} url={_webrtc_url()}")
-
-    def _stop_webrtc_hub(self) -> None:
-        proc = self._hub_proc
-        self._hub_proc = None
-        if not proc or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    def _stop_portal_shim(self) -> None:
-        proc = self._portal_proc
-        self._portal_proc = None
-        if not proc or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
     async def _ensure_vesktop(self, wait: bool = False) -> dict[str, Any]:
         try:
@@ -1485,19 +1365,11 @@ class Plugin:
             if self._bridge_hash == h:
                 ping = await self._eval("window.__deckscord ? window.__deckscord.ping() : {ok:false}")
                 if isinstance(ping, dict) and ping.get("ok"):
-                    try:
-                        await self._eval(f"window.__deckscordHub = {json.dumps(_webrtc_url())}")
-                    except Exception:
-                        pass
                     return
             result = await self._eval(f"(function(){{ {src}\n }})()")
             if isinstance(result, dict) and result.get("ok") is False:
                 raise RuntimeError(result.get("error") or "bridge inject failed")
             self._bridge_hash = h
-            try:
-                await self._eval(f"window.__deckscordHub = {json.dumps(_webrtc_url())}")
-            except Exception:
-                pass
             if self._audio_focus.get("userId"):
                 try:
                     await self._eval(
@@ -1601,12 +1473,9 @@ class Plugin:
             "ready": False,
             "phase": "starting",
             "phase_label": "Starting Discord…",
-            "videoEnabled": bool(self._video_enabled),
             "update": dict(self._update),
-            "pip": dict((self._settings.get("pip") or {})),
             "talking": dict((self._settings.get("talking") or {})),
             "golive": dict((self._settings.get("golive") or {"width": 1280, "height": 720, "fps": 30})),
-            "webrtc": {"url": _webrtc_url(), "port": _webrtc_port()},
         }
 
         targets: Optional[list] = None
@@ -1692,7 +1561,6 @@ class Plugin:
         if isinstance(snap, dict):
             out.update(snap)
             out["cdp"] = True
-            out["webrtc"] = {"url": _webrtc_url(), "port": _webrtc_port()}
         if out.get("logged_in") and out.get("ok") is not False:
             out["ready"] = True
             out["phase"] = "ready"
@@ -1701,7 +1569,6 @@ class Plugin:
             if isinstance(user, dict):
                 name = user.get("name") or user.get("username") or ""
             out["phase_label"] = f"Ready{(' · ' + name) if name else ''}"
-            out["videoEnabled"] = bool(self._video_enabled)
             voice = out.get("voice") if isinstance(out.get("voice"), dict) else None
             vch = str((voice or {}).get("channelId") or "") or None
             if self._last_voice_channel and vch != self._last_voice_channel:
@@ -1722,13 +1589,16 @@ class Plugin:
                 try:
                     hy = ensure_mic_not_loopback()
                     cap = {k: hy[k] for k in ("source", "loopback", "mic", "silent") if k in hy}
-                    gs = find_gamescope_node()
-                    if gs:
-                        cap["gamescope"] = gs
-                    cap["game_audio"] = list_game_audio_nodes()
                     cap["game_mode"] = in_game_mode()
+                    try:
+                        rec = game_recording_consumers()
+                    except Exception:
+                        rec = []
+                    cap["game_recording"] = rec
+                    cap["portal_owned"] = _portal_owned()
                     cap["portal_env"] = vesktop_portal_env()
                     out["capture"] = cap
+                    out["game_recording"] = bool(rec)
                     if hy.get("loopback"):
                         out["phase_label"] = (out.get("phase_label") or "Ready") + " · mic is speakers"
                     elif hy.get("silent"):
@@ -1736,57 +1606,28 @@ class Plugin:
                     await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
                 except Exception as e:
                     decky.logger.warning(f"voice processing: {e}")
-            pip = (self._settings.get("pip") or {})
-            pip_on = bool(pip.get("enabled") and pip.get("userId"))
-            out["pip"] = dict(pip)
-            if pip_on and not vch:
-                pip["enabled"] = False
-                pip["userId"] = None
-                self._settings["pip"] = pip
-                _save_settings(self._settings)
-                self._stop_overlay_if_idle()
-                pip_on = False
-                out["pip"] = dict(pip)
             talk = dict(self._settings.get("talking") or {})
             out["talking"] = dict(talk)
             out["talking"]["live"] = bool(talk.get("enabled") and vch)
+            golive = dict(self._settings.get("golive") or {"width": 1280, "height": 720, "fps": 30})
             now_m = time.monotonic()
-            snap_live = bool(
-                out.get("streaming")
-                or (
-                    isinstance(out.get("stream"), dict)
-                    and out["stream"].get("active")
-                )
-                or (isinstance(voice, dict) and voice.get("streaming"))
-            )
+            snap_live = bool((voice or {}).get("streaming") or out.get("streaming"))
             if snap_live:
                 self._go_live_until = max(self._go_live_until, now_m + 8.0)
                 self._go_live_pending = False
             if self._go_live_pending or now_m < self._go_live_until:
-                out["streaming"] = True
-                st = dict(out["stream"]) if isinstance(out.get("stream"), dict) else {}
-                st["active"] = True
-                st["pending"] = bool(self._go_live_pending and not snap_live)
-                out["stream"] = st
-                if isinstance(out.get("voice"), dict):
-                    v = dict(out["voice"])
-                    v["streaming"] = True
-                    out["voice"] = v
+                golive["active"] = True
+                golive["pending"] = bool(self._go_live_pending and not snap_live)
+            golive["streaming"] = snap_live or bool(golive.get("active"))
+            out["golive"] = golive
+            out["streaming"] = bool(golive.get("streaming"))
+            if "game_recording" not in out:
+                try:
+                    out["game_recording"] = bool(game_recording_consumers())
+                except Exception:
+                    out["game_recording"] = False
             try:
-                if pip_on:
-                    # Keep the PiP popup mapped. Park the Discord window off-screen
-                    # instead of minimizing — Electron often minimizes child popups too.
-                    await self.set_window_mode("offscreen")
-                elif self._video_enabled and time.monotonic() < self._grab_alive_until:
-                    pass
-                else:
-                    if self._video_enabled and self._grab_alive_until and time.monotonic() >= self._grab_alive_until:
-                        try:
-                            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
-                        except Exception:
-                            pass
-                        self._grab_alive_until = 0.0
-                    await self._hide_window()
+                await self._hide_window()
             except Exception:
                 pass
         elif out.get("booting") or not on_login:
@@ -1839,14 +1680,9 @@ class Plugin:
 
     async def leave_voice(self) -> dict[str, Any]:
         decky.logger.info("leave_voice")
-        await self.unpin_pip()
         await self._clear_audio_focus_safe()
         try:
-            await self._eval("window.__deckscord && window.__deckscord.stopGoLive()")
-        except Exception:
-            pass
-        try:
-            await self._eval("window.__deckscord && window.__deckscord.ensureVideoSinks(false)")
+            await self._bridge("stopGoLive()")
         except Exception:
             pass
         r = await self._bridge("leaveVoice()")
@@ -1854,8 +1690,54 @@ class Plugin:
             ensure_mic_not_loopback()
         except Exception:
             pass
+        self._go_live_pending = False
+        self._go_live_until = 0.0
         decky.logger.info(f"leave_voice result {r}")
         return self._ok(r)
+
+    def _ensure_portal_shim(self) -> None:
+        proc = self._portal_proc
+        if proc is not None and proc.poll() is None:
+            _kill_stale_portal_shims(keep=int(proc.pid))
+            return
+        script = PLUGIN_DIR / "portal_shim.py"
+        if not script.is_file():
+            decky.logger.warning("portal_shim.py missing")
+            return
+        _kill_stale_portal_shims()
+        log = DATA_DIR / "portal-shim.log"
+        log_f = open(log, "ab")
+        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        log_f.flush()
+        env = _subprocess_env()
+        self._portal_proc = subprocess.Popen(
+            ["/usr/bin/python3", str(script)],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        try:
+            (DATA_DIR / "portal.pid").write_text(str(self._portal_proc.pid), encoding="utf-8")
+        except OSError:
+            pass
+        decky.logger.info(f"portal shim pid={self._portal_proc.pid} log={log}")
+
+    def _stop_portal_shim(self) -> None:
+        proc = self._portal_proc
+        self._portal_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     async def _restart_vesktop_for_capture(self) -> None:
         decky.logger.info("restarting Vesktop so Chromium uses the Game Mode ScreenCast portal")
@@ -1868,6 +1750,51 @@ class Plugin:
         except Exception as e:
             decky.logger.warning(f"vesktop restart: {e}")
 
+    async def _wait_portal_owned(self, timeout: float = 8.0) -> bool:
+        try:
+            self._ensure_portal_shim()
+        except Exception:
+            pass
+        pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+        _nudge_portal_hard(pid)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if _portal_owned():
+                return True
+            proc = self._portal_proc
+            if proc is not None and proc.poll() is not None:
+                try:
+                    self._ensure_portal_shim()
+                except Exception:
+                    pass
+                pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+            if int(time.monotonic() - t0) % 2 == 0:
+                _nudge_portal_hard(pid)
+            await asyncio.sleep(0.25)
+        return _portal_owned()
+
+    async def set_window_mode(self, mode: str = "minimized", **kwargs: Any) -> dict[str, Any]:
+        mode = str(kwargs.get("mode") or mode or "minimized")
+        if not self._can_hide_window:
+            return {"ok": False, "error": "window api missing"}
+        try:
+            await self._ensure_cdp(inject=False, attempts=2, hide=False)
+            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
+            wid = (info or {}).get("windowId")
+            if wid is None:
+                return {"ok": False, "error": "no windowId"}
+            if mode == "minimized":
+                bounds: dict[str, Any] = {"windowState": "minimized"}
+            elif mode == "offscreen":
+                bounds = {"windowState": "normal", "left": -600, "top": 0, "width": 480, "height": 640}
+            else:
+                bounds = {"windowState": "normal", "width": 480, "height": 640}
+            await self.cdp.call("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds}, timeout=3)
+            return {"ok": True, "mode": mode}
+        except Exception as e:
+            decky.logger.warning(f"set_window_mode: {e}")
+            return {"ok": False, "error": str(e)}
+
     async def start_go_live(self, width: int = 1280, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
         if isinstance(width, dict):
             kwargs.update(width)
@@ -1878,6 +1805,30 @@ class Plugin:
         w = int(kwargs.get("width") or width or saved.get("width") or 1280)
         h = int(kwargs.get("height") or height or saved.get("height") or 720)
         f = int(kwargs.get("fps") or fps or saved.get("fps") or 30)
+        if h not in (720, 1080):
+            h = 720
+            w = 1280
+        rec = []
+        try:
+            rec = game_recording_consumers()
+        except Exception as e:
+            decky.logger.warning(f"game recording probe: {e}")
+        if rec:
+            names = ", ".join(
+                str(x.get("app") or x.get("name") or x.get("binary") or "steam") for x in rec[:3]
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "Turn off Steam Game Recording first (Settings → Game Recording). "
+                    "Share game and Game Recording both encode the same APU. "
+                    f"Now using: {names}."
+                ),
+                "game_recording": rec,
+            }
+        gs = find_gamescope_node()
+        if in_game_mode() and not gs:
+            return {"ok": False, "error": "gamescope capture node is missing — stay in Game Mode"}
         games = []
         try:
             games = list_game_audio_nodes()
@@ -1889,7 +1840,7 @@ class Plugin:
                 v = str(g.get(k) or "").strip()
                 if v and v not in game_audio:
                     game_audio.append(v)
-        decky.logger.info(f"start_go_live {w}x{h}@{f} game_audio={game_audio}")
+        decky.logger.info(f"start_go_live {w}x{h} encoder_fps={f} game_audio={game_audio} node={gs}")
         self._go_live_pending = True
         try:
             self._ensure_portal_shim()
@@ -1919,9 +1870,6 @@ class Plugin:
             pass
         await self._ensure_cdp(inject=True)
         await self._inject_bridge()
-        # Vesktop's picker lives in the renderer. Offscreen/minimized windows
-        # never receive the auto-click, so getDesktopSource hangs. Keep a small
-        # on-screen window until Share game starts, then hide it.
         try:
             await self.set_window_mode("normal")
         except Exception as e:
@@ -1955,18 +1903,6 @@ class Plugin:
         decky.logger.info(f"start_go_live result {r}")
         return self._ok(r)
 
-    async def _pin_mic_burst(self) -> None:
-        for _ in range(8):
-            try:
-                await asyncio.to_thread(ensure_mic_not_loopback)
-            except Exception:
-                pass
-            try:
-                await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
-            except Exception:
-                pass
-            await asyncio.sleep(0.35)
-
     async def stop_go_live(self) -> dict[str, Any]:
         decky.logger.info("stop_go_live")
         self._go_live_pending = False
@@ -1982,6 +1918,38 @@ class Plugin:
             decky.logger.warning(f"voice capture after stop: {e}")
         decky.logger.info(f"stop_go_live result {r}")
         return self._ok(r)
+
+    async def set_golive_quality(self, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
+        h = int(kwargs.get("height") or height or 720)
+        f = int(kwargs.get("fps") or fps or 30)
+        if h not in (720, 1080):
+            h = 720
+        if f not in (15, 30):
+            f = 30
+        w = 1280 if h == 720 else 1920
+        self._settings["golive"] = {"width": w, "height": h, "fps": f}
+        _save_settings(self._settings)
+        vdir = _vesktop_config_dir()
+        state = _read_json(vdir / "state.json")
+        state["screenshareQuality"] = {"resolution": str(h), "frameRate": str(f)}
+        _write_json(vdir / "state.json", state)
+        try:
+            await self._bridge(f"setScreenshareQuality({json.dumps(str(h))}, {json.dumps(str(f))})")
+        except Exception as e:
+            decky.logger.warning(f"screenshareQuality: {e}")
+        return {"ok": True, "golive": self._settings["golive"], "needsRestart": False}
+
+    async def _pin_mic_burst(self) -> None:
+        for _ in range(8):
+            try:
+                await asyncio.to_thread(ensure_mic_not_loopback)
+            except Exception:
+                pass
+            try:
+                await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+            except Exception:
+                pass
+            await asyncio.sleep(0.35)
 
     async def toggle_mute(self) -> dict[str, Any]:
         r = await self._bridge("toggleMute()")
@@ -2054,197 +2022,12 @@ class Plugin:
         r = await self._bridge(f"setOutputVolume({float(vol)})")
         return self._ok(r)
 
-    async def set_stream_volume(self, volume: float = 30, **kwargs: Any) -> dict[str, Any]:
-        vol = kwargs.get("volume", volume)
-        r = await self._bridge(f"setStreamAudioVolume({float(vol)})")
-        if isinstance(r, dict) and r.get("focus"):
-            self._audio_focus = r["focus"]
-        return self._ok(r)
-
-    async def set_window_mode(self, mode: str = "minimized", **kwargs: Any) -> dict[str, Any]:
-        mode = str(kwargs.get("mode") or mode or "minimized")
-        if not self._can_hide_window:
-            return {"ok": False, "error": "window api missing"}
-        try:
-            await self._ensure_cdp(inject=False, attempts=2, hide=False)
-            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
-            wid = (info or {}).get("windowId")
-            if wid is None:
-                return {"ok": False, "error": "no windowId"}
-            if mode == "minimized":
-                bounds: dict[str, Any] = {"windowState": "minimized"}
-            elif mode == "offscreen":
-                bounds = {"windowState": "normal", "left": -600, "top": 0, "width": 480, "height": 640}
-            else:
-                bounds = {"windowState": "normal", "width": 480, "height": 640}
-            await self.cdp.call("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds}, timeout=3)
-            return {"ok": True, "mode": mode}
-        except Exception as e:
-            decky.logger.warning(f"set_window_mode: {e}")
-            return {"ok": False, "error": str(e)}
-
-    async def _arm_grab_window(self) -> None:
-        if not self._video_enabled:
-            return
-        self._grab_alive_until = time.monotonic() + 8.0
-
-    async def _wait_portal_owned(self, timeout: float = 8.0) -> bool:
-        try:
-            self._ensure_portal_shim()
-        except Exception:
-            pass
-        pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
-        _nudge_portal_hard(pid)
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            if _portal_owned():
-                return True
-            proc = self._portal_proc
-            if proc is not None and proc.poll() is not None:
-                try:
-                    self._ensure_portal_shim()
-                except Exception:
-                    pass
-                pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
-            if int(time.monotonic() - t0) % 2 == 0:
-                _nudge_portal_hard(pid)
-            await asyncio.sleep(0.25)
-        return _portal_owned()
-
-    async def _maybe_show_for_camera(self, frames: list) -> None:
-        """Only raise Vesktop if we still have no pixels and someone has a camera.
-        Screenshare stills come from Discord preview URLs and do not need a window."""
-        if not self._video_enabled:
-            return
-        need = False
-        for f in frames or []:
-            if not isinstance(f, dict):
-                continue
-            if f.get("kind") == "camera" and not f.get("jpeg"):
-                need = True
-                break
-        if need:
-            await self.set_window_mode("normal")
-
     async def _bridge_hot(self, call: str, timeout: float = 0.4) -> Any:
         if not self.cdp.connected:
             await self._bridge("ping()")
         if not self.cdp.connected:
             raise ConnectionError("not connected")
         return await self._eval(f"window.__deckscord.{call}", timeout=timeout)
-
-    async def probe_video(self, restore: bool = False, **kwargs: Any) -> dict[str, Any]:
-        restore = bool(kwargs.get("restore", restore))
-        if restore:
-            await self._arm_grab_window()
-        r = await self._bridge("probeVideo()")
-        out = self._ok(r)
-        try:
-            info = await self.cdp.call("Browser.getWindowForTarget", {}, timeout=3)
-            out["windowState"] = ((info or {}).get("bounds") or {}).get("windowState")
-        except Exception:
-            out["windowState"] = None
-        decky.logger.info(
-            f"probe_video winner={out.get('winner')} engine={out.get('engineType')} "
-            f"sink={out.get('sinkApi')} streams={out.get('streamIds')} videos={len(out.get('dom') or [])}"
-        )
-        return out
-
-    async def get_video_frames(self, user_id: str = "", w: int = 0, h: int = 0, **kwargs: Any) -> dict[str, Any]:
-        if isinstance(user_id, dict):
-            kwargs.update(user_id)
-            user_id = str(kwargs.get("user_id") or kwargs.get("userId") or "")
-            w = kwargs.get("w") or kwargs.get("width") or w
-            h = kwargs.get("h") or kwargs.get("height") or h
-        uid = str(user_id or kwargs.get("user_id") or kwargs.get("userId") or "")
-        ww = int(kwargs.get("w") or w or 0)
-        hh = int(kwargs.get("h") or h or 0)
-        if not self._video_enabled:
-            return {"ok": True, "frames": [], "videoEnabled": False}
-        if self._status_lock.locked() or self._grab_lock.locked():
-            return {"ok": True, "frames": self._last_frames, "cached": True, "videoEnabled": True}
-        async with self._grab_lock:
-            await self._arm_grab_window()
-            t0 = time.monotonic()
-            opts: dict[str, Any] = {}
-            if uid:
-                opts["userId"] = uid
-            if ww and hh:
-                opts["w"] = ww
-                opts["h"] = hh
-            call = f"grabVideoFrames({json.dumps(opts)})" if opts else "grabVideoFrames()"
-            try:
-                r = await self._bridge_hot(call, timeout=1.6)
-            except Exception as e:
-                decky.logger.warning(f"grab: {e}")
-                return {"ok": True, "frames": self._last_frames, "cached": True, "error": "grab_timeout", "videoEnabled": True}
-            ms = int((time.monotonic() - t0) * 1000)
-            if isinstance(r, dict) and r.get("ok") and r.get("frames"):
-                frames = r["frames"]
-                clips = r.get("clips") or []
-                if clips and any(not (f or {}).get("jpeg") for f in frames):
-                    await self._fill_frames_from_clips(frames, clips)
-                if any((f or {}).get("kind") == "camera" and not (f or {}).get("jpeg") for f in frames):
-                    await self._maybe_show_for_camera(frames)
-                    try:
-                        r2 = await self._bridge_hot(call, timeout=1.6)
-                        if isinstance(r2, dict) and r2.get("frames"):
-                            frames = r2["frames"]
-                            await self._fill_frames_from_clips(frames, r2.get("clips") or [])
-                    except Exception:
-                        pass
-                self._last_frames = frames
-                self._grab_at = time.monotonic()
-                r["frames"] = frames
-            if time.monotonic() - self._grab_log_at > 5:
-                n = len((r or {}).get("frames") or [])
-                raw = 0
-                for f in (r or {}).get("frames") or []:
-                    raw += len(str((f or {}).get("jpeg") or ""))
-                decky.logger.info(f"video_grab n={n} ms={ms} jpeg_chars={raw}")
-                self._grab_log_at = time.monotonic()
-            if isinstance(r, dict):
-                r["videoEnabled"] = True
-                r["ms"] = ms
-                return r
-            return {"ok": False, "error": "bad response", "frames": self._last_frames}
-
-    async def _fill_frames_from_clips(self, frames: list, clips: list) -> None:
-        if not clips:
-            try:
-                rects = await self._bridge_hot("videoClipRects()", timeout=0.4)
-                if isinstance(rects, dict):
-                    clips = rects.get("clips") or []
-            except Exception:
-                clips = []
-        for i, f in enumerate(frames):
-            if not isinstance(f, dict) or f.get("jpeg"):
-                continue
-            clip = clips[i] if i < len(clips) else (clips[0] if clips else None)
-            if not clip:
-                continue
-            try:
-                shot = await self.cdp.call(
-                    "Page.captureScreenshot",
-                    {
-                        "format": "jpeg",
-                        "quality": 45,
-                        "clip": {
-                            "x": float(clip["x"]),
-                            "y": float(clip["y"]),
-                            "width": float(clip["width"]),
-                            "height": float(clip["height"]),
-                            "scale": 1,
-                        },
-                    },
-                    timeout=1.2,
-                )
-                data = (shot or {}).get("data")
-                if data:
-                    f["jpeg"] = "data:image/jpeg;base64," + data
-                    f["black"] = False
-            except Exception as e:
-                decky.logger.warning(f"clip grab: {e}")
 
     async def get_speaking(self) -> dict[str, Any]:
         try:
@@ -2255,23 +2038,6 @@ class Plugin:
             except Exception as e:
                 return {"ok": False, "ids": [], "error": str(e)}
         return r if isinstance(r, dict) else {"ok": False, "ids": []}
-
-    async def focus_stream(self, user_id: str = "", kind: str = "screenshare", name: str = "", **kwargs: Any) -> dict[str, Any]:
-        uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
-        kind = str(kwargs.get("kind") or kind or "screenshare")
-        name = str(kwargs.get("name") or name or "")
-        r = await self._bridge(f"focusStream({json.dumps(uid)})")
-        if isinstance(r, dict) and r.get("focus"):
-            self._audio_focus = r["focus"]
-        elif isinstance(r, dict) and r.get("ok") and uid:
-            self._audio_focus = {"userId": uid, "saved": (self._audio_focus or {}).get("saved") or {}, "kind": "stream"}
-        decky.logger.info(f"focus_stream {uid} {r if isinstance(r, dict) else ''}")
-        if uid:
-            try:
-                await self.pin_pip(uid, kind, name)
-            except Exception as e:
-                decky.logger.warning(f"auto-pin focused stream: {e}")
-        return self._ok(r)
 
     async def focus_audio(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
         uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
@@ -2590,11 +2356,6 @@ print("reload_plugin sent")
             decky.logger.error(f"update_from_github: {e}")
             self._set_update("error", int(self._update.get("percent") or 0), str(e), ok=False, error=str(e))
 
-    def _write_pip_state(self) -> None:
-        PIP_DIR.mkdir(parents=True, exist_ok=True)
-        pip = dict(self._settings.get("pip") or {})
-        _write_json(PIP_DIR / "state.json", pip)
-
     def _stop_pip_overlay(self) -> None:
         proc = self._pip_proc
         self._pip_proc = None
@@ -2610,15 +2371,11 @@ print("reload_plugin sent")
                 pass
 
     def _overlay_needed(self) -> bool:
-        """GTK overlay is talking-roster only. Video stamps use the WebRTC PiP window."""
+        """GTK overlay draws the who's-talking roster over Game Mode."""
         talk = self._settings.get("talking") or {}
-        talk_on = bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
-        pip = self._settings.get("pip") or {}
-        pip_fallback = bool(pip.get("enabled") and pip.get("userId") and not self._rtc_ok)
-        return talk_on or pip_fallback
+        return bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
 
     def _start_pip_overlay(self) -> None:
-        self._write_pip_state()
         if not self._overlay_needed():
             return
         if not in_game_mode():
@@ -2651,119 +2408,6 @@ print("reload_plugin sent")
     def _stop_overlay_if_idle(self) -> None:
         if not self._overlay_needed():
             self._stop_pip_overlay()
-
-    async def _publish_inbound(self, uid: str = "", kind: str = "", size: str = "") -> dict[str, Any]:
-        self._ensure_webrtc_hub()
-        opts = {
-            "room": "both" if uid else "qam",
-            "userId": uid,
-            "kind": kind,
-            "size": size or "small",
-        }
-        try:
-            r = await self._eval(
-                "window.__deckscord && window.__deckscord.publishInbound(" + json.dumps(opts) + ")",
-                timeout=4.0,
-            )
-            ok = False
-            if isinstance(r, dict) and r.get("ok") is not False:
-                parts = r.get("parts")
-                if isinstance(parts, list) and parts:
-                    for p in parts:
-                        if isinstance(p, dict) and p.get("ok") is not False and int(p.get("n") or 0) > 0:
-                            ok = True
-                            break
-                else:
-                    ok = True
-            self._rtc_ok = bool(ok)
-            return r if isinstance(r, dict) else {"ok": False, "error": str(r)}
-        except Exception as e:
-            self._rtc_ok = False
-            decky.logger.warning(f"publishInbound: {e}")
-            return {"ok": False, "error": str(e)}
-
-    async def _open_pip_viewer(self) -> dict[str, Any]:
-        pip = dict(self._settings.get("pip") or {})
-        geo = _pip_geom(pip)
-        try:
-            r = await self._eval(
-                "window.__deckscord && window.__deckscord.openPipViewer(" + json.dumps(geo) + ")",
-                timeout=3.0,
-            )
-        except Exception as e:
-            r = {"ok": False, "error": str(e)}
-        xid = 0
-        for _ in range(8):
-            await asyncio.sleep(0.12)
-            xid = _find_xwin(PIP_WIN_TITLE)
-            if xid:
-                break
-        if xid:
-            self._pip_xid = xid
-            _set_overlay_xid(xid)
-            env = _overlay_env()
-            try:
-                subprocess.run(
-                    ["xdotool", "windowmove", str(xid), str(geo["x"]), str(geo["y"])],
-                    check=False, timeout=2, env=env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                subprocess.run(
-                    ["xdotool", "windowsize", str(xid), str(geo["w"]), str(geo["h"])],
-                    check=False, timeout=2, env=env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
-            decky.logger.info(f"pip window xid={xid} {geo['w']}x{geo['h']} @ {geo['x']},{geo['y']}")
-        else:
-            decky.logger.warning("pip window not found on X11")
-        return {"ok": bool(xid or (isinstance(r, dict) and r.get("ok"))), "xid": xid, "open": r}
-
-    async def _close_pip_viewer(self) -> None:
-        try:
-            await self._eval("window.__deckscord && window.__deckscord.closePipViewer()")
-        except Exception:
-            pass
-        self._pip_xid = 0
-        self._rtc_ok = False
-
-    async def _pip_grab_once(self) -> None:
-        pip = dict(self._settings.get("pip") or {})
-        uid = str(pip.get("userId") or "")
-        if not uid:
-            return
-        w, h = _pip_dims(str(pip.get("size") or "small"))
-        self._grab_alive_until = time.monotonic() + 8.0
-        if self._last_frames and (time.monotonic() - self._grab_at) < 0.22:
-            r = {"frames": self._last_frames}
-        else:
-            r = await self.get_video_frames(user_id=uid, w=w, h=h)
-        frames = (r or {}).get("frames") or []
-        hit = None
-        kind = str(pip.get("kind") or "")
-        for f in frames:
-            if not isinstance(f, dict):
-                continue
-            if str(f.get("userId") or "") != uid:
-                continue
-            if kind and str(f.get("kind") or "") == kind:
-                hit = f
-                break
-            if hit is None:
-                hit = f
-        jpeg = (hit or {}).get("jpeg") or ""
-        if not jpeg or (hit or {}).get("black"):
-            return
-        raw = jpeg.split(",", 1)[-1]
-        try:
-            data = base64.b64decode(raw)
-        except Exception:
-            return
-        PIP_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = PIP_DIR / "frame.jpg.tmp"
-        tmp.write_bytes(data)
-        tmp.replace(PIP_DIR / "frame.jpg")
 
     def _cache_avatar(self, uid: str, url: str) -> str:
         if not uid:
@@ -2873,9 +2517,7 @@ print("reload_plugin sent")
         pin_at = 0.0
         while True:
             try:
-                pip = self._settings.get("pip") or {}
                 talk = self._settings.get("talking") or {}
-                pip_on = bool(pip.get("enabled") and pip.get("userId"))
                 talk_pref = bool(talk.get("enabled"))
                 now = time.monotonic()
                 pin_iv = 2.0 if self._last_voice_channel else (1.0 if now < self._mic_pin_until else 12.0)
@@ -2896,37 +2538,17 @@ print("reload_plugin sent")
                 elif not talk_pref:
                     self._write_talking_state([], False)
                 talk_on = bool(talk_pref and self._talk_in_voice)
-                if pip_on or self._last_voice_channel:
-                    await self._publish_inbound(
-                        str(pip.get("userId") or "") if pip_on else "",
-                        str(pip.get("kind") or "") if pip_on else "",
-                        str(pip.get("size") or "small"),
-                    )
-                if pip_on:
-                    self._grab_alive_until = time.monotonic() + 8.0
-                    if in_game_mode() and not self._pip_xid:
-                        await self._open_pip_viewer()
-                    elif self._pip_xid:
-                        _set_overlay_xid(self._pip_xid)
-                    if not self._rtc_ok:
-                        await self._pip_grab_once()
-                else:
-                    if self._pip_xid:
-                        await self._close_pip_viewer()
-                if talk_on or (pip_on and not self._rtc_ok):
+                if talk_on:
                     self._start_pip_overlay()
-                    await asyncio.sleep(0.20 if pip_on and not self._rtc_ok else 0.35)
+                    await asyncio.sleep(0.35)
                 else:
                     self._stop_overlay_if_idle()
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.45)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 decky.logger.warning(f"overlay loop: {e}")
                 await asyncio.sleep(1.0)
-
-    def _pip_summary(self) -> dict[str, Any]:
-        return dict(self._settings.get("pip") or {})
 
     async def get_settings(self) -> dict[str, Any]:
         self._settings = _load_settings()
@@ -2947,110 +2569,12 @@ print("reload_plugin sent")
             discord = {"ok": False, "error": str(e)}
         return {
             "ok": True,
-            "pip": self._pip_summary(),
             "talking": dict(self._settings.get("talking") or DEFAULT_SETTINGS["talking"]),
-            "golive": dict(self._settings.get("golive") or DEFAULT_SETTINGS["golive"]),
             "vesktop": vesktop,
             "vesktopState": state,
             "discord": discord,
             "vesktopPath": str(vdir),
         }
-
-    async def set_pip_settings(self, corner: str = "", size: str = "", opacity: Any = None, **kwargs: Any) -> dict[str, Any]:
-        pip = dict(self._settings.get("pip") or {})
-        corner = str(kwargs.get("corner") or corner or pip.get("corner") or "bottom-right")
-        if corner not in ("top-left", "top-right", "bottom-left", "bottom-right"):
-            corner = "bottom-right"
-        size = str(kwargs.get("size") or size or pip.get("size") or "small")
-        if size not in ("small", "large"):
-            size = "small"
-        op = kwargs.get("opacity") if kwargs.get("opacity") is not None else opacity
-        if op is None:
-            op = pip.get("opacity", 100)
-        try:
-            op_n = int(float(op))
-        except (TypeError, ValueError):
-            op_n = 100
-        op_n = max(20, min(100, op_n))
-        pip["corner"] = corner
-        pip["size"] = size
-        pip["opacity"] = op_n
-        self._settings["pip"] = pip
-        _save_settings(self._settings)
-        self._write_pip_state()
-        if pip.get("enabled") and pip.get("userId"):
-            self._start_pip_overlay()
-        return {"ok": True, "pip": pip}
-
-    async def pin_pip(self, user_id: str = "", kind: str = "screenshare", name: str = "", **kwargs: Any) -> dict[str, Any]:
-        if isinstance(user_id, dict):
-            kwargs.update(user_id)
-            user_id = str(kwargs.get("user_id") or kwargs.get("userId") or "")
-        uid = str(user_id or kwargs.get("user_id") or kwargs.get("userId") or "")
-        if not uid:
-            return {"ok": False, "error": "missing user_id"}
-        kind = str(kind or kwargs.get("kind") or "screenshare")
-        name = str(name or kwargs.get("name") or "")
-        try:
-            await self.focus_stream(uid)
-        except Exception as e:
-            decky.logger.warning(f"pin focus: {e}")
-        pip = dict(self._settings.get("pip") or {})
-        pip["enabled"] = True
-        pip["userId"] = uid
-        pip["kind"] = kind
-        pip["name"] = name
-        self._settings["pip"] = pip
-        _save_settings(self._settings)
-        self._write_pip_state()
-        self._grab_alive_until = time.monotonic() + 8.0
-        try:
-            await self._publish_inbound(uid, kind, str(pip.get("size") or "small"))
-        except Exception as e:
-            decky.logger.warning(f"pin publish: {e}")
-        try:
-            await self._open_pip_viewer()
-        except Exception as e:
-            decky.logger.warning(f"pin viewer: {e}")
-        if not self._rtc_ok:
-            try:
-                await self._pip_grab_once()
-            except Exception as e:
-                decky.logger.warning(f"pin grab: {e}")
-            self._start_pip_overlay()
-        return {"ok": True, "pip": pip, "webrtc": self._rtc_ok}
-
-    async def unpin_pip(self) -> dict[str, Any]:
-        pip = dict(self._settings.get("pip") or {})
-        pip["enabled"] = False
-        pip["userId"] = None
-        pip["name"] = ""
-        self._settings["pip"] = pip
-        _save_settings(self._settings)
-        self._write_pip_state()
-        await self._close_pip_viewer()
-        self._stop_overlay_if_idle()
-        return {"ok": True, "pip": pip}
-
-    async def set_golive_quality(self, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
-        h = int(kwargs.get("height") or height or 720)
-        f = int(kwargs.get("fps") or fps or 30)
-        if h not in (720, 1080):
-            h = 720
-        if f not in (15, 30):
-            f = 30
-        w = 1280 if h == 720 else 1920
-        self._settings["golive"] = {"width": w, "height": h, "fps": f}
-        _save_settings(self._settings)
-        vdir = _vesktop_config_dir()
-        state = _read_json(vdir / "state.json")
-        state["screenshareQuality"] = {"resolution": str(h), "frameRate": str(f)}
-        _write_json(vdir / "state.json", state)
-        try:
-            await self._bridge(f"setScreenshareQuality({json.dumps(str(h))}, {json.dumps(str(f))})")
-        except Exception as e:
-            decky.logger.warning(f"screenshareQuality: {e}")
-        return {"ok": True, "golive": self._settings["golive"], "needsRestart": False}
 
     async def set_vesktop_setting(self, key: str = "", value: Any = None, **kwargs: Any) -> dict[str, Any]:
         if isinstance(key, dict):
@@ -3142,7 +2666,7 @@ print("reload_plugin sent")
         live = bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
         speakers = list(self._talk_last.values())[:5] if live else []
         self._write_talking_state(speakers, live)
-        if live or (self._settings.get("pip") or {}).get("enabled"):
+        if live:
             self._start_pip_overlay()
         else:
             self._stop_overlay_if_idle()

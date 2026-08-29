@@ -22,7 +22,7 @@
 
 Official Discord’s Flatpak overlay does not work as a Game Mode companion. Vesktop is a native client with working mic/speakers under PipeWire, Vencord already loaded, and a stable Electron debugger port.
 
-## Chat + calls (current)
+## Chat + voice
 
 `bridge.js` is injected once per CDP session and uses `Vencord.Webpack`:
 
@@ -36,18 +36,16 @@ Official Discord’s Flatpak overlay does not work as a Game Mode companion. Ves
 
 The Python backend is stdlib-only (asyncio + a tiny WebSocket client). No pip packages.
 
+Deckscord is chat, voice, and **outbound Share game**. There is no inbound live-video viewer and no WebRTC hub.
+
+Share game (Game Mode): `portal_shim.py` owns `org.freedesktop.portal.Desktop` and hands Vesktop the gamescope PipeWire node (`OpenPipeWireRemote`). Discord encodes 720p. Steam Game Recording must be off. Do not ask gamescope for a fixed framerate.
+
 ## Persistence
 
 - `systemctl --user enable --now deckscord-vesktop.service`
 - `loginctl enable-linger` so it survives Game Mode / reboot
 - Discord session lives in Vesktop’s Flatpak config
 
-## Live video / PiP
+## Who's talking
 
-QAM live video copies JPEG tiles from Discord’s media engine after `STREAM_WATCH` (the actual Go Live/camera tracks), not from a screenshot of the Vesktop window. Call audio stays in PipeWire. Vesktop stays minimized unless a camera has no pixels yet.
-
-Watch overlay (Switch 2 GameShare *as a spectator*): A on a live tile focuses that stream — game audio only for them, larger JPEG — then a large Watch view. Party mics stay. We do **not** guest-play a game the watcher doesn’t own. See [GAMESHARE.md](GAMESHARE.md).
-
-PiP is a gamescope external-overlay stamp (`plugin/pip_overlay.py`) of those already-decoded frames. The same overlay process draws a who’s-talking roster (avatar + name, speakers only) so gamescope only needs one overlay plane. Overlay is Game Mode only (gamescope Xwayland, input-empty, `GAMESCOPE_EXTERNAL_OVERLAY` before map) so it cannot cover SDDM/KWin or steal the Steam QAM. Settings tree: [SETTINGS.md](SETTINGS.md).
-
-Outbound **Share game** is a different pipe: gamescope’s PipeWire node → ScreenCast portal shim → Discord’s own 720p30 encoder. Documented in [GO_LIVE.md](GO_LIVE.md). Self screenshare is not JPEG-copied back into the QAM.
+An opt-in gamescope overlay (`plugin/pip_overlay.py`) draws avatar + name over the game while that person speaks. Overlay is Game Mode only (gamescope Xwayland, input-empty, `GAMESCOPE_EXTERNAL_OVERLAY` before map) so it cannot cover SDDM/KWin or steal the Steam QAM. Settings tree: [SETTINGS.md](SETTINGS.md).

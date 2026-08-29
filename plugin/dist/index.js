@@ -44,24 +44,17 @@ const selectText = backend("select_text");
 const getMessages = backend("get_messages");
 const sendMessage = backend("send_message");
 const startVesktop = backend("start_vesktop");
-const getVideoFrames = backend("get_video_frames");
 const getSpeaking = backend("get_speaking");
 const focusAudio = backend("focus_audio");
-const focusStream = backend("focus_stream");
 const clearAudioFocus = backend("clear_audio_focus");
 const updateFromGithub = backend("update_from_github");
 const getUpdateStatus = backend("get_update_status");
-const startGoLive = backend("start_go_live");
-const stopGoLive = backend("stop_go_live");
 const getSettings = backend("get_settings");
-const setPipSettings = backend("set_pip_settings");
-const pinPip = backend("pin_pip");
-const unpinPip = backend("unpin_pip");
 const setVesktopSetting = backend("set_vesktop_setting");
 const setDiscordSetting = backend("set_discord_setting");
-const setGoLiveQuality = backend("set_golive_quality");
 const setTalkingSettings = backend("set_talking_settings");
-const setStreamVolume = backend("set_stream_volume");
+const startGoLive = backend("start_go_live");
+const stopGoLive = backend("stop_go_live");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -449,179 +442,6 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outputVolume, mediaStream }) {
-  const [jpeg, setJpeg] = useState(null);
-  const [hint, setHint] = useState("Starting…");
-  const [vol, setVol] = useState(defaultStreamVol(outputVolume));
-  const keepAudio = useRef(false);
-  const bindWatch = (el) => {
-    if (!el) return;
-    if (mediaStream && el.srcObject !== mediaStream) {
-      el.srcObject = mediaStream;
-      try {
-        const p = el.play();
-        if (p && p.catch) p.catch(() => {});
-      } catch (_) {}
-    }
-  };
-  useEffect(() => {
-    let stop = false;
-    (async () => {
-      try {
-        await focusStream(userId, kind || "screenshare", name || "");
-      } catch (_) {}
-      if (mediaStream) {
-        setHint("");
-        return;
-      }
-      while (!stop) {
-        try {
-          const r = await getVideoFrames({ userId: userId, w: 640, h: 360 });
-          const frames = (r && r.frames) || [];
-          const hit =
-            frames.find((f) => f.userId === userId && f.kind === kind) ||
-            frames.find((f) => f.userId === userId);
-          if (hit && hit.jpeg && !hit.black) {
-            setJpeg(hit.jpeg);
-            setHint("");
-          }
-        } catch (_) {}
-        await new Promise((res) => setTimeout(res, 80));
-      }
-    })();
-    return () => {
-      stop = true;
-    };
-  }, [userId, kind, name, mediaStream]);
-  const close = () => {
-    if (onClosed) onClosed();
-    if (closeModal) closeModal();
-  };
-  const pin = () => {
-    keepAudio.current = true;
-    pinPip(userId, kind || "screenshare", name || "")
-      .then(() => {
-        if (onPinned) onPinned();
-        close();
-      })
-      .catch(() => {
-        keepAudio.current = false;
-      });
-  };
-  const Inner = closeModal && DFL.ModalRoot ? DFL.ModalRoot : "div";
-  return e(
-    Inner,
-    {
-      closeModal: close,
-      onCancel: close,
-      onCancelButton: close,
-      bDisableBackgroundDismiss: false,
-      ...cancelBind(close),
-      style: {
-        width: "100%",
-        height: "100%",
-        background: "#000",
-        padding: 0,
-        margin: 0,
-      },
-    },
-    [
-      mediaStream
-        ? e("video", {
-            key: "rtc",
-            autoPlay: true,
-            muted: true,
-            playsInline: true,
-            ref: bindWatch,
-            style: {
-              width: "100%",
-              height: "100%",
-              maxHeight: "90vh",
-              objectFit: "contain",
-              display: "block",
-              background: "#000",
-            },
-          })
-        : jpeg
-        ? e("img", {
-            key: "v",
-            src: jpeg,
-            alt: "",
-            style: {
-              width: "100%",
-              height: "100%",
-              maxHeight: "90vh",
-              objectFit: "contain",
-              display: "block",
-              background: "#000",
-            },
-          })
-        : e(
-            "div",
-            {
-              key: "ph",
-              style: {
-                width: "100%",
-                minHeight: 240,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "#ccc",
-              },
-            },
-            hint || "Waiting for video…"
-          ),
-      e(
-        "div",
-        {
-          key: "cap",
-          style: {
-            position: "absolute",
-            left: 12,
-            bottom: 12,
-            color: "#fff",
-            fontSize: 14,
-            textShadow: "0 1px 4px #000",
-            pointerEvents: "none",
-          },
-        },
-        (name || "Stream") + " · B to close"
-      ),
-      e(
-        DFL.PanelSectionRow,
-        { key: "svol" },
-        e(DFL.SliderField, {
-          label: "Stream volume",
-          value: vol,
-          min: 0,
-          max: 200,
-          step: 5,
-          showValue: true,
-          valueSuffix: "%",
-          onChange: (v) => {
-            setVol(v);
-            setStreamVolume(v).catch(() => {});
-          },
-          ...cancelBind(close),
-        })
-      ),
-      e(
-        DFL.PanelSectionRow,
-        { key: "pin" },
-        e(
-          DFL.ButtonItem,
-          {
-            layout: "below",
-            onClick: pin,
-            ...cancelBind(close),
-          },
-          "Pin to corner"
-        )
-      ),
-    ]
-  );
-}
-
 function MediaOverlay({ item, kind, outputVolume, closeModal, onClosed }) {
   const [volPct, setVolPct] = useState(defaultStreamVol(outputVolume));
   const close = () => {
@@ -724,262 +544,6 @@ function MediaOverlay({ item, kind, outputVolume, closeModal, onClosed }) {
   );
 }
 
-function VideoTile({ stream, focused, jpeg, speaking, pinned, mediaStream, onOpenMember, onWatch }) {
-  const onCancel = useContext(BackNav);
-  const go = () => {
-    if (stream.self) {
-      if (onOpenMember) onOpenMember(stream);
-      return;
-    }
-    if (onWatch) onWatch(stream);
-  };
-  const bindVideo = (el) => {
-    if (!el) return;
-    if (mediaStream && el.srcObject !== mediaStream) {
-      el.srcObject = mediaStream;
-      try {
-        const p = el.play();
-        if (p && p.catch) p.catch(() => {});
-      } catch (_) {}
-    }
-  };
-  return e(
-    Focusable,
-    {
-      className: cx(fieldClass(), "deckscord-tile"),
-      onActivate: go,
-      onOKButton: go,
-      onClick: go,
-      ...cancelBind(onCancel),
-      style: {
-        ...FILL,
-        position: "relative",
-        aspectRatio: "16 / 9",
-        padding: 0,
-        margin: "0 0 6px",
-        overflow: "hidden",
-        background: "#000",
-        border: focused ? "3px solid #3ba55d" : "3px solid transparent",
-        boxShadow: focused
-          ? "inset 0 0 0 2px #3ba55d"
-          : speaking
-            ? "inset 0 0 0 2px rgba(59,165,93,0.7)"
-            : undefined,
-      },
-    },
-    [
-      mediaStream
-        ? e("video", {
-            key: "vid",
-            autoPlay: true,
-            muted: true,
-            playsInline: true,
-            ref: bindVideo,
-            style: {
-              width: "100%",
-              height: "100%",
-              objectFit: "contain",
-              display: "block",
-              background: "#000",
-            },
-          })
-        : jpeg
-        ? e("img", {
-            key: "img",
-            src: jpeg,
-            alt: "",
-            style: {
-              width: "100%",
-              height: "100%",
-              objectFit: "contain",
-              display: "block",
-              background: "#000",
-            },
-          })
-        : e("div", {
-            key: "ph",
-            style: {
-              width: "100%",
-              height: "100%",
-              minHeight: 0,
-              aspectRatio: "16 / 9",
-              background: "rgba(0,0,0,0.55)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              opacity: 0.85,
-            },
-          }, e(Avatar, { src: stream.avatar, name: stream.name, size: 48, radius: 24 })),
-      e("div", {
-        key: "scrim",
-        style: {
-          position: "absolute",
-          top: 0,
-          left: 0,
-          width: 48,
-          height: 48,
-          pointerEvents: "none",
-          background: "linear-gradient(135deg, rgba(0,0,0,0.45) 0%, transparent 70%)",
-        },
-      }),
-      e(
-        "div",
-        { key: "av", style: { position: "absolute", top: 6, left: 6, pointerEvents: "none", opacity: 0.88 } },
-        e(Avatar, { src: stream.avatar, name: stream.name, size: 22, radius: 11 })
-      ),
-      e(
-        "div",
-        {
-          key: "kind",
-          style: { position: "absolute", top: 6, right: 6, pointerEvents: "none", fontSize: 14, opacity: 0.75 },
-        },
-        pinned ? "📌" : stream.kind === "screenshare" ? "🖥" : "📷"
-      ),
-      (focused || speaking) &&
-        e(
-          "div",
-          {
-            key: "pill",
-            style: {
-              position: "absolute",
-              right: 6,
-              bottom: 6,
-              pointerEvents: "none",
-              background: "rgba(0,0,0,0.55)",
-              borderRadius: 4,
-              padding: "3px 5px",
-              color: speaking ? "#3ba55d" : "#8fbc9a",
-              fontSize: 14,
-              fontWeight: 700,
-              textShadow: speaking ? "0 0 8px #3ba55d" : "none",
-            },
-          },
-          "🔊"
-        ),
-    ]
-  );
-}
-
-function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onOpenMember, onWatch, onMore, onPin, onStop, onUnpin, streamVolume, onStreamVolume }) {
-  const onCancel = useContext(BackNav);
-  const list = streams || [];
-  const copied = list.slice(0, max);
-  const extra = Math.max(0, list.length - copied.length);
-  const byKey = {};
-  (frames || []).forEach((f) => {
-    byKey[f.userId + ":" + (f.kind || "camera")] = f;
-  });
-  if (!copied.length) return null;
-  const focusedStream =
-    copied.find((x) => x.userId === focusedUserId) ||
-    copied.find((x) => x.userId === pinnedUserId) || {
-      userId: focusedUserId || pinnedUserId,
-      kind: "screenshare",
-      name: "",
-    };
-  const watching = !!(focusedUserId || pinnedUserId);
-  const actions = [];
-  if (watching) {
-    actions.push(
-      e(
-        DFL.PanelSectionRow,
-        { key: "stop" },
-        e(
-          DFL.ButtonItem,
-          {
-            layout: "below",
-            description: pinnedUserId ? "Unpin and stop" : "Stop",
-            onClick: onStop,
-            ...cancelBind(onCancel),
-          },
-          "Stop watching"
-        )
-      )
-    );
-    if (onStreamVolume) {
-      actions.push(
-        e(
-          DFL.PanelSectionRow,
-          { key: "svol" },
-          e(DFL.SliderField, {
-            label: "Stream volume",
-            value: streamVolume == null ? 30 : streamVolume,
-            min: 0,
-            max: 200,
-            step: 5,
-            showValue: true,
-            valueSuffix: "%",
-            onChange: onStreamVolume,
-            ...cancelBind(onCancel),
-          })
-        )
-      );
-    }
-  }
-  if (pinnedUserId && onUnpin) {
-    actions.push(
-      e(
-        DFL.PanelSectionRow,
-        { key: "unpin" },
-        e(
-          DFL.ButtonItem,
-          {
-            layout: "below",
-            description: "Keep listening",
-            onClick: onUnpin,
-            ...cancelBind(onCancel),
-          },
-          "Unpin from corner"
-        )
-      )
-    );
-  } else if (focusedUserId && onPin) {
-    actions.push(
-      e(
-        DFL.PanelSectionRow,
-        { key: "pin" },
-        e(
-          DFL.ButtonItem,
-          {
-            layout: "below",
-            description: "Stay on screen after QAM closes",
-            onClick: () => onPin(focusedStream),
-            ...cancelBind(onCancel),
-          },
-          "Pin to corner"
-        )
-      )
-    );
-  }
-  return e(
-    "div",
-    { style: { ...FILL, padding: 0, margin: "0 0 8px" } },
-    copied
-      .map((s) => {
-        const fr = byKey[s.userId + ":" + s.kind] || {};
-        return e(VideoTile, {
-          key: s.userId + s.kind,
-          stream: s,
-          focused: !s.self && focusedUserId === s.userId,
-          jpeg: fr.black ? null : fr.jpeg,
-          mediaStream: s.mediaStream || fr.mediaStream || null,
-          speaking: !!(speakingIds && speakingIds[s.userId]),
-          pinned: pinnedUserId === s.userId,
-          onOpenMember,
-          onWatch,
-        });
-      })
-      .concat(
-        extra
-          ? [
-              e(Row, { key: "more", onClick: onMore }, e(Label, null, "+" + extra + " more videos")),
-            ]
-          : []
-      )
-      .concat(actions)
-  );
-}
-
 function cycle(list, cur) {
   const i = Math.max(0, list.indexOf(cur));
   return list[(i + 1) % list.length];
@@ -987,12 +551,10 @@ function cycle(list, cur) {
 
 function SettingsHub({ push, handleCancel }) {
   const items = [
-    { page: "settings_pip", title: "Picture in picture", sub: "Corner, stamp size, opacity" },
     { page: "settings_talk", title: "Who's talking", sub: "Names over the game while someone speaks" },
     { page: "settings_voice", title: "Discord · Voice", sub: "Mute, devices, echo / noise" },
-    { page: "settings_golive", title: "Discord · Go Live", sub: "Resolution and frame rate" },
     { page: "settings_vesktop_perf", title: "Vesktop · Performance", sub: "Hardware acceleration" },
-    { page: "settings_vesktop_audio", title: "Vesktop · Linux audio", sub: "Venmic / screenshare capture" },
+    { page: "settings_vesktop_audio", title: "Vesktop · Linux audio", sub: "Venmic capture flags" },
     { page: "settings_vesktop_app", title: "Vesktop · App", sub: "Branch, tray, Rich Presence" },
   ];
   return e(
@@ -1054,19 +616,15 @@ function App() {
   const [draft, setDraft] = useState("");
   const [tick, setTick] = useState(0);
   const [volLocal, setVolLocal] = useState({});
-  const [frames, setFrames] = useState([]);
   const [speakingIds, setSpeakingIds] = useState({});
   const [updateProg, setUpdateProg] = useState(null);
   const [cfg, setCfg] = useState(null);
-  const [shareLocal, setShareLocal] = useState(null);
-  const [rtcMap, setRtcMap] = useState({});
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const cancelLock = useRef(0);
   const modalOpen = useRef(false);
   const msgCache = useRef({});
   const volTimer = useRef(null);
-  const grabBusy = useRef(false);
   const reloadOnce = useRef(false);
 
   const view = stack[stack.length - 1] || { page: "home" };
@@ -1212,109 +770,6 @@ function App() {
     };
   }, [chatId, status && status.ready]);
 
-  const videoOn = !!(status && status.videoEnabled && status.voice && status.voice.hasVideo);
-  const streamCount = ((status && status.voice && status.voice.streams) || []).length;
-  const webrtcUrl = (status && status.webrtc && status.webrtc.url) || "http://127.0.0.1:18765";
-  const rtcLive = Object.keys(rtcMap).length > 0;
-  useEffect(() => {
-    if (!videoOn) {
-      setFrames([]);
-      return;
-    }
-    let stop = false;
-    const pull = async () => {
-      if (grabBusy.current || stop) return;
-      grabBusy.current = true;
-      try {
-        const r = await getVideoFrames();
-        if (!stop && r && r.frames) setFrames(r.frames);
-      } catch (_) {}
-      grabBusy.current = false;
-    };
-    pull();
-    const ms = rtcLive ? 2000 : streamCount <= 1 ? 90 : streamCount === 2 ? 110 : 140;
-    const id = setInterval(pull, ms);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
-  }, [videoOn, streamCount, rtcLive, status && status.voice && status.voice.focusedUserId]);
-
-  useEffect(() => {
-    if (!videoOn || typeof RTCPeerConnection === "undefined") {
-      setRtcMap({});
-      return;
-    }
-    let stop = false;
-    let pc = null;
-    let appliedGen = -1;
-    let iceN = 0;
-    const api = async (path, body) => {
-      const opt = { headers: { "Content-Type": "application/json" } };
-      if (body !== undefined) {
-        opt.method = "POST";
-        opt.body = JSON.stringify(body);
-      }
-      const r = await fetch(webrtcUrl + path, opt);
-      return r.json();
-    };
-    const loop = async () => {
-      while (!stop) {
-        try {
-          const off = await api("/room/qam/offer");
-          if (off && off.sdp && off.gen !== appliedGen) {
-            if (pc) {
-              try { pc.close(); } catch (_) {}
-            }
-            pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
-            pc.ontrack = (ev) => {
-              const mid = ev.transceiver && ev.transceiver.mid;
-              const tracks = off.tracks || [];
-              const hit =
-                tracks.find((t) => String(t.mid) === String(mid)) ||
-                tracks[Math.max(0, (ev.transceiver && ev.transceiver.mid) ? 0 : 0)] ||
-                tracks[0];
-              const ms = (ev.streams && ev.streams[0]) || new MediaStream(ev.track ? [ev.track] : []);
-              const key = hit ? hit.userId + ":" + (hit.kind || "screenshare") : "x:screenshare";
-              setRtcMap((prev) => {
-                const next = { ...prev, [key]: ms };
-                if (hit && hit.userId) next[hit.userId] = ms;
-                return next;
-              });
-            };
-            pc.onicecandidate = (ev) => {
-              if (!ev.candidate) return;
-              api("/room/qam/ice/sub", {
-                candidate: ev.candidate.candidate,
-                sdpMid: ev.candidate.sdpMid,
-                sdpMLineIndex: ev.candidate.sdpMLineIndex,
-              }).catch(() => {});
-            };
-            await pc.setRemoteDescription({ type: "offer", sdp: off.sdp });
-            const ans = await pc.createAnswer();
-            await pc.setLocalDescription(ans);
-            await api("/room/qam/answer", { sdp: ans.sdp });
-            appliedGen = off.gen;
-            iceN = 0;
-          }
-          if (pc) {
-            const ice = await api("/room/qam/ice/pub?n=" + iceN);
-            (ice.candidates || []).forEach((c) => {
-              if (c && c.candidate) pc.addIceCandidate(c).catch(() => {});
-            });
-            iceN = ice.n || iceN;
-          }
-        } catch (_) {}
-        await new Promise((res) => setTimeout(res, 280));
-      }
-      try { if (pc) pc.close(); } catch (_) {}
-    };
-    loop();
-    return () => {
-      stop = true;
-    };
-  }, [videoOn, webrtcUrl]);
-
   const inVoice = !!(status && status.ready && status.voice && status.voice.channelId);
   useEffect(() => {
     if (!inVoice) {
@@ -1340,16 +795,6 @@ function App() {
       clearInterval(id);
     };
   }, [inVoice]);
-
-  const streamFlag = !!(status && (status.streaming || (status.stream && status.stream.active) || (status.voice && status.voice.streaming)));
-  useEffect(() => {
-    setShareLocal((cur) => {
-      if (cur == null) return cur;
-      if (cur === true && streamFlag) return null;
-      if (cur === false && !streamFlag) return null;
-      return cur;
-    });
-  }, [streamFlag]);
 
   const onSettingsPage = String(view.page || "").indexOf("settings") === 0;
   useEffect(() => {
@@ -1468,7 +913,7 @@ function App() {
           DFL.ButtonItem,
           {
             layout: "below",
-            description: "PiP, Discord voice, Vesktop",
+            description: "Voice, overlay, Vesktop",
             onClick: openSettings,
             ...cancelBind(handleCancel),
           },
@@ -1559,19 +1004,7 @@ function App() {
     volLocal.output != null ? volLocal.output : devices.outputVolume != null ? devices.outputVolume : 100;
   const inVol = volLocal.input != null ? volLocal.input : devices.inputVolume != null ? devices.inputVolume : 100;
 
-  const videoEnabled = !!(status && status.videoEnabled);
-  const hasVideo = !!(voice && voice.hasVideo);
-  const liveStreams = ((voice && voice.streams) || []).map((s) => ({
-    ...s,
-    mediaStream: rtcMap[s.userId + ":" + (s.kind || "screenshare")] || rtcMap[s.userId] || null,
-  }));
   const focusedUserId = (voice && voice.focusedUserId) || null;
-  const streamVol =
-    volLocal.stream != null
-      ? volLocal.stream
-      : voice && voice.streamVolume != null
-        ? voice.streamVolume
-        : defaultStreamVol(outVol);
   const closeOverlay = () => {
     modalOpen.current = false;
     cancelLock.current = Date.now();
@@ -1592,88 +1025,9 @@ function App() {
       push({ page: "media", item: payload.item, kind: payload.kind || "image", title: (payload.item && payload.item.name) || "Media" });
     }
   };
-  const showLiveVideo = videoEnabled && hasVideo;
-  const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
-  const pip = (status && status.pip) || (cfg && cfg.pip) || {};
-  const pipOn = !!(pip.enabled && pip.userId);
   const talking = (status && status.talking) || (cfg && cfg.talking) || {};
   const talkingOn = !!talking.enabled;
-  const onWatchStream = (s) => {
-    tap(() =>
-      act("Watch", () => focusStream(s.userId, s.kind || "screenshare", s.name || ""), { quiet: true })
-    );
-    if (typeof DFL.showModal === "function") {
-      modalOpen.current = true;
-      DFL.showModal(
-        e(WatchOverlay, {
-          userId: s.userId,
-          name: s.name,
-          kind: s.kind || "screenshare",
-          outputVolume: outVol,
-          mediaStream: rtcMap[s.userId + ":" + (s.kind || "screenshare")] || rtcMap[s.userId] || s.mediaStream || null,
-          onPinned: () => refresh(),
-          onClosed: closeOverlay,
-        })
-      );
-    } else {
-      push({ page: "watch", userId: s.userId, kind: s.kind || "screenshare", title: s.name || "Watch" });
-    }
-  };
-  const onPinStream = (s) => {
-    if (!s || !s.userId) return;
-    tap(() =>
-      act("Pin", () => pinPip(s.userId, s.kind || "screenshare", s.name || ""), { quiet: false })
-    );
-  };
-  const onUnpinStream = () => tap(() => act("Unpin", () => unpinPip()));
-  const onStopWatch = () =>
-    tap(() =>
-      act("Stop watching", async () => {
-        if (pipOn) await unpinPip();
-        await clearAudioFocus();
-      })
-    );
-  const onTileMember = (s) => {
-    const m = memberById(s.userId) || { id: s.userId, name: s.name, avatar: s.avatar, self: !!s.self };
-    openMember(m);
-  };
-
-  const streaming = streamFlag || !!(voice && voice.streaming);
-  const shareOn = shareLocal == null ? streaming : shareLocal;
-  const sharePending = !!(status && status.stream && status.stream.pending) || (shareOn && !streaming);
-  const gl = (status && status.golive) || (cfg && cfg.golive) || {};
-  const shareQual = (Number(gl.height) === 1080 ? "1080p" : "720p") + " " + String(gl.fps || 30);
   const compactVoice = [
-    voice
-      ? e(
-          DFL.PanelSectionRow,
-          { key: "share" },
-          e(DFL.ToggleField, {
-            label: "Share game",
-            description: shareOn ? (sharePending ? "Starting…" : "Live · " + shareQual) : shareQual,
-            checked: shareOn,
-            onChange: () =>
-              tap(() => {
-                if (shareOn) {
-                  setShareLocal(false);
-                  act("Stop share", () => stopGoLive());
-                } else {
-                  setShareLocal(true);
-                  act("Share game", async () => {
-                    const r = await startGoLive(
-                      (cfg && cfg.golive && cfg.golive.width) || 1280,
-                      (cfg && cfg.golive && cfg.golive.height) || 720,
-                      (cfg && cfg.golive && cfg.golive.fps) || 30
-                    );
-                    if (r && r.ok === false) setShareLocal(false);
-                    return r;
-                  });
-                }
-              }),
-            ...cancelBind(handleCancel),
-          })
-        )
-      : null,
     voice
       ? e(
           DFL.PanelSectionRow,
@@ -1687,25 +1041,36 @@ function App() {
           })
         )
       : null,
-    pipOn
-      ? e(
-          DFL.PanelSectionRow,
-          { key: "unpin" },
-          e(
-            DFL.ButtonItem,
-            {
-              layout: "below",
-              description: (pip.name || "Stream") + " · " + (pip.size || "small") + " · " + (pip.corner || "bottom-right"),
-              onClick: () => tap(() => act("Unpin", () => unpinPip())),
-              ...cancelBind(handleCancel),
-            },
-            "Unpin PiP"
-          )
-        )
-      : null,
     voice
       ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
       : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
+    voice
+      ? e(
+          DFL.PanelSectionRow,
+          { key: "share" },
+          e(DFL.ButtonItem, {
+            layout: "below",
+            onClick: () =>
+              tap(() => {
+                const live = !!(status && (status.streaming || (status.golive && status.golive.active)));
+                const rec = !!(status && status.game_recording);
+                if (live) return act("Stop sharing", () => stopGoLive());
+                if (rec) {
+                  return act("Share game", async () => {
+                    throw new Error("Turn off Steam Game Recording first (Settings → Game Recording).");
+                  });
+                }
+                const gl = (status && status.golive) || {};
+                return act("Share game", () => startGoLive(gl.width || 1280, gl.height || 720, gl.fps || 30));
+              }),
+            ...cancelBind(handleCancel),
+          }, !!(status && (status.streaming || (status.golive && status.golive.active)))
+            ? "Stop sharing"
+            : status && status.game_recording
+            ? "Share game (recording on)"
+            : "Share game · 720p")
+        )
+      : null,
     e(
       DFL.PanelSectionRow,
       { key: "mute" },
@@ -1762,11 +1127,7 @@ function App() {
     ),
     e(DFL.PanelSectionRow, { key: "dev" }, e(DFL.ButtonItem, { layout: "below", onClick: openDevices, ...cancelBind(handleCancel) }, "Input / output devices")),
   ];
-  const videoUserIds = {};
-  liveStreams.forEach((s) => {
-    videoUserIds[s.userId] = true;
-  });
-  const listMembers = ((voice && voice.members) || []).filter((m) => !showLiveVideo || !videoUserIds[m.id]);
+  const listMembers = (voice && voice.members) || [];
   const memberRows = listMembers.map((m) => {
     const talking = !!(speakingIds[m.id] || m.speaking);
     return e(
@@ -1810,36 +1171,13 @@ function App() {
       ]
     );
   });
-  const videoStack = showLiveVideo
-    ? e(VideoStack, {
-        key: "vids",
-        streams: liveStreams,
-        frames,
-        focusedUserId,
-        speakingIds,
-        pinnedUserId: pipOn ? pip.userId : null,
-        max: 3,
-        onOpenMember: onTileMember,
-        onWatch: onWatchStream,
-        onMore: openVideoPage,
-        onPin: onPinStream,
-        onStop: onStopWatch,
-        onUnpin: onUnpinStream,
-        streamVolume: streamVol,
-        onStreamVolume: (v) => slideVol("stream", v, () => setStreamVolume(v)),
-      })
-    : null;
-
   const showVoicePanel =
     ready &&
     view.page !== "chat" &&
     view.page !== "member" &&
-    view.page !== "video" &&
-    view.page !== "watch" &&
     view.page !== "media" &&
     String(view.page || "").indexOf("settings") !== 0;
   const people = [];
-  if (showLiveVideo && view.page !== "devices" && videoStack) people.push(videoStack);
   if (memberRows.length) people.push.apply(people, memberRows);
   const voiceKids = people.concat(compactVoice).concat(sliderRows);
   const voiceSection =
@@ -2065,12 +1403,6 @@ function App() {
           msgList
         ),
         e("div", { key: "compose", style: FILL }, composer),
-        showLiveVideo &&
-          e(
-            DFL.PanelSectionRow,
-            { key: "live" },
-            e(DFL.ButtonItem, { layout: "below", onClick: openVideoPage, ...cancelBind(handleCancel) }, "Live video (" + liveStreams.length + ")")
-          ),
         voice &&
           e(
             DFL.PanelSectionRow,
@@ -2217,44 +1549,6 @@ function App() {
         ),
       view.self && e(DFL.PanelSectionRow, { key: "self" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "This is you. Use Mute / Deafen in Voice.")),
     ]);
-  } else if (view.page === "video") {
-    body = e(DFL.PanelSection, { title: voice ? "Live · " + voice.name : "Live video" }, [
-      e(VideoStack, {
-        key: "vids",
-        streams: liveStreams,
-        frames,
-        focusedUserId,
-        speakingIds,
-        pinnedUserId: pipOn ? pip.userId : null,
-        max: 4,
-        onOpenMember: onTileMember,
-        onWatch: onWatchStream,
-        onPin: onPinStream,
-        onStop: onStopWatch,
-        onUnpin: onUnpinStream,
-        streamVolume: streamVol,
-        onStreamVolume: (v) => slideVol("stream", v, () => setStreamVolume(v)),
-      }),
-    ].concat(compactVoice));
-  } else if (view.page === "watch") {
-    const ws = liveStreams.find((s) => s.userId === view.userId) || { userId: view.userId, name: view.title, kind: view.kind };
-    body = e(
-      "div",
-      { style: { ...FILL, background: "#000", position: "relative", minHeight: 240 } },
-      [
-        e(WatchOverlay, {
-          userId: view.userId,
-          name: ws.name || view.title,
-          kind: ws.kind || view.kind || "screenshare",
-          outputVolume: outVol,
-          mediaStream: ws.mediaStream || rtcMap[view.userId] || null,
-          onPinned: () => {
-            refresh();
-            back();
-          },
-        }),
-      ]
-    );
   } else if (view.page === "media") {
     body = e(MediaOverlay, { item: view.item, kind: view.kind || "image", outputVolume: outVol });
   } else if (view.page === "settings") {
@@ -2263,8 +1557,6 @@ function App() {
     const ves = (cfg && cfg.vesktop) || {};
     const audio = ves.audio || {};
     const disc = (cfg && cfg.discord) || {};
-    const golive = (cfg && cfg.golive) || { height: 720, fps: 30 };
-    const pipCfg = (cfg && cfg.pip) || pip || {};
     const talkCfg = (cfg && cfg.talking) || talking || {};
     const reload = () =>
       getSettings()
@@ -2285,7 +1577,7 @@ function App() {
         return r;
       });
     let kids = [];
-    if (view.page === "settings_pip") {
+    if (view.page === "settings_talk") {
       kids = [
         e(
           DFL.PanelSectionRow,
@@ -2293,94 +1585,7 @@ function App() {
           e(
             "div",
             { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
-            "Pin a live tile to a corner over the game. Small is 240p, large is 480p, both clamped to the screen height so a Deck and a 4K TV stay usable. Opacity is compositor alpha — no extra encode."
-          )
-        ),
-        e(
-          CycleRow,
-          {
-            key: "sz",
-            label: "Stamp size",
-            value: pipCfg.size || "small",
-            options: [
-              { value: "small", label: "Small · 240p" },
-              { value: "large", label: "Large · 480p" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("PiP", async () => {
-                const r = await setPipSettings(pipCfg.corner, v, pipCfg.opacity);
-                await reload();
-                return r;
-              }),
-          }
-        ),
-        e(
-          CycleRow,
-          {
-            key: "cr",
-            label: "Corner",
-            value: pipCfg.corner || "bottom-right",
-            options: [
-              { value: "top-left", label: "Top left" },
-              { value: "top-right", label: "Top right" },
-              { value: "bottom-left", label: "Bottom left" },
-              { value: "bottom-right", label: "Bottom right" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("PiP", async () => {
-                const r = await setPipSettings(v, pipCfg.size, pipCfg.opacity);
-                await reload();
-                return r;
-              }),
-          }
-        ),
-        e(
-          DFL.PanelSectionRow,
-          { key: "op" },
-          e(DFL.SliderField, {
-            label: "Opacity",
-            value: pipCfg.opacity != null ? pipCfg.opacity : 100,
-            min: 20,
-            max: 100,
-            step: 5,
-            showValue: true,
-            valueSuffix: "%",
-            onChange: (v) =>
-              slideVol("pipop", v, () => setPipSettings(pipCfg.corner, pipCfg.size, v).then(reload)),
-            ...cancelBind(handleCancel),
-          })
-        ),
-        pipOn
-          ? e(
-              DFL.PanelSectionRow,
-              { key: "un" },
-              e(
-                DFL.ButtonItem,
-                {
-                  layout: "below",
-                  onClick: () => tap(() => act("Unpin", () => unpinPip().then(reload))),
-                  ...cancelBind(handleCancel),
-                },
-                "Unpin " + (pipCfg.name || "stream")
-              )
-            )
-          : e(
-              DFL.PanelSectionRow,
-              { key: "n" },
-              e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Focus a live tile, then Pin. The stamp stays after you close the QAM.")
-            ),
-      ];
-    } else if (view.page === "settings_talk") {
-      kids = [
-        e(
-          DFL.PanelSectionRow,
-          { key: "h" },
-          e(
-            "div",
-            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
-            "While you are in a call, a name and avatar appear over the game only when that person is speaking. Nothing is drawn when the channel is quiet. Same cheap overlay plane as PiP — no extra video encode."
+            "While you are in a call, a name and avatar appear over the game only when that person is speaking. Nothing is drawn when the channel is quiet."
           )
         ),
         e(ToggleRow, {
@@ -2546,47 +1751,6 @@ function App() {
           handleCancel,
         }),
       ];
-    } else if (view.page === "settings_golive") {
-      kids = [
-        e(
-          CycleRow,
-          {
-            key: "res",
-            label: "Resolution",
-            value: String(golive.height || 720),
-            options: [
-              { value: "720", label: "720p" },
-              { value: "1080", label: "1080p" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("Go Live", async () => {
-                const r = await setGoLiveQuality(Number(v), golive.fps || 30);
-                await reload();
-                return r;
-              }),
-          }
-        ),
-        e(
-          CycleRow,
-          {
-            key: "fps",
-            label: "Frame rate",
-            value: String(golive.fps || 30),
-            options: [
-              { value: "15", label: "15 fps" },
-              { value: "30", label: "30 fps" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("Go Live", async () => {
-                const r = await setGoLiveQuality(golive.height || 720, Number(v));
-                await reload();
-                return r;
-              }),
-          }
-        ),
-      ];
     } else if (view.page === "settings_vesktop_perf") {
       kids = [
         e(
@@ -2605,7 +1769,7 @@ function App() {
         e(ToggleRow, {
           key: "hva",
           label: "Video hardware acceleration",
-          description: "Helps screenshare; can glitch streams",
+          description: "Chromium video decode — restart Vesktop",
           checked: !!ves.hardwareVideoAcceleration,
           onChange: (v) => setVk("hardwareVideoAcceleration", v),
           handleCancel,
@@ -2626,13 +1790,13 @@ function App() {
           e(
             "div",
             { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
-            "Vesktop venmic flags for Linux screenshare audio. Deckscord still refuses speaker-monitor as the voice mic."
+            "Vesktop venmic flags. Deckscord still refuses speaker-monitor as the voice mic."
           )
         ),
         e(ToggleRow, {
           key: "w",
           label: "Microphone workaround",
-          description: "Only if share sends mic instead of game audio",
+          description: "Venmic workaround",
           checked: !!audio.workaround,
           onChange: (v) => setVk("audio.workaround", v),
           handleCancel,
@@ -2640,7 +1804,7 @@ function App() {
         e(ToggleRow, {
           key: "iim",
           label: "Ignore input media",
-          description: "Do not capture microphones into the share",
+          description: "Do not treat microphones as capture sources",
           checked: audio.ignoreInputMedia !== false,
           onChange: (v) => setVk("audio.ignoreInputMedia", v),
           handleCancel,

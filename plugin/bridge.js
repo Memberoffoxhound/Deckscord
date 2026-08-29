@@ -219,8 +219,6 @@
       self: id === meId,
       volume: volume,
       localMute: localMute,
-      selfVideo: !!(st && (st.selfVideo || st.self_video)),
-      selfStream: !!(st && (st.selfStream || st.self_stream)),
       speaking: isUserSpeaking(id, meId),
     };
   }
@@ -297,9 +295,7 @@
     };
   }
 
-  var SINK_ID = "deckscord-qam";
   window.__deckscordAudioFocus = window.__deckscordAudioFocus || { userId: null, saved: {} };
-  window.__deckscordVideo = window.__deckscordVideo || { canvases: {}, sinks: false, els: {}, watched: {}, held: {} };
 
   function eachMediaConnection(fn) {
     var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
@@ -356,860 +352,38 @@
     return "noop";
   }
 
-  function setStreamVolume(userId, vol) {
-    var fn = findFn("setLocalVolume");
-    if (!fn) return false;
-    var n = Number(vol);
-    if (isNaN(n)) n = 0;
-    if (n < 0) n = 0;
-    if (n > 200) n = 200;
-    try {
-      fn(String(userId), n, "stream");
-      return true;
-    } catch (e1) {
-      try {
-        fn(String(userId), n, { type: "stream" });
-        return true;
-      } catch (e2) {
-        return false;
-      }
-    }
+  function voiceInputForbiddenName(n) {
+    n = String(n || "").toLowerCase();
+    if (!n || n === "default" || n === "communications") return true;
+    return (
+      n.indexOf("monitor") !== -1 ||
+      n.indexOf("loopback") !== -1 ||
+      n.indexOf("stereo mix") !== -1 ||
+      n.indexOf("vencord-screen-share") !== -1 ||
+      n.indexOf("venmic") !== -1 ||
+      n.indexOf("what-u-hear") !== -1 ||
+      n.indexOf("screen-share") !== -1 ||
+      n.indexOf("screenshare") !== -1 ||
+      n.indexOf("screen share") !== -1 ||
+      n.indexOf("audio share") !== -1 ||
+      n.indexOf("share audio") !== -1 ||
+      n.indexOf("desktop audio") !== -1 ||
+      n.indexOf("system audio") !== -1 ||
+      n.indexOf("entire system") !== -1 ||
+      n.indexOf("chromium") !== -1 ||
+      n.indexOf("chrome") !== -1
+    );
   }
 
-  function outputVolumeNow() {
-    try {
-      var MES = store("MediaEngineStore") || byProps("getOutputVolume", "isSelfMute");
-      if (MES && typeof MES.getOutputVolume === "function") {
-        var n = Number(MES.getOutputVolume());
-        if (!isNaN(n) && n > 0) return n;
-      }
-    } catch (e) {}
-    return 100;
+  function isForbiddenVoice(d) {
+    return voiceInputForbiddenName((d && (d.name || d.label || d.id)) || "");
   }
 
-  function defaultStreamVolume() {
-    var n = Math.round(outputVolumeNow() * 0.3);
-    if (n < 1) n = 1;
-    if (n > 200) n = 200;
-    return n;
-  }
-
-  function muteAllStreamAudioExcept(keepId, vol) {
-    var bag = collectStreams();
-    var ok = false;
-    var focusVol = typeof vol === "number" ? vol : defaultStreamVolume();
-    if (keepId) {
-      window.__deckscordAudioFocus = window.__deckscordAudioFocus || { userId: null, saved: {} };
-      window.__deckscordAudioFocus.streamVolume = focusVol;
-    }
-    (bag.streams || []).forEach(function (s) {
-      if (s.self) return;
-      var v = keepId && s.userId === String(keepId) ? focusVol : 0;
-      if (setStreamVolume(s.userId, v)) ok = true;
-    });
-    (bag.members || []).forEach(function (m) {
-      if (m.self) return;
-      if (keepId && m.id === String(keepId)) return;
-      setStreamVolume(m.id, 0);
-    });
-    return ok;
-  }
-
-  function collectStreams() {
-    var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
-    var ChannelStore = store("ChannelStore") || byProps("getChannel", "getDMFromUserId");
-    var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
-    var VoiceStateStore = store("VoiceStateStore") || byProps("getVoiceStateForUser", "getVoiceStatesForChannel");
-    var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
-    var me = UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser();
-    var meId = me && String(me.id);
-    var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
-    if (!cid) return { channelId: null, guildId: null, meId: meId, members: [], streams: [] };
-    var vc = ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(cid);
-    var guildId = vc ? (vc.guild_id || vc.guildId || null) : null;
-    var members = voiceMembersFor(cid, UserStore, VoiceStateStore, meId, MediaEngineStore);
-    var streams = [];
-    var seen = {};
-    function isSnowflake(id) {
-      return /^\d{5,}$/.test(String(id || ""));
-    }
-    function add(userId, kind, streamId) {
-      userId = String(userId || "");
-      if (!isSnowflake(userId)) return;
-      kind = kind === "screenshare" || kind === "stream" ? "screenshare" : "camera";
-      var key = userId + ":" + kind;
-      if (seen[key]) return;
-      seen[key] = true;
-      var m = null;
-      for (var i = 0; i < members.length; i++) if (members[i].id === userId) m = members[i];
-      var u = UserStore && UserStore.getUser && UserStore.getUser(userId);
-      var name = (m && m.name) || (u && (u.globalName || u.username)) || "";
-      if (!name || name.length < 2) return;
-      var streamKey = null;
-      if (kind === "screenshare" && cid) {
-        streamKey = guildId
-          ? "guild:" + guildId + ":" + cid + ":" + userId
-          : "call:" + cid + ":" + userId;
-      }
-      streams.push({
-        userId: userId,
-        kind: kind,
-        name: name,
-        avatar: (m && m.avatar) || avatarFromUser(u, 48),
-        self: !!(m && m.self) || userId === meId,
-        streamId: String(streamId || streamKey || userId),
-        streamKey: streamKey,
-        guildId: guildId && String(guildId),
-        channelId: String(cid),
-      });
-    }
-    members.forEach(function (m) {
-      if (m.selfVideo) add(m.id, "camera", m.id);
-      if (m.selfStream) add(m.id, "screenshare", m.id);
-    });
-    var rtc = store("ChannelRTCStore");
-    function idFrom(p, fallback) {
-      if (p == null) return fallback;
-      if (typeof p === "string" || typeof p === "number") return p;
-      return (p.userId || p.user_id || (p.user && p.user.id) || (isSnowflake(p.id) ? p.id : null) || fallback);
-    }
-    function walkParticipants(bag, kind) {
-      if (!bag) return;
-      if (typeof bag.forEach === "function" && typeof bag !== "string") {
-        try {
-          bag.forEach(function (p, k) {
-            add(idFrom(p, k), kind, p && p.streamId);
-          });
-          return;
-        } catch (eWalk) {}
-      }
-      if (Array.isArray(bag)) {
-        bag.forEach(function (p) { add(idFrom(p), kind, p && p.streamId); });
-        return;
-      }
-      if (typeof bag === "object") {
-        if (bag.userId || (bag.user && bag.user.id) || isSnowflake(bag.id)) {
-          add(idFrom(bag), kind, bag.streamId);
-          return;
-        }
-        Object.keys(bag).forEach(function (id) {
-          if (!isSnowflake(id) && typeof bag[id] !== "object") return;
-          add(idFrom(bag[id], id), kind, bag[id] && bag[id].streamId);
-        });
-      }
-    }
-    try {
-      if (rtc && typeof rtc.getVideoParticipants === "function") {
-        var vp = rtc.getVideoParticipants(cid);
-        if (vp == null) vp = rtc.getVideoParticipants();
-        walkParticipants(vp, "camera");
-      }
-      if (rtc && typeof rtc.getStreamParticipants === "function") {
-        var sp = rtc.getStreamParticipants(cid);
-        if (sp == null) sp = rtc.getStreamParticipants();
-        walkParticipants(sp, "screenshare");
-      }
-    } catch (eRtc) {}
-    var App = store("ApplicationStreamingStore") || byProps("getAllApplicationStreamsForChannel");
-    function takeAppStreams(list) {
-      if (!list) return;
-      var arr = Array.isArray(list) ? list : Object.keys(list).map(function (k) { return list[k]; });
-      arr.forEach(function (s) {
-        if (!s || s.state === "ENDED") return;
-        var oid = s.ownerId || s.owner_id || (s.user && s.user.id);
-        if (oid) add(String(oid), "screenshare", streamKeyOf(s) || s.id || oid);
-      });
-    }
-    try {
-      if (App && App.getAllActiveStreamsForChannel) takeAppStreams(App.getAllActiveStreamsForChannel(cid));
-    } catch (eAct) {}
-    try {
-      if (App && App.getAllApplicationStreamsForChannel) takeAppStreams(App.getAllApplicationStreamsForChannel(cid));
-    } catch (eApp) {}
-    streams.sort(function (a, b) {
-      if (a.self !== b.self) return a.self ? 1 : -1;
-      if (a.kind !== b.kind) return a.kind === "camera" ? -1 : 1;
-      return 0;
-    });
-    return { channelId: String(cid), guildId: guildId && String(guildId), meId: meId, members: members, streams: streams };
-  }
-
-  function streamKeyOf(s) {
-    if (!s) return null;
-    if (s.streamKey) return s.streamKey;
-    var owner = s.ownerId || s.owner_id || s.userId;
-    var channelId = s.channelId || s.channel_id;
-    var guildId = s.guildId || s.guild_id;
-    if (!owner || !channelId) return null;
-    return guildId
-      ? "guild:" + guildId + ":" + channelId + ":" + owner
-      : "call:" + channelId + ":" + owner;
-  }
-
-  function applicationStreamFor(userId, channelId) {
-    var ASS = store("ApplicationStreamingStore") || byProps("getAllApplicationStreamsForChannel");
-    if (!ASS || !channelId) return null;
-    var lists = [];
-    try {
-      if (ASS.getAllActiveStreamsForChannel) lists.push(ASS.getAllActiveStreamsForChannel(channelId) || []);
-    } catch (e1) {}
-    try {
-      if (ASS.getAllApplicationStreamsForChannel) lists.push(ASS.getAllApplicationStreamsForChannel(channelId) || []);
-    } catch (e2) {}
-    for (var i = 0; i < lists.length; i++) {
-      var list = lists[i];
-      var arr = Array.isArray(list) ? list : [];
-      for (var j = 0; j < arr.length; j++) {
-        var st = arr[j];
-        if (!st || st.state === "ENDED") continue;
-        var oid = st.ownerId || st.owner_id || st.userId;
-        if (String(oid) === String(userId)) return st;
-      }
-    }
-    return null;
-  }
-
-  function watchScreenShare(s) {
-    if (!s || s.self) return false;
-    var key = streamKeyOf(s);
-    if (!key) return false;
-    var ASS = store("ApplicationStreamingStore") || byProps("getViewerIds", "getAllApplicationStreamsForChannel");
-    var me = store("UserStore") && store("UserStore").getCurrentUser && store("UserStore").getCurrentUser();
-    var myId = me && String(me.id);
-    try {
-      var viewers = ASS && ASS.getViewerIds && ASS.getViewerIds(key);
-      if (viewers && myId && viewers.indexOf && viewers.indexOf(myId) !== -1) return true;
-    } catch (eV) {}
-    var watch = findByCode('"STREAM_WATCH",streamKey') || findByCode('"STREAM_WATCH"');
-    if (!watch) return false;
-    var payload = applicationStreamFor(s.userId, s.channelId) || {
-      ownerId: s.userId || s.ownerId,
-      userId: s.userId || s.ownerId,
-      channelId: s.channelId,
-      guildId: s.guildId || null,
-      state: "ACTIVE",
-    };
-    try {
-      watch(payload, { forceMultiple: true, noFocus: true });
-      window.__deckscordVideo.watched[key] = true;
-      return true;
-    } catch (e1) {
-      try {
-        watch(key, { forceMultiple: true, noFocus: true });
-        window.__deckscordVideo.watched[key] = true;
-        return true;
-      } catch (e2) {
-        return false;
-      }
-    }
-  }
-
-  function unwatchScreenShare(key) {
-    if (!key || !window.__deckscordVideo.watched[key]) return;
-    delete window.__deckscordVideo.watched[key];
-    var close = findByCode('"STREAM_CLOSE",streamKey') || findByCode('"STREAM_CLOSE"');
-    if (!close) return;
-    try { close(key); } catch (e) {}
-  }
-
-  function findPeerConnection(conn) {
-    if (!conn) return null;
-    if (conn.pc && typeof conn.pc.getReceivers === "function") return conn.pc;
-    try {
-      var keys = Object.keys(conn);
-      for (var i = 0; i < keys.length; i++) {
-        var v = conn[keys[i]];
-        if (v && typeof v === "object" && typeof v.getReceivers === "function") return v;
-      }
-    } catch (e) {}
-    return null;
-  }
-
-  function videoTracksFor(userId) {
-    var out = [];
-    var seen = {};
-    userId = String(userId || "");
-    eachMediaConnection(function (c) {
-      if (!c) return;
-      var pc = findPeerConnection(c);
-      if (!pc) return;
-      var ctx = c.context || c.connectionContext || "";
-      var isScreen = (ctx === "stream" || ctx === "Stream") && String(c.streamUserId || c.userId || "") === userId;
-      var isVoice = !ctx || ctx === "default" || ctx === "Default";
-      if (!isScreen && !isVoice) return;
-      var recs = [];
-      try { recs = pc.getReceivers() || []; } catch (eR) { return; }
-      recs.forEach(function (r) {
-        var t = r && r.track;
-        if (!t || t.kind !== "video") return;
-        if (t.readyState === "ended") return;
-        if (seen[t.id]) return;
-        if (isScreen) {
-          seen[t.id] = true;
-          out.push({ track: t, kind: "screenshare" });
-          return;
-        }
-        var owner = (c.trackUserIds && c.trackUserIds[t.id]) || (c.streamUserId);
-        if (String(owner || "") === userId) {
-          seen[t.id] = true;
-          out.push({ track: t, kind: "camera" });
-        }
-      });
-    });
-    return out;
-  }
-
-  function hiddenVideo(key) {
-    window.__deckscordVideo.els = window.__deckscordVideo.els || {};
-    var el = window.__deckscordVideo.els[key];
-    if (!el) {
-      el = document.createElement("video");
-      el.muted = true;
-      el.autoplay = true;
-      el.playsInline = true;
-      el.setAttribute("playsinline", "true");
-      el.style.cssText = "position:fixed;left:-9999px;top:0;width:640px;height:360px;opacity:0;pointer-events:none";
-      (document.body || document.documentElement).appendChild(el);
-      window.__deckscordVideo.els[key] = el;
-    }
-    return el;
-  }
-
-  function attachTrack(key, track) {
-    if (!track) return null;
-    var el = hiddenVideo(key);
-    var cur = el.srcObject;
-    var same = cur && typeof cur.getVideoTracks === "function" && cur.getVideoTracks()[0] === track;
-    if (!same) {
-      el.srcObject = new MediaStream([track]);
-      try { var p = el.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
-    }
-    return el;
-  }
-
-  function grabCanvas(w, h, key) {
-    var bag = window.__deckscordVideo.works || (window.__deckscordVideo.works = {});
-    var k = key || "_jpeg";
-    var c = bag[k];
-    if (!c) {
-      c = document.createElement("canvas");
-      bag[k] = c;
-    }
-    w = w || 400;
-    h = h || Math.round(w * 9 / 16);
-    if (c.width !== w) c.width = w;
-    if (c.height !== h) c.height = h;
-    return c;
-  }
-
-  function drawContain(ctx, src, dw, dh) {
-    var sw = src.videoWidth || src.width || dw;
-    var sh = src.videoHeight || src.height || dh;
-    if (!sw || !sh) return false;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, dw, dh);
-    var scale = Math.min(dw / sw, dh / sh);
-    var w = Math.max(1, sw * scale);
-    var h = Math.max(1, sh * scale);
-    ctx.drawImage(src, (dw - w) / 2, (dh - h) / 2, w, h);
+  function isRealMic(d) {
+    if (!d || isForbiddenVoice(d)) return false;
+    var n = String((d.name || d.label || d.id) || "").toLowerCase();
+    if (n.indexOf("deckscord") !== -1 && n.indexOf("silent") !== -1) return false;
     return true;
-  }
-
-  function canvasFromFrame(frame, w, h, key) {
-    var c = grabCanvas(w, h, key || "_frame");
-    var ctx = c.getContext("2d");
-    try {
-      if (!frame) return c;
-      if (frame instanceof HTMLCanvasElement || (frame.tagName && String(frame.tagName).toLowerCase() === "canvas")) {
-        drawContain(ctx, frame, c.width, c.height);
-      } else if (frame instanceof HTMLVideoElement || (frame.videoWidth && frame.readyState)) {
-        drawContain(ctx, frame, c.width, c.height);
-      } else if (frame.data && frame.width) {
-        var tmp = document.createElement("canvas");
-        tmp.width = frame.width;
-        tmp.height = frame.height;
-        tmp.getContext("2d").putImageData(frame, 0, 0);
-        drawContain(ctx, tmp, c.width, c.height);
-      } else if (frame.imageData) {
-        return canvasFromFrame(frame.imageData, w, h, key);
-      }
-    } catch (e) {}
-    return c;
-  }
-
-  function lumaBlack(canvas) {
-    try {
-      var s = window.__deckscordVideo.luma;
-      if (!s) {
-        s = document.createElement("canvas");
-        s.width = 8;
-        s.height = 8;
-        window.__deckscordVideo.luma = s;
-      }
-      var ctx = s.getContext("2d");
-      ctx.drawImage(canvas, 0, 0, 8, 8);
-      var d = ctx.getImageData(0, 0, 8, 8).data;
-      var sum = 0;
-      var n = 0;
-      for (var i = 0; i < d.length; i += 4) {
-        sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
-        n++;
-      }
-      return n ? sum / n < 8 : true;
-    } catch (e) {
-      return true;
-    }
-  }
-
-  function jpegFromCanvas(canvas, q) {
-    try {
-      return canvas.toDataURL("image/jpeg", q);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function rememberFrame(key, frame) {
-    var c = canvasFromFrame(frame, 400, 225, key);
-    window.__deckscordVideo.canvases[key] = c;
-  }
-
-  function paintElementToJpeg(el, q, dw, dh) {
-    if (!el) return null;
-    try {
-      var w = el.videoWidth || el.width || 0;
-      var h = el.videoHeight || el.height || 0;
-      if (w < 16 || h < 16) return null;
-      if (w === 240 && h === 240) return null;
-      dw = dw || 400;
-      dh = dh || Math.round(dw * 9 / 16);
-      var c = grabCanvas(dw, dh);
-      if (!drawContain(c.getContext("2d"), el, dw, dh)) return null;
-      if (lumaBlack(c)) return null;
-      return jpegFromCanvas(c, q || 0.42);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function jpegFromEngineTrack(s, big, dw, dh) {
-    var tracks = videoTracksFor(s.userId);
-    var want = s.kind === "screenshare" ? "screenshare" : "camera";
-    var hit = null;
-    for (var i = 0; i < tracks.length; i++) {
-      if (tracks[i].kind === want) { hit = tracks[i]; break; }
-    }
-    if (!hit && s.kind === "screenshare" && tracks.length) hit = tracks[0];
-    if (!hit) return null;
-    var el = attachTrack(s.userId + ":" + s.kind, hit.track);
-    dw = dw || 400;
-    dh = dh || Math.round(dw * 9 / 16);
-    var q = dw >= 640 ? 0.52 : s.kind === "screenshare" ? 0.5 : 0.42;
-    return paintElementToJpeg(el, q, dw, dh);
-  }
-
-  function hubUrl() {
-    return String(window.__deckscordHub || "http://127.0.0.1:18765").replace(/\/$/, "");
-  }
-
-  function hubFetch(path, body, isBuf) {
-    var url = hubUrl() + path;
-    var opt = { method: body === undefined && !isBuf ? "GET" : "POST" };
-    if (isBuf) {
-      opt.body = body;
-      opt.headers = { "Content-Type": "image/jpeg" };
-    } else if (body !== undefined) {
-      opt.body = JSON.stringify(body);
-      opt.headers = { "Content-Type": "application/json" };
-    }
-    return fetch(url, opt).then(function (r) {
-      if (isBuf) return { ok: r.ok };
-      return r.json();
-    }).catch(function () { return { ok: false }; });
-  }
-
-  var RTC = window.__deckscordRtc || (window.__deckscordRtc = { rooms: {}, popups: {} });
-
-  function trackForStream(s) {
-    var tracks = videoTracksFor(s.userId);
-    var want = s.kind === "screenshare" ? "screenshare" : "camera";
-    var hit = null;
-    for (var i = 0; i < tracks.length; i++) {
-      if (tracks[i].kind === want) { hit = tracks[i]; break; }
-    }
-    if (!hit && tracks.length) hit = tracks[0];
-    if (hit) return hit.track;
-    var el = window.__deckscordVideo.els && window.__deckscordVideo.els[s.userId + ":" + s.kind];
-    if (el && el.srcObject && el.srcObject.getVideoTracks) {
-      var vt = el.srcObject.getVideoTracks()[0];
-      if (vt) return vt;
-    }
-    var c = window.__deckscordVideo.canvases[s.userId + ":" + s.kind];
-    if (c && typeof c.captureStream === "function") {
-      try {
-        var ms = c.captureStream(30);
-        var ct = ms && ms.getVideoTracks && ms.getVideoTracks()[0];
-        if (ct) return ct;
-      } catch (eCap) {}
-    }
-    return null;
-  }
-
-  function capSender(sender, fps, w) {
-    if (!sender || typeof sender.setParameters !== "function") return;
-    try {
-      var p = sender.getParameters() || {};
-      p.degradationPreference = "maintain-framerate";
-      p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
-      p.encodings[0].maxFramerate = fps || 30;
-      p.encodings[0].maxBitrate = w >= 800 ? 900000 : 450000;
-      if (w && w <= 480) p.encodings[0].scaleResolutionDownBy = 1;
-      sender.setParameters(p).catch(function () {});
-    } catch (eP) {}
-  }
-
-  function stopRoom(name) {
-    var st = RTC.rooms[name];
-    if (!st) return;
-    try { if (st.timer) clearTimeout(st.timer); } catch (eT) {}
-    try { if (st.pc) st.pc.close(); } catch (eC) {}
-    delete RTC.rooms[name];
-  }
-
-  function publishRoom(name, streams, fps, width) {
-    fps = fps || 30;
-    width = width || 426;
-    var keys = streams.map(function (s) { return s.userId + ":" + s.kind; }).join(",");
-    var st = RTC.rooms[name];
-    if (st && st.keys === keys && st.pc && st.pc.connectionState !== "closed" && st.pc.connectionState !== "failed") {
-      return { ok: true, room: name, reused: true, n: streams.length };
-    }
-    stopRoom(name);
-    if (!streams.length) return { ok: true, room: name, n: 0 };
-    var pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
-    st = { pc: pc, keys: keys, iceN: 0, gen: 0, timer: 0 };
-    RTC.rooms[name] = st;
-    var meta = [];
-    streams.forEach(function (s, i) {
-      jpegFromEngineTrack(s, width >= 640, width, Math.round(width * 9 / 16));
-      var track = trackForStream(s);
-      if (!track) return;
-      try { track.contentHint = s.kind === "screenshare" ? "motion" : "motion"; } catch (eH) {}
-      var sender = pc.addTrack(track, new MediaStream([track]));
-      capSender(sender, fps, width);
-      meta.push({
-        userId: s.userId,
-        kind: s.kind,
-        name: s.name || "",
-        order: i,
-        mid: (pc.getTransceivers()[meta.length] && pc.getTransceivers()[meta.length].mid) || String(i),
-      });
-    });
-    if (!meta.length) {
-      stopRoom(name);
-      return { ok: false, error: "no inbound video tracks", room: name };
-    }
-    pc.onicecandidate = function (ev) {
-      if (!ev.candidate) return;
-      hubFetch("/room/" + name + "/ice/pub", {
-        candidate: ev.candidate.candidate,
-        sdpMid: ev.candidate.sdpMid,
-        sdpMLineIndex: ev.candidate.sdpMLineIndex,
-      });
-    };
-    function poll() {
-      if (RTC.rooms[name] !== st) return;
-      st.timer = setTimeout(poll, 250);
-      var dead = pc.connectionState === "failed" || pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected";
-      if (dead) {
-        stopRoom(name);
-        return;
-      }
-      hubFetch("/room/" + name + "/answer").then(function (ans) {
-        if (!ans || !ans.sdp || st.applied === ans.sdp) return;
-        if (!pc.currentRemoteDescription) {
-          pc.setRemoteDescription({ type: "answer", sdp: ans.sdp }).then(function () {
-            st.applied = ans.sdp;
-          }).catch(function () {});
-          return;
-        }
-        if (ans.sdp !== st.applied) {
-          stopRoom(name);
-        }
-      });
-      hubFetch("/room/" + name + "/ice/sub?n=" + st.iceN).then(function (ice) {
-        (ice && ice.candidates || []).forEach(function (c) {
-          if (c && c.candidate) pc.addIceCandidate(c).catch(function () {});
-        });
-        if (ice && typeof ice.n === "number") st.iceN = ice.n;
-      });
-    }
-    return pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false }).then(function (off) {
-      return pc.setLocalDescription(off).then(function () {
-        var sdp = (pc.localDescription && pc.localDescription.sdp) || off.sdp;
-        var trans = pc.getTransceivers() || [];
-        trans.forEach(function (tr, i) {
-          if (meta[i]) meta[i].mid = tr.mid || meta[i].mid;
-        });
-        return hubFetch("/room/" + name + "/offer", { sdp: sdp, tracks: meta });
-      });
-    }).then(function () {
-      poll();
-      return { ok: true, room: name, n: meta.length, tracks: meta, fps: fps };
-    }).catch(function (e) {
-      stopRoom(name);
-      return err(e);
-    });
-  }
-
-  function publishInbound(opts) {
-    opts = opts || {};
-    try { ensureVideoSinks(true); } catch (eS) {}
-    var bag = collectStreams();
-    var all = (bag.streams || []).filter(function (s) { return !(s.self && s.kind === "screenshare"); });
-    var uid = opts.userId ? String(opts.userId) : "";
-    var kind = opts.kind ? String(opts.kind) : "";
-    var pipList = all;
-    if (uid) {
-      pipList = all.filter(function (s) {
-        if (s.userId !== uid) return false;
-        if (kind && s.kind !== kind) return false;
-        return true;
-      });
-      if (!pipList.length) pipList = all.filter(function (s) { return s.userId === uid; });
-      pipList = pipList.slice(0, 1);
-    }
-    var qamList = all.slice(0, 4);
-    var jobs = [];
-    if (opts.room === "qam" || opts.room === "both" || !opts.room) {
-      jobs.push(publishRoom("qam", qamList, 30, 400));
-    }
-    if (opts.room === "pip" || opts.room === "both" || uid) {
-      var size = String(opts.size || "small");
-      var w = size === "large" ? 854 : 426;
-      jobs.push(publishRoom("pip", pipList, 30, w));
-    }
-    return Promise.all(jobs).then(function (parts) {
-      return { ok: true, parts: parts, hub: hubUrl() };
-    });
-  }
-
-  function openPipViewer(opts) {
-    opts = opts || {};
-    var w = Number(opts.w) || 426;
-    var h = Number(opts.h) || 240;
-    var x = Number(opts.x) || 0;
-    var y = Number(opts.y) || 0;
-    var url = hubUrl() + "/pip.html?room=pip&t=" + Date.now();
-    var feat = "popup=yes,menubar=no,toolbar=no,location=no,status=no,scrollbars=no,resizable=no,width="
-      + w + ",height=" + h + ",left=" + x + ",top=" + y;
-    try {
-      var existing = RTC.popups.pip;
-      if (existing && !existing.closed) {
-        existing.resizeTo(w, h);
-        try { existing.moveTo(x, y); } catch (eM) {}
-        return { ok: true, reused: true, url: url };
-      }
-    } catch (eR) {}
-    var win = window.open(url, "deckscord-pip", feat);
-    RTC.popups.pip = win;
-    return { ok: !!win, url: url, w: w, h: h };
-  }
-
-  function closePipViewer() {
-    try {
-      if (RTC.popups.pip && !RTC.popups.pip.closed) RTC.popups.pip.close();
-    } catch (eC) {}
-    RTC.popups.pip = null;
-    stopRoom("pip");
-    return { ok: true };
-  }
-
-  function startFramePump() {
-    var bag = window.__deckscordVideo;
-    if (bag.pump) return;
-    bag.jpegs = bag.jpegs || {};
-    function tick() {
-      var rtcOn = !!(RTC.rooms.pip || RTC.rooms.qam);
-      bag.pump = setTimeout(tick, rtcOn ? 900 : 120);
-      try {
-        var live = collectStreams();
-        var list = (live.streams || []).filter(function (s) {
-          return !(s.self && s.kind === "screenshare");
-        }).slice(0, 4);
-        if (!list.length) return;
-        var focus = (window.__deckscordAudioFocus && window.__deckscordAudioFocus.userId) || "";
-        list.forEach(function (s) {
-          var key = s.userId + ":" + s.kind;
-          var big = !!(focus && s.userId === String(focus));
-          var dw = rtcOn ? 320 : (big ? 640 : 400);
-          var dh = Math.round(dw * 9 / 16);
-          var c = window.__deckscordVideo.canvases[key];
-          var jpeg = bag.jpegs[key] || null;
-          if (!rtcOn || !jpeg) {
-            var liveJ = jpegFromEngineTrack(s, big && !rtcOn, dw, dh);
-            if (liveJ) jpeg = liveJ;
-          }
-          if (!jpeg && c && !lumaBlack(c)) jpeg = jpegFromCanvas(c, 0.4);
-          if (jpeg) {
-            bag.jpegs[key] = jpeg;
-            bag.jpegs[key + ":w"] = dw;
-            bag.jpegs[key + ":h"] = dh;
-          }
-          if (c && typeof c.toBlob === "function") {
-            try {
-              c.toBlob(function (blob) {
-                if (!blob) return;
-                hubFetch("/frame/" + encodeURIComponent(key), blob, true);
-              }, "image/jpeg", 0.45);
-            } catch (eB) {}
-          }
-        });
-      } catch (eP) {}
-    }
-    tick();
-  }
-
-  function stopFramePump() {
-    var bag = window.__deckscordVideo;
-    if (bag.pump) {
-      clearTimeout(bag.pump);
-      bag.pump = 0;
-    }
-  }
-
-  function cameraStreamId(userId) {
-    try {
-      var rtc = store("RTCConnectionStore") || byProps("getRTCConnection");
-      var rc = rtc && rtc.getRTCConnection && rtc.getRTCConnection();
-      var mgr = rc && rc._localMediaSinkWantsManager;
-      if (mgr && mgr.streamIds && mgr.streamIds[userId] != null) return mgr.streamIds[userId];
-    } catch (e) {}
-    return null;
-  }
-
-  function holdCameraSink(userId, enable) {
-    var want = [];
-    if (enable) {
-      var sid = cameraStreamId(userId);
-      if (sid != null) want.push(sid);
-      want.push(String(userId));
-    }
-    var prev = window.__deckscordVideo.held[userId] || [];
-    eachMediaConnection(function (c) {
-      if (!c || typeof c.setHasActiveVideoOutputSink !== "function") return;
-      want.forEach(function (id) {
-        try { c.setHasActiveVideoOutputSink(id, !!enable, SINK_ID); } catch (e1) {}
-      });
-      if (!enable) {
-        prev.forEach(function (id) {
-          try { c.setHasActiveVideoOutputSink(id, false, SINK_ID); } catch (e2) {}
-        });
-      }
-    });
-    if (enable) window.__deckscordVideo.held[userId] = want;
-    else delete window.__deckscordVideo.held[userId];
-  }
-
-  function videoClipRects() {
-    return [];
-  }
-
-  function ensureVideoSinks(enable) {
-    var bag = collectStreams();
-    var add = findEngineFn("addVideoOutputSink") || findEngineFn("addDirectVideoOutputSink");
-    var remove = findEngineFn("removeVideoOutputSink");
-    var keep = findEngineFn("setHasActiveVideoOutputSink");
-    var watched = window.__deckscordVideo.watched || {};
-    var liveKeys = {};
-    bag.streams.forEach(function (s) {
-      if (enable && s.kind === "screenshare" && !s.self) watchScreenShare(s);
-      if (s.streamKey) liveKeys[s.streamKey] = true;
-      var key = s.userId + ":" + s.kind;
-      var sid = s.kind === "screenshare" ? (s.streamKey || s.streamId) : (s.streamId || s.userId);
-      try {
-        if (enable && add) {
-          add(SINK_ID, sid, function (frame) { rememberFrame(key, frame); });
-        }
-      } catch (e1) {
-        try {
-          if (enable && add) add(sid, function (frame) { rememberFrame(key, frame); });
-        } catch (e2) {}
-      }
-      try {
-        if (!enable && remove) remove(SINK_ID, sid);
-      } catch (e3) {}
-      try {
-        if (keep) keep(sid, !!enable, SINK_ID);
-      } catch (e4) {}
-      try {
-        if (keep && sid !== s.userId) keep(s.userId, !!enable, SINK_ID);
-      } catch (e5) {}
-      holdCameraSink(s.userId, !!enable && s.kind === "camera");
-      if (enable) jpegFromEngineTrack(s);
-    });
-    if (!enable) {
-      Object.keys(watched).forEach(function (k) { unwatchScreenShare(k); });
-    } else {
-      Object.keys(watched).forEach(function (k) {
-        if (!liveKeys[k]) unwatchScreenShare(k);
-      });
-    }
-    window.__deckscordVideo.sinks = !!enable;
-    if (enable) startFramePump();
-    else stopFramePump();
-    return { ok: true, enabled: !!enable, n: bag.streams.length, hasAdd: !!add, watched: Object.keys(window.__deckscordVideo.watched || {}) };
-  }
-
-  function urlToDataJpeg(url) {
-    if (!url || String(url).indexOf("http") !== 0) return Promise.resolve(null);
-    return fetch(String(url), { credentials: "include" }).then(function (r) {
-      if (!r || !r.ok) return null;
-      return r.blob();
-    }).then(function (blob) {
-      if (!blob) return null;
-      return new Promise(function (resolve) {
-        var fr = new FileReader();
-        fr.onload = function () { resolve(fr.result); };
-        fr.onerror = function () { resolve(null); };
-        fr.readAsDataURL(blob);
-      });
-    }).catch(function () { return null; });
-  }
-
-  function previewJpegFor(guildId, channelId, ownerId) {
-    var Prev = store("ApplicationStreamPreviewStore") || byProps("getPreviewURL");
-    var getter = Prev && (Prev.getPreviewURL || Prev.getPreviewUrl);
-    var fetcher =
-      findFn("fetchStreamPreview") ||
-      findFn("fetchPreview") ||
-      (byProps("fetchStreamPreview") && byProps("fetchStreamPreview").fetchStreamPreview) ||
-      (byProps("fetchPreview") && byProps("fetchPreview").fetchPreview);
-    var kick = Promise.resolve();
-    if (fetcher) {
-      try {
-        kick = Promise.resolve(fetcher(String(guildId), String(channelId), String(ownerId))).catch(function () {});
-      } catch (eKick) {
-        kick = Promise.resolve();
-      }
-    }
-    return kick.then(function () {
-      var p = null;
-      if (getter) {
-        try { p = getter.call(Prev, String(guildId), String(channelId), String(ownerId)); } catch (e1) {}
-      }
-      return Promise.resolve(p);
-    }).then(function (url) {
-      if (url && typeof url === "object") url = url.url || url.previewURL || url.previewUrl || null;
-      if (url) return urlToDataJpeg(url);
-      var Rest = common("RestAPI") || byProps("get", "post", "put");
-      var key = String(guildId) + ":" + String(channelId) + ":" + String(ownerId);
-      if (!Rest || !Rest.get) return null;
-      return Promise.resolve(Rest.get({ url: "/streams/" + encodeURIComponent(key) + "/preview" })).then(function (res) {
-        var u = res && (res.body && (res.body.url || res.body.preview_url) || res.url);
-        return urlToDataJpeg(u);
-      }).catch(function () { return null; });
-    }).catch(function () { return null; });
   }
 
   var GO_LIVE = {
@@ -1253,40 +427,6 @@
       if (MES && MES.getGoLiveSource && MES.getGoLiveSource()) return { source: "media-engine" };
     } catch (e2) {}
     return null;
-  }
-
-  function voiceInputForbiddenName(n) {
-    n = String(n || "").toLowerCase();
-    if (!n || n === "default" || n === "communications") return true;
-    return (
-      n.indexOf("monitor") !== -1 ||
-      n.indexOf("loopback") !== -1 ||
-      n.indexOf("stereo mix") !== -1 ||
-      n.indexOf("vencord-screen-share") !== -1 ||
-      n.indexOf("venmic") !== -1 ||
-      n.indexOf("what-u-hear") !== -1 ||
-      n.indexOf("screen-share") !== -1 ||
-      n.indexOf("screenshare") !== -1 ||
-      n.indexOf("screen share") !== -1 ||
-      n.indexOf("audio share") !== -1 ||
-      n.indexOf("share audio") !== -1 ||
-      n.indexOf("desktop audio") !== -1 ||
-      n.indexOf("system audio") !== -1 ||
-      n.indexOf("entire system") !== -1 ||
-      n.indexOf("chromium") !== -1 ||
-      n.indexOf("chrome") !== -1
-    );
-  }
-
-  function isForbiddenVoice(d) {
-    return voiceInputForbiddenName((d && (d.name || d.label || d.id)) || "");
-  }
-
-  function isRealMic(d) {
-    if (!d || isForbiddenVoice(d)) return false;
-    var n = String((d.name || d.label || d.id) || "").toLowerCase();
-    if (n.indexOf("deckscord") !== -1 && n.indexOf("silent") !== -1) return false;
-    return true;
   }
 
   function clickSharePicker() {
@@ -1488,29 +628,19 @@
         if (voiceChannelId && ChannelStore) {
           var vc = ChannelStore.getChannel(voiceChannelId);
           var members = voiceMembersFor(voiceChannelId, UserStore, VoiceStateStore, me.id, MediaEngineStore);
-          var bag = collectStreams();
-          try {
-            (bag.streams || []).forEach(function (s) {
-              if (s && s.kind === "screenshare" && !s.self) watchScreenShare(s);
-            });
-          } catch (eWatch) {}
           var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
           if (af.userId && String(voiceChannelId) !== String(window.__deckscordLastVoice || voiceChannelId)) {
             try { window.__deckscord && window.__deckscord.clearAudioFocus && window.__deckscord.clearAudioFocus(); } catch (eClr) {}
             af = window.__deckscordAudioFocus || { userId: null, saved: {} };
           }
           window.__deckscordLastVoice = String(voiceChannelId);
-          var mine = currentStream();
           voice = {
             channelId: String(voiceChannelId),
             name: vc ? vc.name : String(voiceChannelId),
             guildId: vc ? (vc.guild_id || vc.guildId || null) : null,
             members: members,
-            hasVideo: !!(bag.streams && bag.streams.length),
             focusedUserId: (af && af.userId) || null,
-            streamVolume: typeof af.streamVolume === "number" ? af.streamVolume : defaultStreamVolume(),
-            streams: bag.streams || [],
-            streaming: !!mine || GO_LIVE.active,
+            streaming: !!(currentStream() || GO_LIVE.active),
           };
         } else {
           window.__deckscordLastVoice = null;
@@ -1580,7 +710,6 @@
         }
 
         var textId = SelectedChannelStore && SelectedChannelStore.getChannelId && SelectedChannelStore.getChannelId();
-        var mineStream = currentStream();
 
         return {
           ok: true,
@@ -1589,14 +718,6 @@
           user: userLite(me),
           muted: muted,
           deafened: deafened,
-          streaming: !!(mineStream || (voice && voice.streaming) || GO_LIVE.active),
-          stream: {
-            active: !!(mineStream || GO_LIVE.active),
-            pending: !!GO_LIVE.pending,
-            width: GO_LIVE.width,
-            height: GO_LIVE.height,
-            fps: GO_LIVE.fps,
-          },
           voice: voice,
           text_channel_id: textId || null,
           guilds: guilds,
@@ -1611,128 +732,15 @@
             inputVolume: inputVolume,
             outputVolume: outputVolume,
           },
+          streaming: !!(currentStream() || GO_LIVE.active),
+          golive: {
+            active: !!(currentStream() || GO_LIVE.active),
+            pending: !!GO_LIVE.pending,
+            width: GO_LIVE.width,
+            height: GO_LIVE.height,
+            fps: GO_LIVE.fps,
+          },
         };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    probeVideo: function () {
-      try {
-        var bag = collectStreams();
-        var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
-        var eng = null;
-        try { eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine(); } catch (e) {}
-        var sinkApi = {
-          addVideoOutputSink: typeof findEngineFn("addVideoOutputSink") === "function" ? "function" : "undefined",
-          addDirectVideoOutputSink: typeof findEngineFn("addDirectVideoOutputSink") === "function" ? "function" : "undefined",
-          removeVideoOutputSink: typeof findEngineFn("removeVideoOutputSink") === "function" ? "function" : "undefined",
-          setVideoOutputSink: typeof findEngineFn("setVideoOutputSink") === "function" ? "function" : "undefined",
-          setHasActiveVideoOutputSink: typeof findEngineFn("setHasActiveVideoOutputSink") === "function" ? "function" : "undefined",
-          setLocalMute: typeof findEngineFn("setLocalMute") === "function" || typeof findFn("setLocalMute") === "function" ? "function" : "undefined",
-        };
-        var videos = [];
-        try {
-          Array.prototype.forEach.call(document.querySelectorAll("video"), function (el) {
-            videos.push({
-              tag: "video",
-              className: String(el.className || "").slice(0, 80),
-              w: el.videoWidth || 0,
-              h: el.videoHeight || 0,
-              readyState: el.readyState,
-              hasSrcObject: !!el.srcObject,
-              videoWidth: el.videoWidth || 0,
-            });
-          });
-        } catch (eDom) {}
-        var winner = null;
-        if (sinkApi.addVideoOutputSink === "function" || sinkApi.addDirectVideoOutputSink === "function") winner = "F";
-        else if (videos.some(function (v) { return v.videoWidth > 0; })) winner = "B";
-        else if (bag.streams.some(function (s) { return s.kind === "screenshare"; })) winner = "C";
-        var previewP = Promise.resolve(null);
-        var ss = bag.streams.filter(function (s) { return s.kind === "screenshare"; })[0];
-        if (ss && bag.guildId && bag.channelId) previewP = previewJpegFor(bag.guildId, bag.channelId, ss.userId);
-        return previewP.then(function (pj) {
-          return {
-            ok: true,
-            inVoice: !!bag.channelId,
-            channelId: bag.channelId,
-            engineType: (eng && eng.constructor && eng.constructor.name) || "unknown",
-            members: bag.members.map(function (m) {
-              return { id: m.id, name: m.name, selfVideo: !!m.selfVideo, selfStream: !!m.selfStream };
-            }),
-            streamIds: bag.streams.map(function (s) { return { userId: s.userId, kind: s.kind, streamId: s.streamId }; }),
-            sinkApi: sinkApi,
-            dom: videos,
-            window: { hidden: document.hidden, vis: document.visibilityState },
-            previewJpeg: pj || null,
-            winner: winner,
-            black: false,
-          };
-        });
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    grabVideoFrames: function (opts) {
-      try {
-        opts = opts || {};
-        var bag = collectStreams();
-        try { ensureVideoSinks(true); } catch (eSink) {}
-        startFramePump();
-        var pipId = opts.userId ? String(opts.userId) : "";
-        var pipW = Number(opts.w) || 0;
-        var pipH = Number(opts.h) || 0;
-        var copied = (bag.streams || []).filter(function (s) {
-          if (pipId) return s.userId === pipId;
-          return !(s.self && s.kind === "screenshare");
-        });
-        if (pipId) copied = copied.slice(0, 1);
-        else copied = copied.slice(0, 4);
-        var cache = window.__deckscordVideo.jpegs || {};
-        var jobs = copied.map(function (s) {
-          var key = s.userId + ":" + s.kind;
-          var dw = pipId && pipW ? pipW : 400;
-          var dh = pipId && pipH ? pipH : Math.round(dw * 9 / 16);
-          var jpeg = cache[key] || null;
-          if (!jpeg) {
-            var cached = window.__deckscordVideo.canvases[key];
-            if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, 0.42);
-              if (jpeg) cache[key] = jpeg;
-            }
-          }
-          var next = Promise.resolve(jpeg);
-          if (!jpeg && s.kind === "screenshare" && bag.guildId && bag.channelId) {
-            next = previewJpegFor(bag.guildId, bag.channelId, s.userId);
-          }
-          return next.then(function (j) {
-            var outJpeg = j || jpeg;
-            if (outJpeg) cache[key] = outJpeg;
-            return {
-              userId: s.userId,
-              kind: s.kind,
-              name: s.name,
-              avatar: s.avatar,
-              jpeg: outJpeg || null,
-              w: dw,
-              h: dh,
-              black: !outJpeg,
-              self: !!s.self,
-              from: jpeg ? "engine" : (outJpeg ? "preview" : "none"),
-              big: !!big,
-            };
-          });
-        });
-        return Promise.all(jobs).then(function (frames) {
-          return {
-            ok: true,
-            ts: Date.now(),
-            frames: frames,
-            clips: [],
-          };
-        });
       } catch (e) {
         return err(e);
       }
@@ -1766,8 +774,11 @@
             : inMap[inId];
           if (voiceInputForbiddenName(inId) || isForbiddenVoice(inDev || { id: inId })) voiceInputOk = false;
         } catch (eIn) {}
-        var bag = collectStreams();
-        (bag.members || []).forEach(function (m) {
+        var VoiceStateStore = store("VoiceStateStore") || byProps("getVoiceStateForUser", "getVoiceStatesForChannel");
+        var SelectedChannelStore0 = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
+        var cid0 = SelectedChannelStore0 && SelectedChannelStore0.getVoiceChannelId && SelectedChannelStore0.getVoiceChannelId();
+        var members0 = voiceMembersFor(cid0, UserStore, VoiceStateStore, meId, store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf"));
+        (members0 || []).forEach(function (m) {
           if (m.self && !voiceInputOk) return;
           if (isUserSpeaking(m.id, meId) && ids.indexOf(m.id) === -1) ids.push(m.id);
         });
@@ -1797,138 +808,45 @@
       }
     },
 
-    videoClipRects: function () {
-      try {
-        return { ok: true, clips: videoClipRects() };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    ensureVideoSinks: function (enable) {
-      try {
-        return ensureVideoSinks(!!enable);
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    publishInbound: function (opts) {
-      try {
-        return publishInbound(opts || {});
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    openPipViewer: function (opts) {
-      try {
-        return openPipViewer(opts || {});
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    closePipViewer: function () {
-      try {
-        return closePipViewer();
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    webrtcStatus: function () {
-      try {
-        var rooms = {};
-        Object.keys(RTC.rooms).forEach(function (k) {
-          var st = RTC.rooms[k];
-          rooms[k] = st && st.pc ? st.pc.connectionState : "idle";
-        });
-        return { ok: true, hub: hubUrl(), rooms: rooms };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    focusStream: function (userId) {
-      try {
-        var bag = collectStreams();
-        var id = String(userId || "");
-        if (!id || id === String(bag.meId || "")) {
-          muteAllStreamAudioExcept(null);
-          window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null, streamVolume: defaultStreamVolume() };
-          return { ok: true, cleared: true };
-        }
-        var s = null;
-        (bag.streams || []).forEach(function (x) {
-          if (x.userId === id && !s) s = x;
-          if (x.userId === id && x.kind === "screenshare") s = x;
-        });
-        if (s && s.kind === "screenshare") watchScreenShare(s);
-        var prev = window.__deckscordAudioFocus || {};
-        var vol = typeof prev.streamVolume === "number" ? prev.streamVolume : defaultStreamVolume();
-        muteAllStreamAudioExcept(id, vol);
-        window.__deckscordAudioFocus = {
-          userId: id,
-          saved: prev.saved || {},
-          kind: "stream",
-          streamVolume: vol,
-        };
-        return { ok: true, user_id: id, kind: "stream", streamAudio: true, streamVolume: vol, focus: window.__deckscordAudioFocus };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    setStreamAudioVolume: function (volume) {
-      try {
-        var n = Number(volume);
-        if (isNaN(n)) n = defaultStreamVolume();
-        if (n < 0) n = 0;
-        if (n > 200) n = 200;
-        var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
-        af.streamVolume = n;
-        window.__deckscordAudioFocus = af;
-        if (af.userId && af.kind === "stream") muteAllStreamAudioExcept(af.userId, n);
-        return { ok: true, streamVolume: n, focus: af };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
     focusAudio: function (userId) {
       try {
-        var bag = collectStreams();
+        var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
+        var VoiceStateStore = store("VoiceStateStore") || byProps("getVoiceStateForUser", "getVoiceStatesForChannel");
+        var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
+        var MediaEngineStore = store("MediaEngineStore") || byProps("isLocalMute", "getLocalVolume");
+        var me = UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser();
+        var meId = me && String(me.id);
+        var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
+        var members = voiceMembersFor(cid, UserStore, VoiceStateStore, meId, MediaEngineStore);
         var id = String(userId || "");
         var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
-        if (!id || id === String(bag.meId || "")) {
+        if (!id || id === String(meId || "")) {
           return window.__deckscord.clearAudioFocus();
         }
-        if (af.userId === id && af.kind === "voice") {
+        if (af.userId === id) {
           return { ok: true, user_id: id, already: true };
         }
-        if (af.userId && af.kind === "voice") window.__deckscord.clearAudioFocus();
-        var MediaEngineStore = store("MediaEngineStore") || byProps("isLocalMute", "getLocalVolume");
+        if (af.userId) window.__deckscord.clearAudioFocus();
         var saved = {};
-        bag.members.forEach(function (m) {
+        members.forEach(function (m) {
           if (m.self) return;
           saved[m.id] = {
             localMute: !!(MediaEngineStore && MediaEngineStore.isLocalMute && MediaEngineStore.isLocalMute(m.id)),
             volume: (MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(m.id)) || 100,
           };
         });
-        window.__deckscordAudioFocus = { userId: id, saved: saved, kind: "voice" };
+        window.__deckscordAudioFocus = { userId: id, saved: saved };
         var used = setLocalMuteSafe(id, false);
         var vol = MediaEngineStore && MediaEngineStore.getLocalVolume && MediaEngineStore.getLocalVolume(id);
         if (typeof vol === "number" && vol <= 0) {
           var sv = findFn("setLocalVolume");
           if (sv) sv(id, 100);
         }
-        bag.members.forEach(function (m) {
+        members.forEach(function (m) {
           if (m.self || m.id === id) return;
           setLocalMuteSafe(m.id, true);
         });
-        return { ok: true, user_id: id, method: used, kind: "voice", focus: window.__deckscordAudioFocus };
+        return { ok: true, user_id: id, method: used, focus: window.__deckscordAudioFocus };
       } catch (e) {
         return err(e);
       }
@@ -1946,8 +864,7 @@
             if (sv) sv(uid, st.volume);
           }
         });
-        try { muteAllStreamAudioExcept(null); } catch (eSt) {}
-        window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null };
+        window.__deckscordAudioFocus = { userId: null, saved: {} };
         return { ok: true, cleared: true };
       } catch (e) {
         return err(e);
@@ -2043,7 +960,6 @@
         if (!fn) throw new Error("selectVoiceChannel not found");
         fn(id);
         try { window.__deckscord.ensureVoiceProcessing(); } catch (eProc) {}
-        try { muteAllStreamAudioExcept(null); } catch (eSt) {}
         return { ok: true, channel_id: id };
       } catch (e) {
         return err(e);
@@ -2052,153 +968,12 @@
 
     leaveVoice: function () {
       try {
-        try { window.__deckscord.stopGoLive(); } catch (eStop) {}
         var fn =
           findFn("selectVoiceChannel") ||
           (common("ChannelActionCreators") && common("ChannelActionCreators").selectVoiceChannel);
         if (!fn) throw new Error("selectVoiceChannel not found");
         fn(null);
         return { ok: true };
-      } catch (e) {
-        return err(e);
-      }
-    },
-
-    startGoLive: function (opts) {
-      opts = opts || {};
-      var width = Number(opts.width) || GO_LIVE.width;
-      var height = Number(opts.height) || GO_LIVE.height;
-      var fps = Number(opts.fps) || GO_LIVE.fps;
-      GO_LIVE.width = width;
-      GO_LIVE.height = height;
-      GO_LIVE.fps = fps;
-      GO_LIVE.gameAudio = Array.isArray(opts.gameAudio) ? opts.gameAudio : [];
-      pinScreenshareQuality();
-      try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
-
-      var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId");
-      var ChannelStore = store("ChannelStore") || byProps("getChannel");
-      var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
-      if (!cid) return Promise.resolve({ ok: false, error: "not in a voice channel" });
-      var ch = ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(cid);
-      var guildId = ch ? (ch.guild_id || ch.guildId || null) : null;
-
-      var startFn = findByCode('"STREAM_START",streamType') || findByCode('"STREAM_START"');
-      if (!startFn) return Promise.resolve({ ok: false, error: "STREAM_START not found" });
-
-      if (GO_LIVE.pending) return Promise.resolve({ ok: true, pending: true, note: "already starting" });
-      if (currentStream()) return Promise.resolve({ ok: true, already: true });
-
-      var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
-      var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
-      // Flag BEFORE getDesktopSource so the picker watcher will auto-click.
-      // Same as Deckcord/Steamcord: a hidden Vesktop modal otherwise hangs forever.
-      GO_LIVE.active = true;
-      GO_LIVE.stopRequested = false;
-      GO_LIVE.debug = { picker: "starting" };
-
-      function finishStart(srcId) {
-        if (GO_LIVE.stopRequested) {
-          GO_LIVE.active = false;
-          try { eng && eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eD) {}
-          return { ok: false, error: "cancelled" };
-        }
-        startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: null });
-        GO_LIVE.active = true;
-        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true, picker: GO_LIVE.debug };
-      }
-
-      if (!eng || typeof eng.getDesktopSource !== "function") {
-        try {
-          startFn(guildId, cid, {});
-          return Promise.resolve({ ok: true, legacy: true, warning: "no getDesktopSource — viewers may see black" });
-        } catch (eLeg) {
-          GO_LIVE.active = false;
-          return Promise.resolve(err(eLeg));
-        }
-      }
-
-      GO_LIVE.pending = true;
-      var myGen = ++GO_LIVE.gen;
-
-      function waitTeardown() {
-        var t0 = Date.now();
-        return new Promise(function (resolve) {
-          (function tick() {
-            var busy = currentStream();
-            var since = Date.now() - (GO_LIVE.lastStop || 0);
-            if ((!busy && since >= 1200) || GO_LIVE.stopRequested || Date.now() - t0 > 5000) {
-              resolve();
-              return;
-            }
-            setTimeout(tick, 200);
-          })();
-        });
-      }
-
-      return waitTeardown().then(function () {
-        if (GO_LIVE.stopRequested) {
-          GO_LIVE.active = false;
-          return { ok: false, error: "cancelled" };
-        }
-        var constraints = { width: width, height: height, frameRate: fps };
-        var wantAudio = true;
-        var acq = eng.getDesktopSource(constraints, wantAudio);
-        var raced = false;
-        acq.then(function (id) {
-          if (!raced) return;
-          try { eng.desktopInputPool && eng.desktopInputPool.get(id) && eng.desktopInputPool.get(id).destroy(); } catch (eLate) {}
-        }).catch(function () {});
-        var timed = new Promise(function (_, rej) {
-          setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
-        });
-        return Promise.race([acq, timed]).then(function (srcId) {
-          raced = true;
-          if (myGen !== GO_LIVE.gen) {
-            try { eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eOld) {}
-            return { ok: false, error: "superseded" };
-          }
-          return finishStart(srcId);
-        }, function (e) {
-          raced = true;
-          throw e;
-        });
-      }).catch(function (e) {
-        if (myGen === GO_LIVE.gen) GO_LIVE.active = false;
-        var out = err(e);
-        out.picker = GO_LIVE.debug;
-        return out;
-      }).then(function (r) {
-        if (myGen === GO_LIVE.gen) {
-          GO_LIVE.pending = false;
-          GO_LIVE.stopRequested = false;
-        }
-        try { window.__deckscord.ensureVoiceProcessing(); } catch (eAfter) {}
-        return r;
-      });
-    },
-
-    stopGoLive: function () {
-      try {
-        if (GO_LIVE.pending) GO_LIVE.stopRequested = true;
-        else GO_LIVE.active = false;
-        GO_LIVE.lastStop = Date.now();
-        var s = currentStream();
-        var stopFn = findByCode('"STREAM_STOP"');
-        if (s && stopFn) {
-          var ownerId = s.ownerId || s.owner_id;
-          var channelId = s.channelId || s.channel_id;
-          var gid = s.guildId || s.guild_id;
-          var key = gid
-            ? "guild:" + gid + ":" + channelId + ":" + ownerId
-            : "call:" + channelId + ":" + ownerId;
-          try { stopFn(key); } catch (eKey) {
-            try { stopFn(s); } catch (e2) {}
-          }
-        }
-        GO_LIVE.gameAudio = [];
-        try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
-        return { ok: true, streaming: false };
       } catch (e) {
         return err(e);
       }
@@ -2452,14 +1227,6 @@
             return null;
           }
         }
-        var quality = null;
-        try {
-          var f = document.createElement("iframe");
-          document.documentElement.appendChild(f);
-          var st = JSON.parse(f.contentWindow.localStorage.getItem("VesktopState") || "{}");
-          quality = st.screenshareQuality || null;
-          f.remove();
-        } catch (eQ) {}
         return {
           ok: true,
           muted: !!g("isSelfMute"),
@@ -2472,7 +1239,6 @@
           outputId: g("getOutputDeviceId") || "",
           inputVolume: g("getInputVolume"),
           outputVolume: g("getOutputVolume"),
-          screenshareQuality: quality,
         };
       } catch (e) {
         return err(e);
@@ -2498,22 +1264,150 @@
       }
     },
 
-    setScreenshareQuality: function (res, fps) {
+    startGoLive: function (opts) {
+      opts = opts || {};
+      var width = Number(opts.width) || GO_LIVE.width;
+      var height = Number(opts.height) || GO_LIVE.height;
+      var fps = Number(opts.fps) || GO_LIVE.fps;
+      GO_LIVE.width = width;
+      GO_LIVE.height = height;
+      GO_LIVE.fps = fps;
+      GO_LIVE.gameAudio = Array.isArray(opts.gameAudio) ? opts.gameAudio : [];
+      pinScreenshareQuality(String(height), String(fps));
+      try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
+
+      var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId");
+      var ChannelStore = store("ChannelStore") || byProps("getChannel");
+      var cid = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
+      if (!cid) return Promise.resolve({ ok: false, error: "not in a voice channel" });
+      var ch = ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(cid);
+      var guildId = ch ? (ch.guild_id || ch.guildId || null) : null;
+
+      var startFn = findByCode('"STREAM_START",streamType') || findByCode('"STREAM_START"');
+      if (!startFn) return Promise.resolve({ ok: false, error: "STREAM_START not found" });
+
+      if (GO_LIVE.pending) return Promise.resolve({ ok: true, pending: true, note: "already starting" });
+      if (currentStream()) return Promise.resolve({ ok: true, already: true });
+
+      var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
+      var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
+      GO_LIVE.active = true;
+      GO_LIVE.stopRequested = false;
+      GO_LIVE.debug = { picker: "starting" };
+
+      function finishStart(srcId) {
+        if (GO_LIVE.stopRequested) {
+          GO_LIVE.active = false;
+          try { eng && eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eD) {}
+          return { ok: false, error: "cancelled" };
+        }
+        startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: null });
+        GO_LIVE.active = true;
+        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true, picker: GO_LIVE.debug };
+      }
+
+      if (!eng || typeof eng.getDesktopSource !== "function") {
+        try {
+          startFn(guildId, cid, {});
+          return Promise.resolve({ ok: true, legacy: true, warning: "no getDesktopSource — viewers may see black" });
+        } catch (eLeg) {
+          GO_LIVE.active = false;
+          return Promise.resolve(err(eLeg));
+        }
+      }
+
+      GO_LIVE.pending = true;
+      var myGen = ++GO_LIVE.gen;
+
+      function waitTeardown() {
+        var t0 = Date.now();
+        return new Promise(function (resolve) {
+          (function tick() {
+            var busy = currentStream();
+            var since = Date.now() - (GO_LIVE.lastStop || 0);
+            if ((!busy && since >= 1200) || GO_LIVE.stopRequested || Date.now() - t0 > 5000) {
+              resolve();
+              return;
+            }
+            setTimeout(tick, 200);
+          })();
+        });
+      }
+
+      return waitTeardown().then(function () {
+        if (GO_LIVE.stopRequested) {
+          GO_LIVE.active = false;
+          return { ok: false, error: "cancelled" };
+        }
+        // Size only. Do NOT pass frameRate: gamescope advertises 0/1 and a
+        // 30/1 PipeWire renegotiate has killed the Game Mode capture node.
+        var constraints = { width: width, height: height };
+        var wantAudio = true;
+        var acq = eng.getDesktopSource(constraints, wantAudio);
+        var raced = false;
+        acq.then(function (id) {
+          if (!raced) return;
+          try { eng.desktopInputPool && eng.desktopInputPool.get(id) && eng.desktopInputPool.get(id).destroy(); } catch (eLate) {}
+        }).catch(function () {});
+        var timed = new Promise(function (_, rej) {
+          setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
+        });
+        return Promise.race([acq, timed]).then(function (srcId) {
+          raced = true;
+          if (myGen !== GO_LIVE.gen) {
+            try { eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eOld) {}
+            return { ok: false, error: "superseded" };
+          }
+          return finishStart(srcId);
+        }, function (e) {
+          raced = true;
+          throw e;
+        });
+      }).catch(function (e) {
+        if (myGen === GO_LIVE.gen) GO_LIVE.active = false;
+        var out = err(e);
+        out.picker = GO_LIVE.debug;
+        return out;
+      }).then(function (r) {
+        if (myGen === GO_LIVE.gen) {
+          GO_LIVE.pending = false;
+          GO_LIVE.stopRequested = false;
+        }
+        try { window.__deckscord.ensureVoiceProcessing(); } catch (eAfter) {}
+        return r;
+      });
+    },
+
+    stopGoLive: function () {
       try {
-        var q = pinScreenshareQuality(res, fps);
-        return { ok: true, screenshareQuality: q };
+        if (GO_LIVE.pending) GO_LIVE.stopRequested = true;
+        else GO_LIVE.active = false;
+        GO_LIVE.lastStop = Date.now();
+        var s = currentStream();
+        var stopFn = findByCode('"STREAM_STOP"');
+        if (s && stopFn) {
+          var ownerId = s.ownerId || s.owner_id;
+          var channelId = s.channelId || s.channel_id;
+          var gid = s.guildId || s.guild_id;
+          var key = gid
+            ? "guild:" + gid + ":" + channelId + ":" + ownerId
+            : "call:" + channelId + ":" + ownerId;
+          try { stopFn(key); } catch (eKey) {
+            try { stopFn(s); } catch (e2) {}
+          }
+        }
+        GO_LIVE.gameAudio = [];
+        try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
+        return { ok: true, streaming: false };
       } catch (e) {
         return err(e);
       }
     },
 
-    getScreenshareQuality: function () {
+    setScreenshareQuality: function (res, fps) {
       try {
-        var f = document.createElement("iframe");
-        document.documentElement.appendChild(f);
-        var st = JSON.parse(f.contentWindow.localStorage.getItem("VesktopState") || "{}");
-        f.remove();
-        return { ok: true, screenshareQuality: st.screenshareQuality || { resolution: "720", frameRate: "30" } };
+        var q = pinScreenshareQuality(res, fps);
+        return { ok: true, screenshareQuality: q };
       } catch (e) {
         return err(e);
       }

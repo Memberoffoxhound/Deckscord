@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """Deckscord overlay on gamescope's external overlay plane.
 
-One transparent fullscreen X11 window (GAMESCOPE_EXTERNAL_OVERLAY):
-  - PiP stamp from state.json + frame.jpg
-  - Who's-talking roster from talking.json (avatar + name, speakers only)
-
+Who's-talking roster from talking.json (avatar + name, speakers only).
 Game Mode only. Mapping this onto KWin/SDDM (the first :0 socket) covers
 login and steals Steam's overlay. Clicks pass through so the game keeps input.
 """
@@ -261,67 +258,10 @@ def main() -> None:
         pass
 
     bag = {
-        "pip": {},
         "talk": {},
-        "pixbuf": None,
-        "mtime": -1.0,
-        "stamp": (0, 0, 0, 0),
         "winbox": (0, 0, 0, 0),
         "faces": {},
     }
-
-    def stamp_box(st: dict) -> tuple[int, int, int, int]:
-        size = str(st.get("size") or "small")
-        cap = 480 if size == "large" else 240
-        frac = 0.42 if size == "large" else 0.30
-        h = min(cap, max(90, int(sh * frac)))
-        w = int(h * 16 / 9)
-        pad = max(10, int(min(sw, sh) * 0.012))
-        corner = str(st.get("corner") or "bottom-right")
-        if corner == "top-left":
-            x, y = pad, pad
-        elif corner == "top-right":
-            x, y = sw - w - pad, pad
-        elif corner == "bottom-left":
-            x, y = pad, sh - h - pad
-        else:
-            x, y = sw - w - pad, sh - h - pad
-        return x, y, w, h
-
-    def draw_stamp(cr) -> None:
-        st = bag["pip"] or {}
-        if not st.get("enabled"):
-            return
-        pb = bag["pixbuf"]
-        if pb is None:
-            return
-        wx, wy, ww, wh = bag.get("winbox") or (0, 0, 0, 0)
-        x, y, tw, th = bag["stamp"]
-        x, y = x - wx, y - wy
-        alpha = max(0.15, min(1.0, float(st.get("opacity") or 100) / 100.0))
-        iw, ih = pb.get_width(), pb.get_height()
-        if iw < 2 or ih < 2:
-            return
-        scale = min(tw / iw, th / ih)
-        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
-        ox, oy = x + (tw - dw) // 2, y + (th - dh) // 2
-        cr.set_operator(cairo.OPERATOR_OVER)
-        cr.save()
-        cr.translate(ox, oy)
-        cr.scale(dw / iw, dh / ih)
-        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
-        cr.paint_with_alpha(alpha)
-        cr.restore()
-        name = str(st.get("name") or "")
-        if name:
-            cr.set_source_rgba(0, 0, 0, 0.55 * alpha)
-            cr.rectangle(ox, oy + dh - 22, dw, 22)
-            cr.fill()
-            cr.set_source_rgba(1, 1, 1, alpha)
-            cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            cr.set_font_size(12)
-            cr.move_to(ox + 6, oy + dh - 7)
-            cr.show_text(name[:42])
 
     def face_for(path: str):
         if not path:
@@ -370,17 +310,6 @@ def main() -> None:
         if bottom:
             y0 = sh - pad - total_h
 
-        pip = bag["pip"] or {}
-        if pip.get("enabled"):
-            px, py, pw, ph = bag["stamp"]
-            same_v = (py < sh / 2) == (not bottom)
-            same_h = (px < sw / 2) == (not right)
-            if same_v and same_h:
-                if bottom:
-                    y0 = py - pad - total_h
-                else:
-                    y0 = py + ph + pad
-                y0 = max(pad, min(y0, sh - pad - total_h))
         wx, wy, _ww, _wh = bag.get("winbox") or (0, 0, 0, 0)
         x0 -= wx
         y0 -= wy
@@ -440,7 +369,6 @@ def main() -> None:
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
-        draw_stamp(cr)
         draw_talking(cr)
         return False
 
@@ -488,8 +416,7 @@ def main() -> None:
     misses = {"gm": 0}
 
     def tick() -> bool:
-        # Stay up across a brief /proc miss or gamescope restart. Quitting on
-        # a single False is why PiP vanished a frame after join.
+        # Stay up across a brief /proc miss or gamescope restart.
         if in_game_mode() or _display_is_gamescope(disp):
             misses["gm"] = 0
         else:
@@ -498,17 +425,12 @@ def main() -> None:
                 print("overlay: left Game Mode, quitting", flush=True)
                 Gtk.main_quit()
                 return False
-        pip = _load(state_dir / "state.json")
         talk = _load(state_dir / "talking.json")
-        bag["pip"] = pip
         bag["talk"] = talk
-        if not pip.get("enabled") and not talk.get("enabled"):
+        if not talk.get("enabled"):
             Gtk.main_quit()
             return False
-        bag["stamp"] = stamp_box(pip) if pip.get("enabled") else (0, 0, 0, 0)
         boxes = []
-        if pip.get("enabled"):
-            boxes.append(bag["stamp"])
         if talk.get("enabled") and (talk.get("speakers") or []):
             speakers = (talk.get("speakers") or [])[:5]
             size = str(talk.get("size") or "small")
@@ -536,17 +458,6 @@ def main() -> None:
             try:
                 win.resize(ww, wh)
                 win.move(x0, y0)
-            except Exception:
-                pass
-        frame = state_dir / "frame.jpg"
-        try:
-            mt = frame.stat().st_mtime
-        except OSError:
-            mt = -1.0
-        if pip.get("enabled") and mt != bag["mtime"] and frame.is_file():
-            try:
-                bag["pixbuf"] = Gdk.pixbuf_new_from_file(str(frame))
-                bag["mtime"] = mt
             except Exception:
                 pass
         da.queue_draw()
