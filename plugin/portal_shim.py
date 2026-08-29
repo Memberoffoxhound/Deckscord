@@ -68,7 +68,6 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 FD_RELEASE_S = 30.0
 KWIN = {"kwin_wayland", "kwin_x11"}
-GAMESCOPE = {"gamescope", "gamescope-wl"}
 
 XML = f"""
 <node>
@@ -148,10 +147,11 @@ def in_game_mode() -> bool:
     # Nested gamescope under KWin is still Desktop Mode. During login, kwin
     # is not up yet — do not treat a leftover gamescope binary as Game Mode
     # unless gamescope is actually the session compositor.
+    # gamescope-session's /proc comm truncates to "gamescope-sessio".
     names = _comms()
     if names & KWIN:
         return False
-    return bool(names & GAMESCOPE)
+    return any(n == "gamescope" or n.startswith("gamescope") for n in names)
 
 
 def _msg_path(message) -> str:
@@ -174,13 +174,29 @@ def _systemctl_user(*args: str, timeout: int = 8) -> None:
     )
 
 
-def _nudge_fresh() -> bool:
+def _data_dir() -> Path:
     home = Path(os.environ.get("HOME") or "")
-    p = home / ".local" / "share" / "deckscord" / "want-portal"
+    return home / ".local" / "share" / "deckscord"
+
+
+def _nudge_fresh() -> bool:
+    p = _data_dir() / "want-portal"
     try:
         return p.is_file() and (time.time() - p.stat().st_mtime) < 90
     except OSError:
         return False
+
+
+def _write_status(owned: bool) -> None:
+    path = _data_dir() / "portal.status"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"owned": bool(owned), "ts": time.time(), "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def sender_token(sender: str) -> str:
@@ -276,6 +292,8 @@ class Portal:
         self._desk_since = 0.0
         self._last_stop = 0.0
         self._stable_gm = False
+        self._own_at = 0.0
+        self._masked = False
 
     def sender_is_vesktop(self, sender: str) -> bool:
         if not self.conn or not sender:
@@ -551,13 +569,49 @@ class Portal:
                     pass
         self.regs = []
 
+    def _mask_desktop_portal(self) -> None:
+        """Runtime-mask so systemd cannot steal the name back during Game Mode."""
+        now = time.monotonic()
+        if (now - self._last_stop) < 4.0 and self._masked:
+            return
+        self._last_stop = now
+        try:
+            _systemctl_user("mask", "--runtime", "xdg-desktop-portal.service")
+            self._masked = True
+        except Exception as e:
+            log.warning("mask portal: %r", e)
+        try:
+            _systemctl_user("stop", "xdg-desktop-portal.service")
+        except Exception as e:
+            log.warning("stop portal: %r", e)
+
+    def _unmask_desktop_portal(self) -> None:
+        if not self._masked:
+            return
+        try:
+            _systemctl_user("unmask", "xdg-desktop-portal.service")
+            self._masked = False
+        except Exception as e:
+            log.warning("unmask portal: %r", e)
+
     def try_own(self) -> None:
         if self.owner_id:
             return
+        now = time.monotonic()
+        if self._own_at and (now - self._own_at) < 2.0:
+            return
+        self._own_at = now
+        if self._stable_gm:
+            self._mask_desktop_portal()
+        flags = Gio.BusNameOwnerFlags.DO_NOT_QUEUE
+        try:
+            flags |= Gio.BusNameOwnerFlags.REPLACE
+        except Exception:
+            pass
         self.owner_id = Gio.bus_own_name(
             Gio.BusType.SESSION,
             PORTAL_NAME,
-            Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+            flags,
             self.on_bus_acquired,
             self.on_name_acquired,
             self.on_name_lost,
@@ -568,9 +622,11 @@ class Portal:
             Gio.bus_unown_name(self.owner_id)
             self.owner_id = 0
         self.unregister()
+        _write_status(False)
         log.info("released %s", PORTAL_NAME)
 
     def _start_desktop_portal(self) -> None:
+        self._unmask_desktop_portal()
         try:
             _systemctl_user("start", "xdg-desktop-portal.service")
             log.info("started xdg-desktop-portal for Desktop Mode")
@@ -582,28 +638,19 @@ class Portal:
 
     def on_name_acquired(self, _conn, _name):
         self._stopping_portal = False
+        _write_status(True)
         log.info("owned %s — Game Mode Go Live uses the gamescope node", PORTAL_NAME)
 
     def on_name_lost(self, _conn, _name):
         log.info("name lost")
+        _write_status(False)
         self.unregister()
         self.owner_id = 0
         now = time.monotonic()
         # Only steal the name after Game Mode has been up for a bit. Stopping
         # xdg-desktop-portal during boot/login hangs Plasma and gamescope-session.
-        if (
-            self._stable_gm
-            and not self._stopping_portal
-            and (now - self._last_stop) >= 30.0
-            and ((now - self._started) >= 20.0 or _nudge_fresh())
-        ):
-            self._stopping_portal = True
-            self._last_stop = now
-            log.info("stopping leftover xdg-desktop-portal so Game Mode can capture")
-            try:
-                _systemctl_user("stop", "xdg-desktop-portal.service")
-            except Exception as e:
-                log.warning("stop portal: %r", e)
+        if self._stable_gm and ((now - self._started) >= 20.0 or _nudge_fresh()):
+            self._mask_desktop_portal()
 
     def tick(self) -> bool:
         want = in_game_mode()
@@ -613,7 +660,7 @@ class Portal:
             if not self._gm_since:
                 self._gm_since = now
             nudged = _nudge_fresh()
-            self._stable_gm = nudged or (now - self._gm_since) >= 8.0
+            self._stable_gm = nudged or (now - self._gm_since) >= 5.0
             if self._stable_gm and not self.owner_id:
                 self.try_own()
         else:
@@ -622,7 +669,7 @@ class Portal:
             self._stopping_portal = False
             if not self._desk_since:
                 self._desk_since = now
-            if self.owner_id and (now - self._desk_since) >= 2.0:
+            if self.owner_id and (now - self._desk_since) >= 5.0:
                 self.drop_name()
                 self._start_desktop_portal()
         return True
@@ -637,6 +684,7 @@ def main() -> int:
 
     def _quit(*_a):
         portal.drop_name()
+        portal._unmask_desktop_portal()
         loop.quit()
         return False
 

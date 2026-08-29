@@ -33,7 +33,6 @@ os.environ.pop("WAYLAND_DISPLAY", None)
 os.environ.pop("GAMESCOPE_WAYLAND_DISPLAY", None)
 
 KWIN = {"kwin_wayland", "kwin_x11"}
-GAMESCOPE = {"gamescope", "gamescope-wl"}
 
 
 def _die(msg: str, code: int = 1) -> None:
@@ -60,7 +59,7 @@ def in_game_mode() -> bool:
     names = _comms()
     if names & KWIN:
         return False
-    return bool(names & GAMESCOPE)
+    return any(n == "gamescope" or n.startswith("gamescope") for n in names)
 
 
 def _display_is_gamescope(disp: str) -> bool:
@@ -116,8 +115,6 @@ def _pick_display() -> str | None:
     gs = [d for d in ordered if _display_is_gamescope(d)]
     if gs:
         return gs[0]
-    if in_game_mode() and len(ordered) == 1:
-        return ordered[0]
     return None
 
 
@@ -484,11 +481,19 @@ def main() -> None:
         except Exception:
             pass
 
+    misses = {"gm": 0}
+
     def tick() -> bool:
-        if not in_game_mode():
-            print("overlay: left Game Mode, quitting", flush=True)
-            Gtk.main_quit()
-            return False
+        # Stay up across a brief /proc miss or gamescope restart. Quitting on
+        # a single False is why PiP vanished a frame after join.
+        if in_game_mode() or _display_is_gamescope(disp):
+            misses["gm"] = 0
+        else:
+            misses["gm"] += 1
+            if misses["gm"] >= 90:
+                print("overlay: left Game Mode, quitting", flush=True)
+                Gtk.main_quit()
+                return False
         pip = _load(state_dir / "state.json")
         talk = _load(state_dir / "talking.json")
         bag["pip"] = pip

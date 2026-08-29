@@ -618,7 +618,8 @@
       try { recs = pc.getReceivers() || []; } catch (eR) { return; }
       recs.forEach(function (r) {
         var t = r && r.track;
-        if (!t || t.kind !== "video" || t.muted || t.readyState !== "live") return;
+        if (!t || t.kind !== "video") return;
+        if (t.readyState === "ended") return;
         if (seen[t.id]) return;
         if (isScreen) {
           seen[t.id] = true;
@@ -644,7 +645,7 @@
       el.autoplay = true;
       el.playsInline = true;
       el.setAttribute("playsinline", "true");
-      el.style.cssText = "position:fixed;left:-9999px;top:0;width:160px;height:90px;opacity:0;pointer-events:none";
+      el.style.cssText = "position:fixed;left:-9999px;top:0;width:640px;height:360px;opacity:0;pointer-events:none";
       (document.body || document.documentElement).appendChild(el);
       window.__deckscordVideo.els[key] = el;
     }
@@ -663,25 +664,51 @@
     return el;
   }
 
-  function canvasFromFrame(frame, w, h) {
-    var c = document.createElement("canvas");
-    c.width = w || 400;
-    c.height = h || 225;
+  function grabCanvas(w, h, key) {
+    var bag = window.__deckscordVideo.works || (window.__deckscordVideo.works = {});
+    var k = key || "_jpeg";
+    var c = bag[k];
+    if (!c) {
+      c = document.createElement("canvas");
+      bag[k] = c;
+    }
+    w = w || 400;
+    h = h || Math.round(w * 9 / 16);
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    return c;
+  }
+
+  function drawContain(ctx, src, dw, dh) {
+    var sw = src.videoWidth || src.width || dw;
+    var sh = src.videoHeight || src.height || dh;
+    if (!sw || !sh) return false;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, dw, dh);
+    var scale = Math.min(dw / sw, dh / sh);
+    var w = Math.max(1, sw * scale);
+    var h = Math.max(1, sh * scale);
+    ctx.drawImage(src, (dw - w) / 2, (dh - h) / 2, w, h);
+    return true;
+  }
+
+  function canvasFromFrame(frame, w, h, key) {
+    var c = grabCanvas(w, h, key || "_frame");
     var ctx = c.getContext("2d");
     try {
       if (!frame) return c;
       if (frame instanceof HTMLCanvasElement || (frame.tagName && String(frame.tagName).toLowerCase() === "canvas")) {
-        ctx.drawImage(frame, 0, 0, c.width, c.height);
+        drawContain(ctx, frame, c.width, c.height);
       } else if (frame instanceof HTMLVideoElement || (frame.videoWidth && frame.readyState)) {
-        ctx.drawImage(frame, 0, 0, c.width, c.height);
+        drawContain(ctx, frame, c.width, c.height);
       } else if (frame.data && frame.width) {
         var tmp = document.createElement("canvas");
         tmp.width = frame.width;
         tmp.height = frame.height;
         tmp.getContext("2d").putImageData(frame, 0, 0);
-        ctx.drawImage(tmp, 0, 0, c.width, c.height);
+        drawContain(ctx, tmp, c.width, c.height);
       } else if (frame.imageData) {
-        return canvasFromFrame(frame.imageData, w, h);
+        return canvasFromFrame(frame.imageData, w, h, key);
       }
     } catch (e) {}
     return c;
@@ -689,9 +716,13 @@
 
   function lumaBlack(canvas) {
     try {
-      var s = document.createElement("canvas");
-      s.width = 8;
-      s.height = 8;
+      var s = window.__deckscordVideo.luma;
+      if (!s) {
+        s = document.createElement("canvas");
+        s.width = 8;
+        s.height = 8;
+        window.__deckscordVideo.luma = s;
+      }
       var ctx = s.getContext("2d");
       ctx.drawImage(canvas, 0, 0, 8, 8);
       var d = ctx.getImageData(0, 0, 8, 8).data;
@@ -716,7 +747,7 @@
   }
 
   function rememberFrame(key, frame) {
-    var c = canvasFromFrame(frame, 400, 225);
+    var c = canvasFromFrame(frame, 400, 225, key);
     window.__deckscordVideo.canvases[key] = c;
   }
 
@@ -725,19 +756,14 @@
     try {
       var w = el.videoWidth || el.width || 0;
       var h = el.videoHeight || el.height || 0;
-      var r = el.getBoundingClientRect && el.getBoundingClientRect();
-      if ((!w || !h) && r) {
-        w = r.width;
-        h = r.height;
-      }
-      if (w < 64 || h < 64) return null;
+      if (w < 16 || h < 16) return null;
       if (w === 240 && h === 240) return null;
-      var c = document.createElement("canvas");
-      c.width = dw || 400;
-      c.height = dh || 225;
-      c.getContext("2d").drawImage(el, 0, 0, c.width, c.height);
+      dw = dw || 400;
+      dh = dh || Math.round(dw * 9 / 16);
+      var c = grabCanvas(dw, dh);
+      if (!drawContain(c.getContext("2d"), el, dw, dh)) return null;
       if (lumaBlack(c)) return null;
-      return jpegFromCanvas(c, q || 0.45);
+      return jpegFromCanvas(c, q || 0.42);
     } catch (e) {
       return null;
     }
@@ -753,9 +779,9 @@
     if (!hit && s.kind === "screenshare" && tracks.length) hit = tracks[0];
     if (!hit) return null;
     var el = attachTrack(s.userId + ":" + s.kind, hit.track);
-    dw = dw || (big ? 960 : 400);
-    dh = dh || (big ? 540 : 225);
-    var q = big || dw >= 640 ? 0.55 : s.kind === "screenshare" ? 0.5 : 0.4;
+    dw = dw || 400;
+    dh = dh || Math.round(dw * 9 / 16);
+    var q = dw >= 640 ? 0.48 : s.kind === "screenshare" ? 0.42 : 0.38;
     return paintElementToJpeg(el, q, dw, dh);
   }
 
@@ -1160,6 +1186,11 @@
           var vc = ChannelStore.getChannel(voiceChannelId);
           var members = voiceMembersFor(voiceChannelId, UserStore, VoiceStateStore, me.id, MediaEngineStore);
           var bag = collectStreams();
+          try {
+            (bag.streams || []).forEach(function (s) {
+              if (s && s.kind === "screenshare" && !s.self) watchScreenShare(s);
+            });
+          } catch (eWatch) {}
           var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
           if (af.userId && String(voiceChannelId) !== String(window.__deckscordLastVoice || voiceChannelId)) {
             try { window.__deckscord && window.__deckscord.clearAudioFocus && window.__deckscord.clearAudioFocus(); } catch (eClr) {}
@@ -1354,18 +1385,16 @@
         });
         if (pipId) copied = copied.slice(0, 1);
         else copied = copied.slice(0, 4);
-        var focusId = (window.__deckscordAudioFocus && window.__deckscordAudioFocus.kind === "stream" && window.__deckscordAudioFocus.userId) || null;
-        try { muteAllStreamAudioExcept(focusId || pipId || null); } catch (eMute) {}
         var jobs = copied.map(function (s) {
           var key = s.userId + ":" + s.kind;
-          var big = !!(focusId && s.userId === focusId) || !!(pipId && pipW >= 640);
-          var dw = pipId && pipW ? pipW : (big ? 960 : 400);
-          var dh = pipId && pipH ? pipH : (big ? 540 : 225);
+          var dw = pipId && pipW ? pipW : 400;
+          var dh = pipId && pipH ? pipH : Math.round(dw * 9 / 16);
+          var big = dw >= 640;
           var jpeg = jpegFromEngineTrack(s, big, dw, dh);
           if (!jpeg) {
             var cached = window.__deckscordVideo.canvases[key];
             if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, big ? 0.55 : s.kind === "screenshare" ? 0.5 : 0.4);
+              jpeg = jpegFromCanvas(cached, big ? 0.48 : 0.4);
             }
           }
           var next = Promise.resolve(jpeg);
@@ -1599,7 +1628,7 @@
         for (var i = 0; i < inputs.length; i++) {
           if (String(inputs[i].id) === String(cur)) curDev = inputs[i];
         }
-        var needPin = !curDev || isForbiddenVoice(curDev) || String(cur || "").toLowerCase() === "default";
+        var needPin = !curDev || isForbiddenVoice(curDev);
         if (needPin) {
           var setIn = findFn("setInputDevice");
           var pick = null;
@@ -1746,7 +1775,7 @@
         var wantAudio = GO_LIVE.gameAudio.length > 0;
         var acq = eng.getDesktopSource(constraints, wantAudio);
         var timed = new Promise(function (_, rej) {
-          setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
+          setTimeout(function () { rej(new Error("getDesktopSource timeout (12s)")); }, 12000);
         });
         return Promise.race([acq, timed]).then(function (srcId) {
           if (myGen !== GO_LIVE.gen) {

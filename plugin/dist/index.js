@@ -383,7 +383,7 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
+function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed }) {
   const onCancel = useContext(BackNav);
   const [jpeg, setJpeg] = useState(null);
   const [hint, setHint] = useState("Starting…");
@@ -396,7 +396,7 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
       } catch (_) {}
       while (!stop) {
         try {
-          const r = await getVideoFrames();
+          const r = await getVideoFrames({ userId: userId, w: 640, h: 360 });
           const frames = (r && r.frames) || [];
           const hit =
             frames.find((f) => f.userId === userId && f.kind === kind) ||
@@ -406,7 +406,7 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
             setHint("");
           }
         } catch (_) {}
-        await new Promise((res) => setTimeout(res, 120));
+        await new Promise((res) => setTimeout(res, 160));
       }
     })();
     return () => {
@@ -415,6 +415,7 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
   }, [userId, kind]);
   const close = () => {
     if (!keepAudio.current) clearAudioFocus().catch(() => {});
+    if (onClosed) onClosed();
     if (closeModal) closeModal();
   };
   const pin = () => {
@@ -509,15 +510,14 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned }) {
   );
 }
 
-function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, onOpenMember, onWatch }) {
+function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWatch }) {
   const onCancel = useContext(BackNav);
   const go = () => {
     if (stream.self) {
       if (onOpenMember) onOpenMember(stream);
       return;
     }
-    if (focused && onWatch) onWatch(stream);
-    else if (onFocus) onFocus(stream.userId);
+    if (onWatch) onWatch(stream);
   };
   return e(
     Focusable,
@@ -530,11 +530,11 @@ function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, o
       style: {
         ...FILL,
         position: "relative",
-        height: height || undefined,
-        aspectRatio: height ? undefined : "16 / 9",
+        aspectRatio: "16 / 9",
         padding: 0,
         margin: "0 0 6px",
         overflow: "hidden",
+        background: "#000",
         boxShadow: focused
           ? "inset 0 0 0 2px #3ba55d"
           : speaking
@@ -551,7 +551,7 @@ function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, o
             style: {
               width: "100%",
               height: "100%",
-              objectFit: stream.kind === "screenshare" ? "contain" : "cover",
+              objectFit: "contain",
               display: "block",
               background: "#000",
             },
@@ -561,7 +561,8 @@ function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, o
             style: {
               width: "100%",
               height: "100%",
-              minHeight: height || 120,
+              minHeight: 0,
+              aspectRatio: "16 / 9",
               background: "rgba(0,0,0,0.55)",
               display: "flex",
               alignItems: "center",
@@ -619,17 +620,78 @@ function VideoTile({ stream, focused, jpeg, height, speaking, pinned, onFocus, o
   );
 }
 
-function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onFocus, onOpenMember, onWatch, onMore, onPin }) {
+function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onOpenMember, onWatch, onMore, onPin, onStop, onUnpin }) {
+  const onCancel = useContext(BackNav);
   const list = streams || [];
   const copied = list.slice(0, max);
   const extra = Math.max(0, list.length - copied.length);
-  const n = copied.length || 1;
-  const h = n === 1 ? 225 : n === 2 ? 160 : 120;
   const byKey = {};
   (frames || []).forEach((f) => {
     byKey[f.userId + ":" + (f.kind || "camera")] = f;
   });
   if (!copied.length) return null;
+  const focusedStream =
+    copied.find((x) => x.userId === focusedUserId) ||
+    copied.find((x) => x.userId === pinnedUserId) || {
+      userId: focusedUserId || pinnedUserId,
+      kind: "screenshare",
+      name: "",
+    };
+  const watching = !!(focusedUserId || pinnedUserId);
+  const actions = [];
+  if (watching) {
+    actions.push(
+      e(
+        DFL.PanelSectionRow,
+        { key: "stop" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: pinnedUserId ? "Removes the corner stamp and stream audio" : "Mutes stream audio, party voice stays",
+            onClick: onStop,
+            ...cancelBind(onCancel),
+          },
+          "Stop watching"
+        )
+      )
+    );
+  }
+  if (pinnedUserId && onUnpin) {
+    actions.push(
+      e(
+        DFL.PanelSectionRow,
+        { key: "unpin" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: "Keep listening, drop the stamp",
+            onClick: onUnpin,
+            ...cancelBind(onCancel),
+          },
+          "Unpin from corner"
+        )
+      )
+    );
+  } else if (focusedUserId && onPin) {
+    actions.push(
+      e(
+        DFL.PanelSectionRow,
+        { key: "pin" },
+        e(
+          DFL.ButtonItem,
+          {
+            layout: "below",
+            description: "Keeps a stamp on the game after you close the QAM",
+            onClick: () => onPin(focusedStream),
+            ...cancelBind(onCancel),
+          },
+          "Pin to corner"
+        )
+      )
+    );
+  }
   return e(
     "div",
     { style: { ...FILL, padding: 0, margin: "0 0 8px" } },
@@ -641,10 +703,8 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           stream: s,
           focused: !s.self && focusedUserId === s.userId,
           jpeg: fr.black ? null : fr.jpeg,
-          height: h,
           speaking: !!(speakingIds && speakingIds[s.userId]),
           pinned: pinnedUserId === s.userId,
-          onFocus,
           onOpenMember,
           onWatch,
         });
@@ -656,27 +716,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
             ]
           : []
       )
-      .concat(
-        focusedUserId && onPin
-          ? [
-              e(
-                Row,
-                {
-                  key: "pin",
-                  onClick: () => {
-                    const s = copied.find((x) => x.userId === focusedUserId) || {
-                      userId: focusedUserId,
-                      kind: "screenshare",
-                      name: "",
-                    };
-                    onPin(s);
-                  },
-                },
-                e(Label, null, "Pin focused stream to corner")
-              ),
-            ]
-          : []
-      )
+      .concat(actions)
   );
 }
 
@@ -884,9 +924,8 @@ function App() {
       grabBusy.current = false;
     };
     pull();
-    const focused = !!(status && status.voice && status.voice.focusedUserId);
-    const fps = focused ? 8 : streamCount <= 1 ? 5 : streamCount === 2 ? 4 : 3;
-    const id = setInterval(pull, Math.max(focused ? 120 : 220, Math.floor(1000 / fps)));
+    const fps = streamCount <= 1 ? 6 : streamCount === 2 ? 5 : 4;
+    const id = setInterval(pull, Math.max(180, Math.floor(1000 / fps)));
     return () => {
       stop = true;
       clearInterval(id);
@@ -1143,7 +1182,6 @@ function App() {
   const focusedUserId = (voice && voice.focusedUserId) || null;
   const showLiveVideo = videoEnabled && hasVideo;
   const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
-  const onTileFocus = (uid) => act("Watch audio", () => focusStream(uid), { quiet: true });
   const pip = (status && status.pip) || (cfg && cfg.pip) || {};
   const pipOn = !!(pip.enabled && pip.userId);
   const talking = (status && status.talking) || (cfg && cfg.talking) || {};
@@ -1169,6 +1207,14 @@ function App() {
       act("Pin", () => pinPip(s.userId, s.kind || "screenshare", s.name || ""), { quiet: false })
     );
   };
+  const onUnpinStream = () => tap(() => act("Unpin", () => unpinPip()));
+  const onStopWatch = () =>
+    tap(() =>
+      act("Stop watching", async () => {
+        if (pipOn) await unpinPip();
+        await clearAudioFocus();
+      })
+    );
   const onTileMember = (s) => {
     const m = memberById(s.userId) || { id: s.userId, name: s.name, avatar: s.avatar, self: !!s.self };
     openMember(m);
@@ -1321,7 +1367,6 @@ function App() {
               Sub,
               null,
               [
-                talking ? "speaking" : "",
                 focusedUserId === m.id ? "solo" : "",
                 m.localMute || m.muted ? "muted" : "",
                 m.deaf ? "deaf" : "",
@@ -1358,11 +1403,12 @@ function App() {
         speakingIds,
         pinnedUserId: pipOn ? pip.userId : null,
         max: 3,
-        onFocus: onTileFocus,
         onOpenMember: onTileMember,
         onWatch: onWatchStream,
         onMore: openVideoPage,
         onPin: onPinStream,
+        onStop: onStopWatch,
+        onUnpin: onUnpinStream,
       })
     : null;
 
@@ -1742,10 +1788,11 @@ function App() {
         speakingIds,
         pinnedUserId: pipOn ? pip.userId : null,
         max: 4,
-        onFocus: onTileFocus,
         onOpenMember: onTileMember,
         onWatch: onWatchStream,
         onPin: onPinStream,
+        onStop: onStopWatch,
+        onUnpin: onUnpinStream,
       }),
     ].concat(compactVoice));
   } else if (view.page === "watch") {

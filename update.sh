@@ -167,9 +167,11 @@ pull_repo() {
     bar 15 "Fetching from GitHub…"
     echo "git fetch ${dir}"
     git -C "${dir}" fetch --prune origin
-    local branch
-    branch="$(git -C "${dir}" rev-parse --abbrev-ref HEAD)"
-    git -C "${dir}" merge --ff-only "origin/${branch}" || git -C "${dir}" merge --ff-only origin/main
+    # This clone is an update cache, not a working tree. Discard local
+    # edits so "your local changes would be overwritten" cannot fail QAM update.
+    git -C "${dir}" reset --hard origin/main 2>/dev/null \
+      || git -C "${dir}" reset --hard FETCH_HEAD
+    git -C "${dir}" clean -fd
   else
     bar 15 "Cloning repository…"
     echo "git clone ${REPO}"

@@ -84,6 +84,7 @@ DATA_DIR = _ensure_dir(_login_home() / ".local" / "share" / "deckscord")
 SETTINGS_PATH = DATA_DIR / "settings.json"
 PIP_DIR = _ensure_dir(DATA_DIR / "pip")
 WANT_PORTAL = DATA_DIR / "want-portal"
+PORTAL_STATUS = DATA_DIR / "portal.status"
 
 
 def _nudge_portal() -> None:
@@ -91,6 +92,18 @@ def _nudge_portal() -> None:
         WANT_PORTAL.write_text(str(time.time()), encoding="utf-8")
     except OSError:
         pass
+
+
+def _portal_owned() -> bool:
+    try:
+        raw = json.loads(PORTAL_STATUS.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("owned"):
+            ts = float(raw.get("ts") or 0)
+            if ts and time.time() - ts < 20:
+                return True
+    except Exception:
+        pass
+    return False
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "pip": {
@@ -695,26 +708,41 @@ def list_game_audio_nodes() -> list[dict[str, Any]]:
     return out[:8]
 
 
-def in_game_mode() -> bool:
-    kwin = False
-    gamescope = False
+def _proc_comms() -> set[str]:
+    names: set[str] = set()
     try:
         for p in Path("/proc").iterdir():
             if not p.name.isdigit():
                 continue
             try:
-                comm = (p / "comm").read_text().strip()
+                names.add((p / "comm").read_text().strip())
             except OSError:
                 continue
-            if comm in ("kwin_wayland", "kwin_x11"):
-                kwin = True
-            if comm in ("gamescope", "gamescope-wl"):
-                gamescope = True
     except OSError:
         pass
-    if kwin:
+    return names
+
+
+def _has_gamescope(names: Optional[set[str]] = None) -> bool:
+    names = names if names is not None else _proc_comms()
+    return any(n == "gamescope" or n.startswith("gamescope") for n in names)
+
+
+def _has_kwin(names: Optional[set[str]] = None) -> bool:
+    names = names if names is not None else _proc_comms()
+    return "kwin_wayland" in names or "kwin_x11" in names
+
+
+def in_game_mode() -> bool:
+    """True when gamescope is the session compositor (Steam Game Mode).
+
+    Nested gamescope under KWin/Plasma is Desktop Mode — do not steal the
+    portal or cover :0. Match gamescope* comms (gamescope-session truncates).
+    """
+    names = _proc_comms()
+    if _has_kwin(names):
         return False
-    return gamescope
+    return _has_gamescope(names)
 
 
 class Cdp:
@@ -960,6 +988,7 @@ class Plugin:
         self._mic_pin_until = 0.0
         self._go_live_until = 0.0
         self._go_live_pending = False
+        self._grab_at = 0.0
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -1024,6 +1053,10 @@ class Plugin:
             start_new_session=True,
             close_fds=True,
         )
+        try:
+            (DATA_DIR / "portal.pid").write_text(str(self._portal_proc.pid), encoding="utf-8")
+        except OSError:
+            pass
         decky.logger.info(f"portal shim pid={self._portal_proc.pid} log={log}")
 
     def _stop_portal_shim(self) -> None:
@@ -1513,6 +1546,8 @@ class Plugin:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
+        owned = await self._wait_portal_owned(8.0)
+        decky.logger.info(f"start_go_live portal_owned={owned} game_mode={in_game_mode()}")
         try:
             ensure_mic_not_loopback()
         except Exception:
@@ -1523,9 +1558,17 @@ class Plugin:
             "window.__deckscord.startGoLive("
             + json.dumps({"width": w, "height": h, "fps": f, "gameAudio": game_audio})
             + ")",
-            timeout=28.0,
+            timeout=22.0,
         )
         ok = isinstance(r, dict) and r.get("ok") is not False
+        if not isinstance(r, dict):
+            r = {"ok": False, "error": str(r)}
+            ok = False
+        if not ok and not owned:
+            r["error"] = (
+                str(r.get("error") or "Go Live failed")
+                + ". Game capture portal was not ready — stay in Game Mode and try Share game again."
+            )
         self._go_live_pending = False
         if ok:
             self._go_live_until = time.monotonic() + 20.0
@@ -1660,7 +1703,26 @@ class Plugin:
     async def _arm_grab_window(self) -> None:
         if not self._video_enabled:
             return
-        self._grab_alive_until = time.monotonic() + 3.0
+        self._grab_alive_until = time.monotonic() + 8.0
+
+    async def _wait_portal_owned(self, timeout: float = 8.0) -> bool:
+        _nudge_portal()
+        try:
+            self._ensure_portal_shim()
+        except Exception:
+            pass
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            if _portal_owned():
+                return True
+            proc = self._portal_proc
+            if proc is not None and proc.poll() is not None:
+                try:
+                    self._ensure_portal_shim()
+                except Exception:
+                    pass
+            await asyncio.sleep(0.25)
+        return _portal_owned()
 
     async def _maybe_show_for_camera(self, frames: list) -> None:
         """Only raise Vesktop if we still have no pixels and someone has a camera.
@@ -1702,6 +1764,11 @@ class Plugin:
         return out
 
     async def get_video_frames(self, user_id: str = "", w: int = 0, h: int = 0, **kwargs: Any) -> dict[str, Any]:
+        if isinstance(user_id, dict):
+            kwargs.update(user_id)
+            user_id = str(kwargs.get("user_id") or kwargs.get("userId") or "")
+            w = kwargs.get("w") or kwargs.get("width") or w
+            h = kwargs.get("h") or kwargs.get("height") or h
         uid = str(user_id or kwargs.get("user_id") or kwargs.get("userId") or "")
         ww = int(kwargs.get("w") or w or 0)
         hh = int(kwargs.get("h") or h or 0)
@@ -1710,6 +1777,7 @@ class Plugin:
         if self._status_lock.locked() or self._grab_lock.locked():
             return {"ok": True, "frames": self._last_frames, "cached": True, "videoEnabled": True}
         async with self._grab_lock:
+            await self._arm_grab_window()
             t0 = time.monotonic()
             opts: dict[str, Any] = {}
             if uid:
@@ -1739,6 +1807,7 @@ class Plugin:
                     except Exception:
                         pass
                 self._last_frames = frames
+                self._grab_at = time.monotonic()
                 r["frames"] = frames
             if time.monotonic() - self._grab_log_at > 5:
                 n = len((r or {}).get("frames") or [])
@@ -1974,14 +2043,24 @@ class Plugin:
                     self._set_update("error", 12, err, ok=False, error=err)
                     return
                 self._set_update("merge", 40, "Applying commits…")
-                r = await asyncio.to_thread(self._git, ["merge", "--ff-only", "origin/main"], src, 30)
+                # Update cache only — never merge. Local edits in this clone
+                # are leftover copies and must not block QAM update.
+                r = await asyncio.to_thread(self._git, ["reset", "--hard", "origin/main"], src, 30)
                 if r.returncode != 0:
-                    r = await asyncio.to_thread(self._git, ["pull", "--ff-only"], src, 30)
+                    r = await asyncio.to_thread(self._git, ["reset", "--hard", "FETCH_HEAD"], src, 30)
                 if r.returncode != 0:
-                    err = (r.stderr or r.stdout or "git pull failed").strip()
+                    err = (r.stderr or r.stdout or "git reset failed").strip()
                     note(err)
-                    self._set_update("error", 40, err, ok=False, error=err)
-                    return
+                    shutil.rmtree(src, ignore_errors=True)
+                    self._set_update("clone", 20, "Re-cloning repository…")
+                    r = await asyncio.to_thread(self._git, ["clone", "--depth", "1", REPO_URL, str(src)], None, 120)
+                    if r.returncode != 0:
+                        err = (r.stderr or r.stdout or "git clone failed").strip()
+                        note(err)
+                        self._set_update("error", 20, err, ok=False, error=err)
+                        return
+                else:
+                    await asyncio.to_thread(self._git, ["clean", "-fd"], src, 15)
                 note(f"pulled {src}")
             else:
                 if src.exists():
@@ -2106,6 +2185,8 @@ class Plugin:
         proc = self._pip_proc
         if proc is not None and proc.poll() is None:
             return
+        if proc is not None:
+            decky.logger.info(f"overlay restart (exit={proc.poll()})")
         script = PLUGIN_DIR / "pip_overlay.py"
         if not script.is_file():
             decky.logger.warning("pip_overlay.py missing")
@@ -2136,8 +2217,11 @@ class Plugin:
         if not uid:
             return
         w, h = _pip_dims(str(pip.get("size") or "small"))
-        self._grab_alive_until = time.monotonic() + 4.0
-        r = await self.get_video_frames(user_id=uid, w=w, h=h)
+        self._grab_alive_until = time.monotonic() + 8.0
+        if self._last_frames and (time.monotonic() - self._grab_at) < 0.22:
+            r = {"frames": self._last_frames}
+        else:
+            r = await self.get_video_frames(user_id=uid, w=w, h=h)
         frames = (r or {}).get("frames") or []
         hit = None
         kind = str(pip.get("kind") or "")
@@ -2299,7 +2383,7 @@ class Plugin:
                     await self._pip_grab_once()
                 if pip_on or talk_on:
                     self._start_pip_overlay()
-                    await asyncio.sleep(1.0 / 30.0 if pip_on else 0.25)
+                    await asyncio.sleep(0.18 if pip_on else 0.25)
                 else:
                     self._stop_overlay_if_idle()
                     await asyncio.sleep(0.4)
@@ -2404,10 +2488,6 @@ class Plugin:
         _save_settings(self._settings)
         self._write_pip_state()
         self._stop_overlay_if_idle()
-        try:
-            await self._clear_audio_focus_safe()
-        except Exception:
-            pass
         return {"ok": True, "pip": pip}
 
     async def set_golive_quality(self, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
