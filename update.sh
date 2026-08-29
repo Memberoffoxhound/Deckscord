@@ -56,34 +56,98 @@ sync_plugin() {
   local uid gid
   uid="$(id -u)"
   gid="$(id -g)"
-  if [[ -d "${PLUGIN_DIR}" && -w "${PLUGIN_DIR}/." ]]; then
-    if command -v rsync >/dev/null 2>&1; then
-      rsync -rltD --chmod=Du+rwx,Fu+rw \
-        --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' --exclude '.git' \
-        "${src}/" "${PLUGIN_DIR}/"
+  # Decky often leaves the plugin directory root-owned 0755. rsync/cp temps
+  # need +w on the directory; files the user owns can still be truncated.
+  if ! python3 - "${src}" "${PLUGIN_DIR}" "${uid}" "${gid}" <<'PY'
+import os, sys
+from pathlib import Path
+
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+uid, gid = int(sys.argv[3]), int(sys.argv[4])
+skip_dir = {"__pycache__", "node_modules", ".git"}
+errors = []
+
+def dir_writable(p: Path) -> bool:
+    try:
+        return p.is_dir() and os.access(p, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+def write_bytes(path: Path, data: bytes) -> None:
+    parent = path.parent
+    mode = path.stat().st_mode if path.exists() else None
+    if dir_writable(parent):
+        tmp = parent / (".%s.decknew.%s" % (path.name, os.getpid()))
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    elif path.exists():
+        if not os.access(path, os.W_OK):
+            try:
+                os.chmod(path, path.stat().st_mode | 0o220)
+            except OSError:
+                pass
+        fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    else:
+        raise PermissionError("cannot create %s" % path)
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+for root, dirs, files in os.walk(src):
+    dirs[:] = [d for d in dirs if d not in skip_dir]
+    rel = Path(root).relative_to(src)
+    dest_dir = dst / rel
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        if not dest_dir.is_dir():
+            errors.append("mkdir %s" % dest_dir)
+            continue
+    for name in files:
+        if name.endswith(".pyc") or ".decknew" in name:
+            continue
+        try:
+            write_bytes(dest_dir / name, (Path(root) / name).read_bytes())
+        except OSError as e:
+            errors.append("%s: %s" % (rel / name, e))
+
+core_ok = all((dst / c).is_file() for c in ("main.py", "bridge.js", "dist/index.js"))
+if errors:
+    sys.stderr.write("skipped %s file(s): %s\n" % (len(errors), "; ".join(errors[:6])))
+if not core_ok:
+    sys.exit(2)
+print("copied %s -> %s" % (src, dst))
+PY
+  then
+    if sudo -n true 2>/dev/null; then
+      echo "Plugin dir is root-owned; copying with sudo, then giving it back to $(whoami)."
+      sudo -n mkdir -p "${PLUGIN_DIR}"
+      if command -v rsync >/dev/null 2>&1; then
+        sudo -n rsync -rltD --chmod=Du+rwx,Fu+rw \
+          --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' --exclude '.git' \
+          "${src}/" "${PLUGIN_DIR}/"
+      else
+        sudo -n cp -R "${src}/." "${PLUGIN_DIR}/"
+      fi
+      sudo -n chown -R "${uid}:${gid}" "${PLUGIN_DIR}"
+      sudo -n chmod -R u+rwX "${PLUGIN_DIR}"
     else
-      cp -R "${src}/." "${PLUGIN_DIR}/"
+      echo -e "${YELLOW}Cannot write ${PLUGIN_DIR} (owned by root).${NC}"
+      echo "SteamOS / Decky installed it as root. One-time:"
+      echo "  sudo chown -R ${uid}:${gid} ${PLUGIN_DIR}"
+      echo "  sudo chmod -R u+rwX ${PLUGIN_DIR}"
+      echo "Then re-run this updater."
+      exit 1
     fi
-  elif sudo -n true 2>/dev/null; then
-    echo "Plugin dir is root-owned; copying with sudo, then giving it back to $(whoami)."
-    sudo -n mkdir -p "${PLUGIN_DIR}"
-    if command -v rsync >/dev/null 2>&1; then
-      sudo -n rsync -rltD --chmod=Du+rwx,Fu+rw \
-        --exclude '__pycache__' --exclude '*.pyc' --exclude 'node_modules' --exclude '.git' \
-        "${src}/" "${PLUGIN_DIR}/"
-    else
-      sudo -n cp -R "${src}/." "${PLUGIN_DIR}/"
-    fi
-    sudo -n chown -R "${uid}:${gid}" "${PLUGIN_DIR}"
-    sudo -n chmod -R u+rwX "${PLUGIN_DIR}"
-  else
-    echo -e "${YELLOW}Cannot write ${PLUGIN_DIR} (owned by root).${NC}"
-    echo "SteamOS / Decky installed it as root. One-time:"
-    echo "  sudo chown -R ${uid}:${gid} ${PLUGIN_DIR}"
-    echo "  sudo chmod -R u+rwX ${PLUGIN_DIR}"
-    echo "Then re-run this updater."
-    exit 1
   fi
+  sudo -n chown -R "${uid}:${gid}" "${PLUGIN_DIR}" 2>/dev/null || true
   if [[ -f "${src}/../launch-vesktop.sh" ]]; then
     cp "${src}/../launch-vesktop.sh" "${DATA_DIR}/launch-vesktop.sh"
     chmod +x "${DATA_DIR}/launch-vesktop.sh"

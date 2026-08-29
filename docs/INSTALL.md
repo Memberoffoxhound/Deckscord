@@ -26,7 +26,15 @@ If the QAM tile is missing: Decky → Developer Mode, then reopen the QAM. `sudo
 
 ## Updates (no sudo)
 
-Older installs `chown`’d the plugin to root, which is why `update.sh` asked for a password. The plugin dir is now **yours**. After a one-time `sudo chown -R "$USER" ~/homebrew/plugins/Deckscord` if it is still root-owned:
+Older installs `chown`’d the plugin folder to root. The QAM updater and
+`update.sh` overwrite files you already own **in place** (no rsync temps in
+that folder), so a root-owned `~/homebrew/plugins/Deckscord` no longer blocks
+updates. Optional, one-time, if you want the folder itself back:
+
+```bash
+sudo chown -R "$USER:$USER" ~/homebrew/plugins/Deckscord
+sudo chmod -R u+rwX ~/homebrew/plugins/Deckscord
+```
 
 ```bash
 ./update.sh          # git pull + copy

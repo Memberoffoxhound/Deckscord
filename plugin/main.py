@@ -212,51 +212,112 @@ def _plugin_dst() -> Path:
     return here
 
 
+def _dir_is_writable(path: Path) -> bool:
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def _write_bytes(path: Path, data: bytes, uid: int, gid: int) -> None:
+    """Write `path` even when the parent directory is root-owned 0755.
+
+    Atomic replace needs +w on the directory (Decky often leaves
+    ~/homebrew/plugins/Deckscord owned by root). Files the user already
+    owns can still be truncated in place — that is the QAM updater path
+    on Bazzite, where PluginLoader is euid=1000 and sudo -n is not set.
+    """
+    parent = path.parent
+    orig_mode = None
+    try:
+        if path.exists():
+            orig_mode = path.stat().st_mode
+    except OSError:
+        pass
+
+    if _dir_is_writable(parent):
+        tmp = parent / f".{path.name}.decknew.{os.getpid()}"
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    elif path.exists():
+        if not os.access(path, os.W_OK):
+            _chmod_write(path, False)
+        fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    else:
+        raise PermissionError(f"cannot create {path}: {parent} is not writable")
+
+    if orig_mode is not None:
+        try:
+            os.chmod(path, orig_mode)
+        except OSError:
+            pass
+    if os.geteuid() == 0:
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+
+
 def _install_file(src: Path, dst: Path, uid: int, gid: int) -> None:
     data = src.read_bytes()
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    _force_writable(dst.parent, uid, gid)
-    tmp = dst.with_name("." + dst.name + ".decknew")
     try:
-        tmp.write_bytes(data)
+        dst.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        if dst.exists():
-            _force_writable(dst, uid, gid)
-            try:
-                dst.unlink()
-            except OSError:
-                pass
-        tmp.write_bytes(data)
-    os.replace(tmp, dst)
+        if not dst.parent.is_dir():
+            raise
+    _force_writable(dst.parent, uid, gid)
+    _write_bytes(dst, data, uid, gid)
     _force_writable(dst, uid, gid)
 
 
-def _copy_plugin_tree(src: Path, dst: Path, uid: int, gid: int) -> None:
-    """Overlay-copy plugin files. No rsync -a (that preserves root owner and --delete hits EACCES)."""
+def _copy_plugin_tree(src: Path, dst: Path, uid: int, gid: int) -> list[str]:
+    """Overlay-copy plugin files. No rsync -a (that preserves root owner and --delete hits EACCES).
+
+    Returns a list of per-file errors. Core files may still have been written.
+    """
     skip_dir = {"__pycache__", "node_modules", ".git"}
-    dst.mkdir(parents=True, exist_ok=True)
+    errors: list[str] = []
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        if not dst.is_dir():
+            return [f"mkdir {dst}: permission denied"]
     _force_writable(dst, uid, gid)
     for root, dirs, files in os.walk(src):
         dirs[:] = [d for d in dirs if d not in skip_dir]
         rel = Path(root).relative_to(src)
         dest_dir = dst / rel
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            if not dest_dir.is_dir():
+                errors.append(f"mkdir {dest_dir}: permission denied")
+                continue
         _force_writable(dest_dir, uid, gid)
         for name in files:
             if name.endswith(".pyc") or name.endswith(".decknew"):
                 continue
-            _install_file(Path(root) / name, dest_dir / name, uid, gid)
+            try:
+                _install_file(Path(root) / name, dest_dir / name, uid, gid)
+            except OSError as e:
+                errors.append(f"{rel / name}: {e}")
     for junk in dst.glob("n.*"):
         try:
             if junk.is_file() and len(junk.name) < 20:
                 junk.unlink()
         except OSError:
             pass
-    for tmp in dst.rglob("*.decknew"):
+    for tmp in dst.rglob("*.decknew*"):
         try:
             tmp.unlink()
         except OSError:
             pass
+    return errors
 
 
 def _load_settings() -> dict[str, Any]:
@@ -1942,14 +2003,19 @@ class Plugin:
             if not (plugin_src / "main.py").is_file():
                 self._set_update("error", 70, "no plugin in repo", ok=False, error="no plugin")
                 return
-            note(f"copy {plugin_src} -> {dst} euid={os.geteuid()} owner={dst.stat().st_uid if dst.exists() else '?'}")
-            self._ensure_plugin_writable(dst)
-            copied = False
+            own = "?"
             try:
-                await asyncio.to_thread(_copy_plugin_tree, plugin_src, dst, uid, gid)
-                copied = True
-            except OSError as e:
-                note(f"copy: {e}")
+                st = dst.stat()
+                own = f"uid={st.st_uid} mode={oct(st.st_mode)}"
+            except OSError:
+                pass
+            note(f"copy {plugin_src} -> {dst} euid={os.geteuid()} owner={own}")
+            self._ensure_plugin_writable(dst)
+            errors = await asyncio.to_thread(_copy_plugin_tree, plugin_src, dst, uid, gid)
+            core = ("main.py", "bridge.js", Path("dist") / "index.js")
+            missing_core = [str(c) for c in core if not (dst / c).is_file()]
+            if missing_core:
+                note("core missing after copy: " + ", ".join(missing_core))
                 rsync = await asyncio.to_thread(
                     _run,
                     [
@@ -1968,26 +2034,19 @@ class Plugin:
                     30,
                 )
                 if rsync.returncode != 0:
-                    err = (rsync.stderr or rsync.stdout or str(e)).strip()
-                    own = "?"
-                    try:
-                        st = dst.stat()
-                        own = f"uid={st.st_uid} mode={oct(st.st_mode)}"
-                    except OSError:
-                        pass
+                    err = (rsync.stderr or rsync.stdout or "copy failed").strip()
+                    user = home.name
                     msg = (
-                        f"Permission denied writing {dst} ({own}, euid={os.geteuid()}). "
-                        f"On the Deck, from Desktop Mode: sudo chown -R deck:deck {dst} "
-                        f"&& sudo chmod -R u+rwX {dst}"
+                        f"Cannot write {dst} ({own}, euid={os.geteuid()}). "
+                        f"One-time: sudo chown -R {user}:{user} {dst} && sudo chmod -R u+rwX {dst}"
                     )
                     note(err)
                     self._set_update("error", 70, msg, ok=False, error=msg, head=head_s)
                     return
-                copied = True
                 note("copied with sudo rsync")
-            if not copied:
-                self._set_update("error", 70, "copy failed", ok=False, error="copy failed")
-                return
+                errors = []
+            elif errors:
+                note("skipped " + str(len(errors)) + " root-owned file(s): " + "; ".join(errors[:6]))
             _run(["sudo", "-n", "chown", "-R", f"{uid}:{gid}", str(dst)], timeout=15)
             for helper in ("launch-vesktop.sh", "update.sh", "uninstall.sh"):
                 hf = src / helper
