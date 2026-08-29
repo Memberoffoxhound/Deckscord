@@ -152,6 +152,10 @@ PY
     cp "${src}/../launch-vesktop.sh" "${DATA_DIR}/launch-vesktop.sh"
     chmod +x "${DATA_DIR}/launch-vesktop.sh"
   fi
+  if [[ -f "${src}/webrtc_hub.py" ]]; then
+    cp "${src}/webrtc_hub.py" "${DATA_DIR}/webrtc_hub.py"
+    chmod +x "${DATA_DIR}/webrtc_hub.py"
+  fi
   for helper in update.sh uninstall.sh; do
     if [[ -f "${src}/../${helper}" ]]; then
       cp "${src}/../${helper}" "${DATA_DIR}/${helper}"

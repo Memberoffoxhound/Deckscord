@@ -340,7 +340,7 @@ class Portal:
                 .decode(errors="replace")
                 .lower()
             )
-            if any(k in cmd for k in ("vesktop", "vencord", "discord")):
+            if any(k in cmd for k in ("vesktop", "vencord", "discord", "xdg-desktop-portal")):
                 return True
             cg = Path(f"/proc/{pid}/cgroup").read_text(errors="replace").lower()
             if any(k in cg for k in ("vesktop", "vencord")):
@@ -572,6 +572,9 @@ class Portal:
 
     def register(self, conn: Gio.DBusConnection) -> None:
         self.conn = conn
+        if self.regs:
+            log.info("ScreenCast objects already on %s", PORTAL_PATH)
+            return
         conn.add_filter(self.on_filter)
         info = Gio.DBusNodeInfo.new_for_xml(XML)
         for iface in info.interfaces:

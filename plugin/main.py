@@ -86,6 +86,9 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 PIP_DIR = _ensure_dir(DATA_DIR / "pip")
 WANT_PORTAL = DATA_DIR / "want-portal"
 PORTAL_STATUS = DATA_DIR / "portal.status"
+WEBRTC_PORT_PATH = DATA_DIR / "webrtc.port"
+WEBRTC_DEFAULT_PORT = 18765
+PIP_WIN_TITLE = "Deckscord PiP"
 
 
 def _nudge_portal() -> None:
@@ -644,6 +647,110 @@ def _overlay_env() -> dict[str, str]:
     return env
 
 
+def _webrtc_port() -> int:
+    try:
+        n = int(WEBRTC_PORT_PATH.read_text(encoding="utf-8").strip())
+        if 1 <= n <= 65535:
+            return n
+    except Exception:
+        pass
+    return WEBRTC_DEFAULT_PORT
+
+
+def _webrtc_url() -> str:
+    return f"http://127.0.0.1:{_webrtc_port()}"
+
+
+def _screen_size() -> tuple[int, int]:
+    env = _overlay_env()
+    try:
+        r = subprocess.run(
+            ["xdotool", "getdisplaygeometry"],
+            capture_output=True, text=True, timeout=2, env=env,
+        )
+        parts = (r.stdout or "").split()
+        if len(parts) >= 2:
+            return max(640, int(parts[0])), max(400, int(parts[1]))
+    except Exception:
+        pass
+    return 1280, 800
+
+
+def _pip_geom(pip: Optional[dict] = None) -> dict[str, int]:
+    pip = pip or {}
+    sw, sh = _screen_size()
+    w, h = _pip_dims(str(pip.get("size") or "small"))
+    frac = 0.42 if str(pip.get("size") or "") == "large" else 0.30
+    h = min(h, max(90, int(sh * frac)))
+    w = int(h * 16 / 9)
+    pad = max(10, int(min(sw, sh) * 0.012))
+    corner = str(pip.get("corner") or "bottom-right")
+    if corner == "top-left":
+        x, y = pad, pad
+    elif corner == "top-right":
+        x, y = sw - w - pad, pad
+    elif corner == "bottom-left":
+        x, y = pad, sh - h - pad
+    else:
+        x, y = sw - w - pad, sh - h - pad
+    return {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "sw": sw, "sh": sh}
+
+
+def _find_xwin(title: str) -> int:
+    env = _overlay_env()
+    try:
+        r = subprocess.run(
+            ["xdotool", "search", "--name", title],
+            capture_output=True, text=True, timeout=2, env=env,
+        )
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["xwininfo", "-root", "-tree"],
+            capture_output=True, text=True, timeout=3, env=env,
+        )
+        needle = title.lower()
+        for line in (r.stdout or "").splitlines():
+            if needle not in line.lower():
+                continue
+            tok = line.strip().split()
+            if tok and tok[0].startswith("0x"):
+                return int(tok[0], 16)
+    except Exception:
+        pass
+    return 0
+
+
+def _set_overlay_xid(xid: int) -> bool:
+    if not xid:
+        return False
+    env = _overlay_env()
+    try:
+        subprocess.run(
+            [
+                "xprop", "-id", str(xid),
+                "-f", "GAMESCOPE_EXTERNAL_OVERLAY", "32c",
+                "-set", "GAMESCOPE_EXTERNAL_OVERLAY", "1",
+            ],
+            check=False, timeout=2, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["xprop", "-id", str(xid), "-f", "_NET_WM_STATE", "32a",
+             "-set", "_NET_WM_STATE", "_NET_WM_STATE_ABOVE"],
+            check=False, timeout=2, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _run(cmd: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -1147,6 +1254,9 @@ class Plugin:
         self._go_live_pending = False
         self._capture_env_restarted = False
         self._grab_at = 0.0
+        self._hub_proc: Optional[subprocess.Popen] = None
+        self._pip_xid = 0
+        self._rtc_ok = False
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
@@ -1168,6 +1278,10 @@ class Plugin:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
+        try:
+            self._ensure_webrtc_hub()
+        except Exception as e:
+            decky.logger.warning(f"webrtc hub: {e}")
         pip = (self._settings.get("pip") or {})
         if pip.get("enabled") and pip.get("userId"):
             pip["enabled"] = False
@@ -1185,8 +1299,13 @@ class Plugin:
         self._pip_task = None
         if task:
             task.cancel()
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.closePipViewer()")
+        except Exception:
+            pass
         self._stop_pip_overlay()
         self._stop_portal_shim()
+        self._stop_webrtc_hub()
         await self.cdp.close()
 
     def _ensure_portal_shim(self) -> None:
@@ -1218,6 +1337,50 @@ class Plugin:
         except OSError:
             pass
         decky.logger.info(f"portal shim pid={self._portal_proc.pid} log={log}")
+
+    def _ensure_webrtc_hub(self) -> None:
+        proc = self._hub_proc
+        if proc is not None and proc.poll() is None:
+            return
+        script = PLUGIN_DIR / "webrtc_hub.py"
+        if not script.is_file():
+            script = DATA_DIR / "webrtc_hub.py"
+        if not script.is_file():
+            decky.logger.warning("webrtc_hub.py missing")
+            return
+        log = DATA_DIR / "webrtc-hub.log"
+        log_f = open(log, "ab")
+        log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        log_f.flush()
+        env = _subprocess_env()
+        self._hub_proc = subprocess.Popen(
+            ["/usr/bin/python3", str(script)],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        for _ in range(20):
+            time.sleep(0.05)
+            if WEBRTC_PORT_PATH.is_file():
+                break
+        decky.logger.info(f"webrtc hub pid={self._hub_proc.pid} url={_webrtc_url()}")
+
+    def _stop_webrtc_hub(self) -> None:
+        proc = self._hub_proc
+        self._hub_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _stop_portal_shim(self) -> None:
         proc = self._portal_proc
@@ -1322,11 +1485,19 @@ class Plugin:
             if self._bridge_hash == h:
                 ping = await self._eval("window.__deckscord ? window.__deckscord.ping() : {ok:false}")
                 if isinstance(ping, dict) and ping.get("ok"):
+                    try:
+                        await self._eval(f"window.__deckscordHub = {json.dumps(_webrtc_url())}")
+                    except Exception:
+                        pass
                     return
             result = await self._eval(f"(function(){{ {src}\n }})()")
             if isinstance(result, dict) and result.get("ok") is False:
                 raise RuntimeError(result.get("error") or "bridge inject failed")
             self._bridge_hash = h
+            try:
+                await self._eval(f"window.__deckscordHub = {json.dumps(_webrtc_url())}")
+            except Exception:
+                pass
             if self._audio_focus.get("userId"):
                 try:
                     await self._eval(
@@ -1435,6 +1606,7 @@ class Plugin:
             "pip": dict((self._settings.get("pip") or {})),
             "talking": dict((self._settings.get("talking") or {})),
             "golive": dict((self._settings.get("golive") or {"width": 1280, "height": 720, "fps": 30})),
+            "webrtc": {"url": _webrtc_url(), "port": _webrtc_port()},
         }
 
         targets: Optional[list] = None
@@ -1520,6 +1692,7 @@ class Plugin:
         if isinstance(snap, dict):
             out.update(snap)
             out["cdp"] = True
+            out["webrtc"] = {"url": _webrtc_url(), "port": _webrtc_port()}
         if out.get("logged_in") and out.get("ok") is not False:
             out["ready"] = True
             out["phase"] = "ready"
@@ -1600,7 +1773,11 @@ class Plugin:
                     v["streaming"] = True
                     out["voice"] = v
             try:
-                if pip_on or (self._video_enabled and time.monotonic() < self._grab_alive_until):
+                if pip_on:
+                    # Keep the PiP popup mapped. Park the Discord window off-screen
+                    # instead of minimizing — Electron often minimizes child popups too.
+                    await self.set_window_mode("offscreen")
+                elif self._video_enabled and time.monotonic() < self._grab_alive_until:
                     pass
                 else:
                     if self._video_enabled and self._grab_alive_until and time.monotonic() >= self._grab_alive_until:
@@ -1742,10 +1919,11 @@ class Plugin:
             pass
         await self._ensure_cdp(inject=True)
         await self._inject_bridge()
-        # Vesktop's picker lives in the renderer. A minimized window often never
-        # mounts it, so getDesktopSource hangs and the portal never sees a call.
+        # Vesktop's picker lives in the renderer. Offscreen/minimized windows
+        # never receive the auto-click, so getDesktopSource hangs. Keep a small
+        # on-screen window until Share game starts, then hide it.
         try:
-            await self.set_window_mode("offscreen")
+            await self.set_window_mode("normal")
         except Exception as e:
             decky.logger.warning(f"raise for share: {e}")
         r = await self._eval(
@@ -2078,14 +2256,21 @@ class Plugin:
                 return {"ok": False, "ids": [], "error": str(e)}
         return r if isinstance(r, dict) else {"ok": False, "ids": []}
 
-    async def focus_stream(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def focus_stream(self, user_id: str = "", kind: str = "screenshare", name: str = "", **kwargs: Any) -> dict[str, Any]:
         uid = str(user_id or kwargs.get("user_id") or kwargs.get("id") or "")
+        kind = str(kwargs.get("kind") or kind or "screenshare")
+        name = str(kwargs.get("name") or name or "")
         r = await self._bridge(f"focusStream({json.dumps(uid)})")
         if isinstance(r, dict) and r.get("focus"):
             self._audio_focus = r["focus"]
         elif isinstance(r, dict) and r.get("ok") and uid:
             self._audio_focus = {"userId": uid, "saved": (self._audio_focus or {}).get("saved") or {}, "kind": "stream"}
         decky.logger.info(f"focus_stream {uid} {r if isinstance(r, dict) else ''}")
+        if uid:
+            try:
+                await self.pin_pip(uid, kind, name)
+            except Exception as e:
+                decky.logger.warning(f"auto-pin focused stream: {e}")
         return self._ok(r)
 
     async def focus_audio(self, user_id: str = "", **kwargs: Any) -> dict[str, Any]:
@@ -2425,11 +2610,12 @@ print("reload_plugin sent")
                 pass
 
     def _overlay_needed(self) -> bool:
-        pip = self._settings.get("pip") or {}
+        """GTK overlay is talking-roster only. Video stamps use the WebRTC PiP window."""
         talk = self._settings.get("talking") or {}
-        pip_on = bool(pip.get("enabled") and pip.get("userId"))
         talk_on = bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
-        return pip_on or talk_on
+        pip = self._settings.get("pip") or {}
+        pip_fallback = bool(pip.get("enabled") and pip.get("userId") and not self._rtc_ok)
+        return talk_on or pip_fallback
 
     def _start_pip_overlay(self) -> None:
         self._write_pip_state()
@@ -2465,6 +2651,82 @@ print("reload_plugin sent")
     def _stop_overlay_if_idle(self) -> None:
         if not self._overlay_needed():
             self._stop_pip_overlay()
+
+    async def _publish_inbound(self, uid: str = "", kind: str = "", size: str = "") -> dict[str, Any]:
+        self._ensure_webrtc_hub()
+        opts = {
+            "room": "both" if uid else "qam",
+            "userId": uid,
+            "kind": kind,
+            "size": size or "small",
+        }
+        try:
+            r = await self._eval(
+                "window.__deckscord && window.__deckscord.publishInbound(" + json.dumps(opts) + ")",
+                timeout=4.0,
+            )
+            ok = False
+            if isinstance(r, dict) and r.get("ok") is not False:
+                parts = r.get("parts")
+                if isinstance(parts, list) and parts:
+                    for p in parts:
+                        if isinstance(p, dict) and p.get("ok") is not False and int(p.get("n") or 0) > 0:
+                            ok = True
+                            break
+                else:
+                    ok = True
+            self._rtc_ok = bool(ok)
+            return r if isinstance(r, dict) else {"ok": False, "error": str(r)}
+        except Exception as e:
+            self._rtc_ok = False
+            decky.logger.warning(f"publishInbound: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def _open_pip_viewer(self) -> dict[str, Any]:
+        pip = dict(self._settings.get("pip") or {})
+        geo = _pip_geom(pip)
+        try:
+            r = await self._eval(
+                "window.__deckscord && window.__deckscord.openPipViewer(" + json.dumps(geo) + ")",
+                timeout=3.0,
+            )
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        xid = 0
+        for _ in range(8):
+            await asyncio.sleep(0.12)
+            xid = _find_xwin(PIP_WIN_TITLE)
+            if xid:
+                break
+        if xid:
+            self._pip_xid = xid
+            _set_overlay_xid(xid)
+            env = _overlay_env()
+            try:
+                subprocess.run(
+                    ["xdotool", "windowmove", str(xid), str(geo["x"]), str(geo["y"])],
+                    check=False, timeout=2, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                subprocess.run(
+                    ["xdotool", "windowsize", str(xid), str(geo["w"]), str(geo["h"])],
+                    check=False, timeout=2, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+            decky.logger.info(f"pip window xid={xid} {geo['w']}x{geo['h']} @ {geo['x']},{geo['y']}")
+        else:
+            decky.logger.warning("pip window not found on X11")
+        return {"ok": bool(xid or (isinstance(r, dict) and r.get("ok"))), "xid": xid, "open": r}
+
+    async def _close_pip_viewer(self) -> None:
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.closePipViewer()")
+        except Exception:
+            pass
+        self._pip_xid = 0
+        self._rtc_ok = False
 
     async def _pip_grab_once(self) -> None:
         pip = dict(self._settings.get("pip") or {})
@@ -2616,7 +2878,7 @@ print("reload_plugin sent")
                 pip_on = bool(pip.get("enabled") and pip.get("userId"))
                 talk_pref = bool(talk.get("enabled"))
                 now = time.monotonic()
-                pin_iv = 1.0 if now < self._mic_pin_until else 12.0
+                pin_iv = 2.0 if self._last_voice_channel else (1.0 if now < self._mic_pin_until else 12.0)
                 if (self._last_voice_channel or now < self._mic_pin_until) and now - pin_at >= pin_iv:
                     pin_at = now
                     try:
@@ -2634,11 +2896,26 @@ print("reload_plugin sent")
                 elif not talk_pref:
                     self._write_talking_state([], False)
                 talk_on = bool(talk_pref and self._talk_in_voice)
+                if pip_on or self._last_voice_channel:
+                    await self._publish_inbound(
+                        str(pip.get("userId") or "") if pip_on else "",
+                        str(pip.get("kind") or "") if pip_on else "",
+                        str(pip.get("size") or "small"),
+                    )
                 if pip_on:
-                    await self._pip_grab_once()
-                if pip_on or talk_on:
+                    self._grab_alive_until = time.monotonic() + 8.0
+                    if in_game_mode() and not self._pip_xid:
+                        await self._open_pip_viewer()
+                    elif self._pip_xid:
+                        _set_overlay_xid(self._pip_xid)
+                    if not self._rtc_ok:
+                        await self._pip_grab_once()
+                else:
+                    if self._pip_xid:
+                        await self._close_pip_viewer()
+                if talk_on or (pip_on and not self._rtc_ok):
                     self._start_pip_overlay()
-                    await asyncio.sleep(0.18 if pip_on else 0.25)
+                    await asyncio.sleep(0.20 if pip_on and not self._rtc_ok else 0.35)
                 else:
                     self._stop_overlay_if_idle()
                     await asyncio.sleep(0.4)
@@ -2728,11 +3005,20 @@ print("reload_plugin sent")
         self._write_pip_state()
         self._grab_alive_until = time.monotonic() + 8.0
         try:
-            await self._pip_grab_once()
+            await self._publish_inbound(uid, kind, str(pip.get("size") or "small"))
         except Exception as e:
-            decky.logger.warning(f"pin grab: {e}")
-        self._start_pip_overlay()
-        return {"ok": True, "pip": pip}
+            decky.logger.warning(f"pin publish: {e}")
+        try:
+            await self._open_pip_viewer()
+        except Exception as e:
+            decky.logger.warning(f"pin viewer: {e}")
+        if not self._rtc_ok:
+            try:
+                await self._pip_grab_once()
+            except Exception as e:
+                decky.logger.warning(f"pin grab: {e}")
+            self._start_pip_overlay()
+        return {"ok": True, "pip": pip, "webrtc": self._rtc_ok}
 
     async def unpin_pip(self) -> dict[str, Any]:
         pip = dict(self._settings.get("pip") or {})
@@ -2742,6 +3028,7 @@ print("reload_plugin sent")
         self._settings["pip"] = pip
         _save_settings(self._settings)
         self._write_pip_state()
+        await self._close_pip_viewer()
         self._stop_overlay_if_idle()
         return {"ok": True, "pip": pip}
 

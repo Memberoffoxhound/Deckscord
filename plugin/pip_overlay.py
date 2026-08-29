@@ -254,13 +254,11 @@ def main() -> None:
         if screen:
             sw = screen.get_width() or sw
             sh = screen.get_height() or sh
-    win.set_default_size(sw, sh)
-    win.set_size_request(sw, sh)
+    win.set_default_size(240, 140)
     try:
-        win.move(0, 0)
+        win.move(sw - 250, sh - 150)
     except Exception:
         pass
-    win.resize(sw, sh)
 
     bag = {
         "pip": {},
@@ -268,6 +266,7 @@ def main() -> None:
         "pixbuf": None,
         "mtime": -1.0,
         "stamp": (0, 0, 0, 0),
+        "winbox": (0, 0, 0, 0),
         "faces": {},
     }
 
@@ -296,7 +295,9 @@ def main() -> None:
         pb = bag["pixbuf"]
         if pb is None:
             return
+        wx, wy, ww, wh = bag.get("winbox") or (0, 0, 0, 0)
         x, y, tw, th = bag["stamp"]
+        x, y = x - wx, y - wy
         alpha = max(0.15, min(1.0, float(st.get("opacity") or 100) / 100.0))
         iw, ih = pb.get_width(), pb.get_height()
         if iw < 2 or ih < 2:
@@ -380,6 +381,9 @@ def main() -> None:
                 else:
                     y0 = py + ph + pad
                 y0 = max(pad, min(y0, sh - pad - total_h))
+        wx, wy, _ww, _wh = bag.get("winbox") or (0, 0, 0, 0)
+        x0 -= wx
+        y0 -= wy
 
         cr.set_operator(cairo.OPERATOR_OVER)
         cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -502,6 +506,38 @@ def main() -> None:
             Gtk.main_quit()
             return False
         bag["stamp"] = stamp_box(pip) if pip.get("enabled") else (0, 0, 0, 0)
+        boxes = []
+        if pip.get("enabled"):
+            boxes.append(bag["stamp"])
+        if talk.get("enabled") and (talk.get("speakers") or []):
+            speakers = (talk.get("speakers") or [])[:5]
+            size = str(talk.get("size") or "small")
+            frac = 0.055 if size == "large" else 0.038
+            d = min(48 if size == "large" else 32, max(22, int(sh * frac)))
+            pad_t = max(10, int(min(sw, sh) * 0.012))
+            gap = max(6, int(d * 0.28))
+            row_h = d + gap
+            total_h = len(speakers) * row_h - gap
+            name_w = int(min(sw * 0.28, d * 8))
+            block_w = d + 10 + name_w
+            corner = str(talk.get("corner") or "top-left")
+            right = corner.endswith("right")
+            bottom = "bottom" in corner
+            tx = sw - pad_t - block_w if right else pad_t
+            ty = sh - pad_t - total_h if bottom else pad_t
+            boxes.append((tx, ty, block_w, total_h))
+        if boxes:
+            x0 = min(b[0] for b in boxes)
+            y0 = min(b[1] for b in boxes)
+            x1 = max(b[0] + b[2] for b in boxes)
+            y1 = max(b[1] + b[3] for b in boxes)
+            ww, wh = max(32, x1 - x0), max(32, y1 - y0)
+            bag["winbox"] = (x0, y0, ww, wh)
+            try:
+                win.resize(ww, wh)
+                win.move(x0, y0)
+            except Exception:
+                pass
         frame = state_dir / "frame.jpg"
         try:
             mt = frame.stat().st_mtime
@@ -524,10 +560,6 @@ def main() -> None:
     win.connect("destroy", Gtk.main_quit)
     win.realize()
     mark_overlay()
-    try:
-        win.fullscreen()
-    except Exception:
-        pass
     win.show_all()
     mark_overlay()
     pass_clicks()

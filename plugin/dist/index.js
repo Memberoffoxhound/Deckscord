@@ -449,17 +449,31 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outputVolume }) {
+function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outputVolume, mediaStream }) {
   const [jpeg, setJpeg] = useState(null);
   const [hint, setHint] = useState("Starting…");
   const [vol, setVol] = useState(defaultStreamVol(outputVolume));
   const keepAudio = useRef(false);
+  const bindWatch = (el) => {
+    if (!el) return;
+    if (mediaStream && el.srcObject !== mediaStream) {
+      el.srcObject = mediaStream;
+      try {
+        const p = el.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (_) {}
+    }
+  };
   useEffect(() => {
     let stop = false;
     (async () => {
       try {
-        await focusStream(userId);
+        await focusStream(userId, kind || "screenshare", name || "");
       } catch (_) {}
+      if (mediaStream) {
+        setHint("");
+        return;
+      }
       while (!stop) {
         try {
           const r = await getVideoFrames({ userId: userId, w: 640, h: 360 });
@@ -478,9 +492,8 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
     return () => {
       stop = true;
     };
-  }, [userId, kind]);
+  }, [userId, kind, name, mediaStream]);
   const close = () => {
-    if (!keepAudio.current) clearAudioFocus().catch(() => {});
     if (onClosed) onClosed();
     if (closeModal) closeModal();
   };
@@ -513,7 +526,23 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outp
       },
     },
     [
-      jpeg
+      mediaStream
+        ? e("video", {
+            key: "rtc",
+            autoPlay: true,
+            muted: true,
+            playsInline: true,
+            ref: bindWatch,
+            style: {
+              width: "100%",
+              height: "100%",
+              maxHeight: "90vh",
+              objectFit: "contain",
+              display: "block",
+              background: "#000",
+            },
+          })
+        : jpeg
         ? e("img", {
             key: "v",
             src: jpeg,
@@ -695,7 +724,7 @@ function MediaOverlay({ item, kind, outputVolume, closeModal, onClosed }) {
   );
 }
 
-function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWatch }) {
+function VideoTile({ stream, focused, jpeg, speaking, pinned, mediaStream, onOpenMember, onWatch }) {
   const onCancel = useContext(BackNav);
   const go = () => {
     if (stream.self) {
@@ -703,6 +732,16 @@ function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWa
       return;
     }
     if (onWatch) onWatch(stream);
+  };
+  const bindVideo = (el) => {
+    if (!el) return;
+    if (mediaStream && el.srcObject !== mediaStream) {
+      el.srcObject = mediaStream;
+      try {
+        const p = el.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (_) {}
+    }
   };
   return e(
     Focusable,
@@ -729,7 +768,22 @@ function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWa
       },
     },
     [
-      jpeg
+      mediaStream
+        ? e("video", {
+            key: "vid",
+            autoPlay: true,
+            muted: true,
+            playsInline: true,
+            ref: bindVideo,
+            style: {
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              display: "block",
+              background: "#000",
+            },
+          })
+        : jpeg
         ? e("img", {
             key: "img",
             src: jpeg,
@@ -908,6 +962,7 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
           stream: s,
           focused: !s.self && focusedUserId === s.userId,
           jpeg: fr.black ? null : fr.jpeg,
+          mediaStream: s.mediaStream || fr.mediaStream || null,
           speaking: !!(speakingIds && speakingIds[s.userId]),
           pinned: pinnedUserId === s.userId,
           onOpenMember,
@@ -1004,6 +1059,7 @@ function App() {
   const [updateProg, setUpdateProg] = useState(null);
   const [cfg, setCfg] = useState(null);
   const [shareLocal, setShareLocal] = useState(null);
+  const [rtcMap, setRtcMap] = useState({});
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const cancelLock = useRef(0);
@@ -1158,6 +1214,8 @@ function App() {
 
   const videoOn = !!(status && status.videoEnabled && status.voice && status.voice.hasVideo);
   const streamCount = ((status && status.voice && status.voice.streams) || []).length;
+  const webrtcUrl = (status && status.webrtc && status.webrtc.url) || "http://127.0.0.1:18765";
+  const rtcLive = Object.keys(rtcMap).length > 0;
   useEffect(() => {
     if (!videoOn) {
       setFrames([]);
@@ -1174,13 +1232,88 @@ function App() {
       grabBusy.current = false;
     };
     pull();
-    const fps = streamCount <= 1 ? 12 : streamCount === 2 ? 10 : 8;
-    const id = setInterval(pull, Math.max(80, Math.floor(1000 / fps)));
+    const ms = rtcLive ? 2000 : streamCount <= 1 ? 90 : streamCount === 2 ? 110 : 140;
+    const id = setInterval(pull, ms);
     return () => {
       stop = true;
       clearInterval(id);
     };
-  }, [videoOn, streamCount, status && status.voice && status.voice.focusedUserId]);
+  }, [videoOn, streamCount, rtcLive, status && status.voice && status.voice.focusedUserId]);
+
+  useEffect(() => {
+    if (!videoOn || typeof RTCPeerConnection === "undefined") {
+      setRtcMap({});
+      return;
+    }
+    let stop = false;
+    let pc = null;
+    let appliedGen = -1;
+    let iceN = 0;
+    const api = async (path, body) => {
+      const opt = { headers: { "Content-Type": "application/json" } };
+      if (body !== undefined) {
+        opt.method = "POST";
+        opt.body = JSON.stringify(body);
+      }
+      const r = await fetch(webrtcUrl + path, opt);
+      return r.json();
+    };
+    const loop = async () => {
+      while (!stop) {
+        try {
+          const off = await api("/room/qam/offer");
+          if (off && off.sdp && off.gen !== appliedGen) {
+            if (pc) {
+              try { pc.close(); } catch (_) {}
+            }
+            pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+            pc.ontrack = (ev) => {
+              const mid = ev.transceiver && ev.transceiver.mid;
+              const tracks = off.tracks || [];
+              const hit =
+                tracks.find((t) => String(t.mid) === String(mid)) ||
+                tracks[Math.max(0, (ev.transceiver && ev.transceiver.mid) ? 0 : 0)] ||
+                tracks[0];
+              const ms = (ev.streams && ev.streams[0]) || new MediaStream(ev.track ? [ev.track] : []);
+              const key = hit ? hit.userId + ":" + (hit.kind || "screenshare") : "x:screenshare";
+              setRtcMap((prev) => {
+                const next = { ...prev, [key]: ms };
+                if (hit && hit.userId) next[hit.userId] = ms;
+                return next;
+              });
+            };
+            pc.onicecandidate = (ev) => {
+              if (!ev.candidate) return;
+              api("/room/qam/ice/sub", {
+                candidate: ev.candidate.candidate,
+                sdpMid: ev.candidate.sdpMid,
+                sdpMLineIndex: ev.candidate.sdpMLineIndex,
+              }).catch(() => {});
+            };
+            await pc.setRemoteDescription({ type: "offer", sdp: off.sdp });
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            await api("/room/qam/answer", { sdp: ans.sdp });
+            appliedGen = off.gen;
+            iceN = 0;
+          }
+          if (pc) {
+            const ice = await api("/room/qam/ice/pub?n=" + iceN);
+            (ice.candidates || []).forEach((c) => {
+              if (c && c.candidate) pc.addIceCandidate(c).catch(() => {});
+            });
+            iceN = ice.n || iceN;
+          }
+        } catch (_) {}
+        await new Promise((res) => setTimeout(res, 280));
+      }
+      try { if (pc) pc.close(); } catch (_) {}
+    };
+    loop();
+    return () => {
+      stop = true;
+    };
+  }, [videoOn, webrtcUrl]);
 
   const inVoice = !!(status && status.ready && status.voice && status.voice.channelId);
   useEffect(() => {
@@ -1428,7 +1561,10 @@ function App() {
 
   const videoEnabled = !!(status && status.videoEnabled);
   const hasVideo = !!(voice && voice.hasVideo);
-  const liveStreams = (voice && voice.streams) || [];
+  const liveStreams = ((voice && voice.streams) || []).map((s) => ({
+    ...s,
+    mediaStream: rtcMap[s.userId + ":" + (s.kind || "screenshare")] || rtcMap[s.userId] || null,
+  }));
   const focusedUserId = (voice && voice.focusedUserId) || null;
   const streamVol =
     volLocal.stream != null
@@ -1463,7 +1599,9 @@ function App() {
   const talking = (status && status.talking) || (cfg && cfg.talking) || {};
   const talkingOn = !!talking.enabled;
   const onWatchStream = (s) => {
-    tap(() => act("Watch", () => focusStream(s.userId), { quiet: true }));
+    tap(() =>
+      act("Watch", () => focusStream(s.userId, s.kind || "screenshare", s.name || ""), { quiet: true })
+    );
     if (typeof DFL.showModal === "function") {
       modalOpen.current = true;
       DFL.showModal(
@@ -1472,6 +1610,7 @@ function App() {
           name: s.name,
           kind: s.kind || "screenshare",
           outputVolume: outVol,
+          mediaStream: rtcMap[s.userId + ":" + (s.kind || "screenshare")] || rtcMap[s.userId] || s.mediaStream || null,
           onPinned: () => refresh(),
           onClosed: closeOverlay,
         })
@@ -2108,6 +2247,7 @@ function App() {
           name: ws.name || view.title,
           kind: ws.kind || view.kind || "screenshare",
           outputVolume: outVol,
+          mediaStream: ws.mediaStream || rtcMap[view.userId] || null,
           onPinned: () => {
             refresh();
             back();

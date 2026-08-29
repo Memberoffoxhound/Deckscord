@@ -17,12 +17,9 @@
  * Messages show timestamps and d-pad-scroll in the thread pane.
  * B / onCancel pops the view stack until home, then QAM closes.
  *
- * Live video: edge-to-edge JPEG tiles (VideoStack first in voice),
- * exclusive local-mute on tile A, 🔊 pill on the focused stream.
- * Member-row A still opens the mixer; Solo is a ToggleField there.
- * Pin to corner starts pip_overlay.py on gamescope's overlay plane (Game Mode only).
- * Stop watching under the tile unfocuses and unpins. A on a tile opens Watch.
- * Who's-talking roster uses the same overlay (speakers only, avatar + name). Off by default.
+ * Live video: WebRTC tiles at 30fps (JPEG thumbs only as fallback).
+ * A on a tile focuses that inbound stream and pins a PiP stamp over the game.
+ * Stop watching unfocuses and unpins. Who's-talking is a separate GTK overlay.
  * Settings hub maps Vesktop settings.json + MediaEngine voice flags.
  */
 export {};

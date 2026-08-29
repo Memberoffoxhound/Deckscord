@@ -808,12 +808,230 @@
     return paintElementToJpeg(el, q, dw, dh);
   }
 
+  function hubUrl() {
+    return String(window.__deckscordHub || "http://127.0.0.1:18765").replace(/\/$/, "");
+  }
+
+  function hubFetch(path, body, isBuf) {
+    var url = hubUrl() + path;
+    var opt = { method: body === undefined && !isBuf ? "GET" : "POST" };
+    if (isBuf) {
+      opt.body = body;
+      opt.headers = { "Content-Type": "image/jpeg" };
+    } else if (body !== undefined) {
+      opt.body = JSON.stringify(body);
+      opt.headers = { "Content-Type": "application/json" };
+    }
+    return fetch(url, opt).then(function (r) {
+      if (isBuf) return { ok: r.ok };
+      return r.json();
+    }).catch(function () { return { ok: false }; });
+  }
+
+  var RTC = window.__deckscordRtc || (window.__deckscordRtc = { rooms: {}, popups: {} });
+
+  function trackForStream(s) {
+    var tracks = videoTracksFor(s.userId);
+    var want = s.kind === "screenshare" ? "screenshare" : "camera";
+    var hit = null;
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].kind === want) { hit = tracks[i]; break; }
+    }
+    if (!hit && tracks.length) hit = tracks[0];
+    if (hit) return hit.track;
+    var el = window.__deckscordVideo.els && window.__deckscordVideo.els[s.userId + ":" + s.kind];
+    if (el && el.srcObject && el.srcObject.getVideoTracks) {
+      var vt = el.srcObject.getVideoTracks()[0];
+      if (vt) return vt;
+    }
+    var c = window.__deckscordVideo.canvases[s.userId + ":" + s.kind];
+    if (c && typeof c.captureStream === "function") {
+      try {
+        var ms = c.captureStream(30);
+        var ct = ms && ms.getVideoTracks && ms.getVideoTracks()[0];
+        if (ct) return ct;
+      } catch (eCap) {}
+    }
+    return null;
+  }
+
+  function capSender(sender, fps, w) {
+    if (!sender || typeof sender.setParameters !== "function") return;
+    try {
+      var p = sender.getParameters() || {};
+      p.degradationPreference = "maintain-framerate";
+      p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
+      p.encodings[0].maxFramerate = fps || 30;
+      p.encodings[0].maxBitrate = w >= 800 ? 900000 : 450000;
+      if (w && w <= 480) p.encodings[0].scaleResolutionDownBy = 1;
+      sender.setParameters(p).catch(function () {});
+    } catch (eP) {}
+  }
+
+  function stopRoom(name) {
+    var st = RTC.rooms[name];
+    if (!st) return;
+    try { if (st.timer) clearTimeout(st.timer); } catch (eT) {}
+    try { if (st.pc) st.pc.close(); } catch (eC) {}
+    delete RTC.rooms[name];
+  }
+
+  function publishRoom(name, streams, fps, width) {
+    fps = fps || 30;
+    width = width || 426;
+    var keys = streams.map(function (s) { return s.userId + ":" + s.kind; }).join(",");
+    var st = RTC.rooms[name];
+    if (st && st.keys === keys && st.pc && st.pc.connectionState !== "closed" && st.pc.connectionState !== "failed") {
+      return { ok: true, room: name, reused: true, n: streams.length };
+    }
+    stopRoom(name);
+    if (!streams.length) return { ok: true, room: name, n: 0 };
+    var pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+    st = { pc: pc, keys: keys, iceN: 0, gen: 0, timer: 0 };
+    RTC.rooms[name] = st;
+    var meta = [];
+    streams.forEach(function (s, i) {
+      jpegFromEngineTrack(s, width >= 640, width, Math.round(width * 9 / 16));
+      var track = trackForStream(s);
+      if (!track) return;
+      try { track.contentHint = s.kind === "screenshare" ? "motion" : "motion"; } catch (eH) {}
+      var sender = pc.addTrack(track, new MediaStream([track]));
+      capSender(sender, fps, width);
+      meta.push({
+        userId: s.userId,
+        kind: s.kind,
+        name: s.name || "",
+        order: i,
+        mid: (pc.getTransceivers()[meta.length] && pc.getTransceivers()[meta.length].mid) || String(i),
+      });
+    });
+    if (!meta.length) {
+      stopRoom(name);
+      return { ok: false, error: "no inbound video tracks", room: name };
+    }
+    pc.onicecandidate = function (ev) {
+      if (!ev.candidate) return;
+      hubFetch("/room/" + name + "/ice/pub", {
+        candidate: ev.candidate.candidate,
+        sdpMid: ev.candidate.sdpMid,
+        sdpMLineIndex: ev.candidate.sdpMLineIndex,
+      });
+    };
+    function poll() {
+      if (RTC.rooms[name] !== st) return;
+      st.timer = setTimeout(poll, 250);
+      var dead = pc.connectionState === "failed" || pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected";
+      if (dead) {
+        stopRoom(name);
+        return;
+      }
+      hubFetch("/room/" + name + "/answer").then(function (ans) {
+        if (!ans || !ans.sdp || st.applied === ans.sdp) return;
+        if (!pc.currentRemoteDescription) {
+          pc.setRemoteDescription({ type: "answer", sdp: ans.sdp }).then(function () {
+            st.applied = ans.sdp;
+          }).catch(function () {});
+          return;
+        }
+        if (ans.sdp !== st.applied) {
+          stopRoom(name);
+        }
+      });
+      hubFetch("/room/" + name + "/ice/sub?n=" + st.iceN).then(function (ice) {
+        (ice && ice.candidates || []).forEach(function (c) {
+          if (c && c.candidate) pc.addIceCandidate(c).catch(function () {});
+        });
+        if (ice && typeof ice.n === "number") st.iceN = ice.n;
+      });
+    }
+    return pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false }).then(function (off) {
+      return pc.setLocalDescription(off).then(function () {
+        var sdp = (pc.localDescription && pc.localDescription.sdp) || off.sdp;
+        var trans = pc.getTransceivers() || [];
+        trans.forEach(function (tr, i) {
+          if (meta[i]) meta[i].mid = tr.mid || meta[i].mid;
+        });
+        return hubFetch("/room/" + name + "/offer", { sdp: sdp, tracks: meta });
+      });
+    }).then(function () {
+      poll();
+      return { ok: true, room: name, n: meta.length, tracks: meta, fps: fps };
+    }).catch(function (e) {
+      stopRoom(name);
+      return err(e);
+    });
+  }
+
+  function publishInbound(opts) {
+    opts = opts || {};
+    try { ensureVideoSinks(true); } catch (eS) {}
+    var bag = collectStreams();
+    var all = (bag.streams || []).filter(function (s) { return !(s.self && s.kind === "screenshare"); });
+    var uid = opts.userId ? String(opts.userId) : "";
+    var kind = opts.kind ? String(opts.kind) : "";
+    var pipList = all;
+    if (uid) {
+      pipList = all.filter(function (s) {
+        if (s.userId !== uid) return false;
+        if (kind && s.kind !== kind) return false;
+        return true;
+      });
+      if (!pipList.length) pipList = all.filter(function (s) { return s.userId === uid; });
+      pipList = pipList.slice(0, 1);
+    }
+    var qamList = all.slice(0, 4);
+    var jobs = [];
+    if (opts.room === "qam" || opts.room === "both" || !opts.room) {
+      jobs.push(publishRoom("qam", qamList, 30, 400));
+    }
+    if (opts.room === "pip" || opts.room === "both" || uid) {
+      var size = String(opts.size || "small");
+      var w = size === "large" ? 854 : 426;
+      jobs.push(publishRoom("pip", pipList, 30, w));
+    }
+    return Promise.all(jobs).then(function (parts) {
+      return { ok: true, parts: parts, hub: hubUrl() };
+    });
+  }
+
+  function openPipViewer(opts) {
+    opts = opts || {};
+    var w = Number(opts.w) || 426;
+    var h = Number(opts.h) || 240;
+    var x = Number(opts.x) || 0;
+    var y = Number(opts.y) || 0;
+    var url = hubUrl() + "/pip.html?room=pip&t=" + Date.now();
+    var feat = "popup=yes,menubar=no,toolbar=no,location=no,status=no,scrollbars=no,resizable=no,width="
+      + w + ",height=" + h + ",left=" + x + ",top=" + y;
+    try {
+      var existing = RTC.popups.pip;
+      if (existing && !existing.closed) {
+        existing.resizeTo(w, h);
+        try { existing.moveTo(x, y); } catch (eM) {}
+        return { ok: true, reused: true, url: url };
+      }
+    } catch (eR) {}
+    var win = window.open(url, "deckscord-pip", feat);
+    RTC.popups.pip = win;
+    return { ok: !!win, url: url, w: w, h: h };
+  }
+
+  function closePipViewer() {
+    try {
+      if (RTC.popups.pip && !RTC.popups.pip.closed) RTC.popups.pip.close();
+    } catch (eC) {}
+    RTC.popups.pip = null;
+    stopRoom("pip");
+    return { ok: true };
+  }
+
   function startFramePump() {
     var bag = window.__deckscordVideo;
     if (bag.pump) return;
     bag.jpegs = bag.jpegs || {};
     function tick() {
-      bag.pump = setTimeout(tick, 55);
+      var rtcOn = !!(RTC.rooms.pip || RTC.rooms.qam);
+      bag.pump = setTimeout(tick, rtcOn ? 900 : 120);
       try {
         var live = collectStreams();
         var list = (live.streams || []).filter(function (s) {
@@ -824,13 +1042,27 @@
         list.forEach(function (s) {
           var key = s.userId + ":" + s.kind;
           var big = !!(focus && s.userId === String(focus));
-          var dw = big ? 640 : 400;
+          var dw = rtcOn ? 320 : (big ? 640 : 400);
           var dh = Math.round(dw * 9 / 16);
-          var jpeg = jpegFromEngineTrack(s, big, dw, dh);
+          var c = window.__deckscordVideo.canvases[key];
+          var jpeg = bag.jpegs[key] || null;
+          if (!rtcOn || !jpeg) {
+            var liveJ = jpegFromEngineTrack(s, big && !rtcOn, dw, dh);
+            if (liveJ) jpeg = liveJ;
+          }
+          if (!jpeg && c && !lumaBlack(c)) jpeg = jpegFromCanvas(c, 0.4);
           if (jpeg) {
             bag.jpegs[key] = jpeg;
             bag.jpegs[key + ":w"] = dw;
             bag.jpegs[key + ":h"] = dh;
+          }
+          if (c && typeof c.toBlob === "function") {
+            try {
+              c.toBlob(function (blob) {
+                if (!blob) return;
+                hubFetch("/frame/" + encodeURIComponent(key), blob, true);
+              }, "image/jpeg", 0.45);
+            } catch (eB) {}
           }
         });
       } catch (eP) {}
@@ -1120,7 +1352,7 @@
     }
 
     if (go && go.disabled) {
-      var tiles = root.querySelectorAll("img, [role='button'], button");
+      var tiles = root.querySelectorAll("img, [role='button'], button, [class*='tile'], [class*='source']");
       for (var n = 0; n < tiles.length; n++) {
         var tile = tiles[n];
         if (tile === go) continue;
@@ -1129,6 +1361,15 @@
         try { tile.click(); } catch (eTile) {}
         GO_LIVE.debug = { picker: "picked-source" };
         return;
+      }
+      var allBtns = document.querySelectorAll("button, [role='button']");
+      for (var n2 = 0; n2 < allBtns.length; n2++) {
+        var t3 = txt(allBtns[n2]);
+        if (/entire screen|screen 1|display|gamescope|monitor/i.test(t3)) {
+          try { allBtns[n2].click(); } catch (e3) {}
+          GO_LIVE.debug = { picker: "picked-source" };
+          return;
+        }
       }
       return;
     }
@@ -1454,19 +1695,12 @@
           var key = s.userId + ":" + s.kind;
           var dw = pipId && pipW ? pipW : 400;
           var dh = pipId && pipH ? pipH : Math.round(dw * 9 / 16);
-          var big = dw >= 640;
           var jpeg = cache[key] || null;
-          if (!jpeg || big) {
-            var live = jpegFromEngineTrack(s, big, dw, dh);
-            if (live) {
-              jpeg = live;
-              cache[key] = live;
-            }
-          }
           if (!jpeg) {
             var cached = window.__deckscordVideo.canvases[key];
             if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, big ? 0.5 : 0.42);
+              jpeg = jpegFromCanvas(cached, 0.42);
+              if (jpeg) cache[key] = jpeg;
             }
           }
           var next = Promise.resolve(jpeg);
@@ -1574,6 +1808,43 @@
     ensureVideoSinks: function (enable) {
       try {
         return ensureVideoSinks(!!enable);
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    publishInbound: function (opts) {
+      try {
+        return publishInbound(opts || {});
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    openPipViewer: function (opts) {
+      try {
+        return openPipViewer(opts || {});
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    closePipViewer: function () {
+      try {
+        return closePipViewer();
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    webrtcStatus: function () {
+      try {
+        var rooms = {};
+        Object.keys(RTC.rooms).forEach(function (k) {
+          var st = RTC.rooms[k];
+          rooms[k] = st && st.pc ? st.pc.connectionState : "idle";
+        });
+        return { ok: true, hub: hubUrl(), rooms: rooms };
       } catch (e) {
         return err(e);
       }

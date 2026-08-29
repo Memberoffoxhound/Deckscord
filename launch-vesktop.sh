@@ -50,6 +50,7 @@ fi
 flags=(
   --remote-debugging-port="${CDP_PORT}"
   --remote-allow-origins=*
+  --enable-features=WebRTCPipeWireCapturer
 )
 
 flatpak_extra=()
@@ -89,6 +90,8 @@ if DISPLAY_VAL="$(pick_display)"; then
   flatpak_extra+=(
     --socket=x11
     --nosocket=wayland
+    --talk-name=org.freedesktop.portal.Desktop
+    --filesystem=xdg-run/pipewire-0:ro
     --env=DISPLAY="${DISPLAY}"
     --env=ELECTRON_OZONE_PLATFORM_HINT=x11
     --env=GDK_BACKEND=x11
