@@ -196,6 +196,10 @@ else
   curl -fsSL "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/launch-vesktop.sh" -o "${LAUNCH}"
 fi
 chmod +x "${LAUNCH}"
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/startvesktop" ]]; then
+  cp "${SCRIPT_DIR}/startvesktop" "${DATA_DIR}/startvesktop"
+  chmod +x "${DATA_DIR}/startvesktop"
+fi
 
 cat > "${HOME}/.config/systemd/user/${SERVICE_NAME}" << EOF
 [Unit]

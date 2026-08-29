@@ -50,10 +50,14 @@ fi
 flags=(
   --remote-debugging-port="${CDP_PORT}"
   --remote-allow-origins=*
-  --enable-features=WebRTCPipeWireCapturer
+  --enable-features=WebRTCPipeWireCapturer,VaapiVideoEncoder,VaapiIgnoreDriverChecks,AcceleratedVideoEncoder,CanvasOopRasterization
+  --enable-gpu-rasterization
+  --enable-zero-copy
+  --ignore-gpu-blocklist
 )
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-radeonsi}"
 
-flatpak_extra=()
+flatpak_extra=(--env=LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME}")
 # Never let Discord's "default" capture follow a speaker monitor.
 pick_mic_source() {
   command -v pactl >/dev/null 2>&1 || return 1
@@ -99,12 +103,23 @@ if DISPLAY_VAL="$(pick_display)"; then
   if [[ "${in_gamescope}" == true ]]; then
     # Dummy name is enough for Chromium IsRunningUnderWayland. Do not point
     # this at gamescope-* or ozone would try to render there.
+    # Keep Discord tiny so gamescope does not composite a 4K Chromium window.
+    flags+=(--window-size=960,540 --force-device-scale-factor=1)
     export XDG_SESSION_TYPE=wayland
-    export WAYLAND_DISPLAY=wayland-0
+    export WAYLAND_DISPLAY=deckscord-0
     flatpak_extra+=(
       --env=XDG_SESSION_TYPE=wayland
-      --env=WAYLAND_DISPLAY=wayland-0
+      --env=WAYLAND_DISPLAY=deckscord-0
     )
+    # gamescope ignores minimize and remaps Discord to the output size.
+    # Keep pinning from this unit so a dead plugin cannot leave a 4K compositor.
+    (
+      disp="${DISPLAY}"
+      while sleep 2; do
+        DISPLAY="${disp}" xdotool search --class vesktop windowsize 960 540 windowmove 8000 8000 >/dev/null 2>&1 || true
+      done
+    ) &
+    disown || true
   else
     unset WAYLAND_DISPLAY
     export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"

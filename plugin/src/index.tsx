@@ -18,8 +18,8 @@
  * B / onCancel pops the view stack until home, then QAM closes.
  *
  * Chat and voice, plus outbound Share game (gamescope PipeWire → Discord
- * Go Live at 720p). No inbound live-call video tiles or Watch overlay.
- * Who's-talking is a GTK overlay of avatar + name.
+ * Go Live at 720p). No inbound live-call video tiles, Watch overlay, or
+ * who's-talking names over the game (parked).
  * Settings hub maps Vesktop settings.json + MediaEngine voice flags.
  */
 export {};

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Deckscord wrap of Vesktop's startvesktop.
+#
+# Flatpak --nosocket=wayland strips WAYLAND_DISPLAY before this script runs.
+# Chromium webrtc DesktopCapturer::IsRunningUnderWayland() is true only when
+# BOTH XDG_SESSION_TYPE=wayland AND WAYLAND_DISPLAY are set. Without the
+# dummy name, getDesktopSource stays on X11 and never calls our ScreenCast
+# portal. Rendering stays X11 via --ozone-platform=x11 from launch-vesktop.sh.
+# Do not point WAYLAND_DISPLAY at gamescope-* (ozone would try to render there).
+# The dummy name does not need a listening socket: getenv is enough, and
+# wl_display_connect on a missing socket fails immediately.
+
+export TMPDIR="$XDG_RUNTIME_DIR/app/${FLATPAK_ID:-dev.vencord.Vesktop}"
+
+export XDG_SESSION_TYPE=wayland
+case "${WAYLAND_DISPLAY:-}" in
+  gamescope-*) unset WAYLAND_DISPLAY ;;
+esac
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-deckscord-0}"
+unset GAMESCOPE_WAYLAND_DISPLAY
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-radeonsi}"
+
+declare -a FLAGS=(--enable-speech-dispatcher)
+
+echo "Deckscord startvesktop: SESSION=$XDG_SESSION_TYPE WAYLAND=$WAYLAND_DISPLAY DISPLAY=$DISPLAY OZONE=${ELECTRON_OZONE_PLATFORM_HINT:-}"
+echo "Passing the following arguments to Electron:" "${FLAGS[@]}" "$@"
+exec zypak-wrapper /app/bin/vesktop/vesktop.bin "${FLAGS[@]}" "$@"

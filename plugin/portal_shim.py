@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -69,6 +70,11 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 FD_RELEASE_S = 30.0
 KWIN = {"kwin_wayland", "kwin_x11"}
+# Last gamescope Video/Source we successfully dumped. Start() uses this when
+# pw-dump is wedged (Share game connected) so we never block the GLib loop
+# on a 5s hang, and never retry into a live PipeWire graph.
+_NODE = {"id": None, "size": None, "at": 0.0}
+_DUMPING = threading.Event()
 
 XML = f"""
 <node>
@@ -254,23 +260,42 @@ def node_size(info: dict):
     return None
 
 
-def find_screen_node():
+def _cached_node():
+    nid = _NODE.get("id")
+    if nid is None:
+        return None, None
+    if (time.monotonic() - float(_NODE.get("at") or 0)) > 180:
+        return None, None
+    return nid, _NODE.get("size")
+
+
+def find_screen_node(timeout: float = 1.5):
     """Return (node_id, (w,h)|None) for the gamescope framebuffer, else (None, None)."""
+    if _DUMPING.is_set():
+        return _cached_node()
+    _DUMPING.set()
+    try:
+        return _find_screen_node(timeout)
+    finally:
+        _DUMPING.clear()
+
+
+def _find_screen_node(timeout: float = 1.5):
     try:
         proc = subprocess.run(
             ["pw-dump"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             env={k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"},
         )
         data = json.loads(proc.stdout or "[]")
     except subprocess.TimeoutExpired:
-        log.warning("pw-dump silent (5s) — PipeWire may be wedged")
-        return None, None
+        log.warning("pw-dump silent (%.1fs) — PipeWire may be wedged", timeout)
+        return _cached_node()
     except Exception as e:
         log.warning("pw-dump: %r", e)
-        return None, None
+        return _cached_node()
 
     vids = []
     for n in data:
@@ -286,13 +311,20 @@ def find_screen_node():
             continue
         if "video/source" in mc.lower() or "gamescope" in blob or "screen" in blob:
             vids.append((n.get("id"), name, mc, info))
+    picked = None
     for nid, name, mc, info in vids:
         if "gamescope" in name.lower() or "screen" in name.lower():
-            return int(nid), node_size(info)
-    for nid, name, mc, info in vids:
-        if "video/source" in mc.lower():
-            return int(nid), node_size(info)
-    return None, None
+            picked = (int(nid), node_size(info))
+            break
+    if picked is None:
+        for nid, name, mc, info in vids:
+            if "video/source" in mc.lower():
+                picked = (int(nid), node_size(info))
+                break
+    if picked is not None:
+        _NODE["id"], _NODE["size"], _NODE["at"] = picked[0], picked[1], time.monotonic()
+        return picked
+    return _cached_node()
 
 
 def _safe_close(fd: int) -> None:
@@ -433,8 +465,10 @@ class Portal:
             if not self.sender_is_vesktop(sender):
                 GLib.idle_add(self.emit_response, sender, req, 2, {})
                 return
-            prefix = f"/org/freedesktop/portal/desktop/session/{sender_token(sender)}/"
-            for old in [p for p in self.sessions if p.startswith(prefix) and p != session]:
+            # One ScreenCast at a time. Chromium retries with a new unique
+            # name (:1.387, :1.390, …) so sender-prefix matching leaked
+            # OpenPipeWireRemote fds and stacked gamescope consumers.
+            for old in [p for p in self.sessions if p != session]:
                 self.close_session(old)
             self.sessions[session] = {"fds": [], "sender": sender}
             log.info("CreateSession %s", session)
@@ -494,8 +528,10 @@ class Portal:
         )
 
     def _start(self, sender: str, session: str, req: str, attempt: int = 0) -> bool:
-        node, size = find_screen_node()
-        if node is None and attempt < 12:
+        node, size = _cached_node()
+        if node is None:
+            node, size = find_screen_node()
+        if node is None and attempt < 3:
             GLib.timeout_add(400, self._start, sender, session, req, attempt + 1)
             return False
         if node is None or session not in self.sessions:
@@ -700,6 +736,9 @@ class Portal:
             self._stable_gm = nudged or (now - self._gm_since) >= 5.0
             if self._stable_gm and not self.owner_id:
                 self.try_own(force=nudged)
+            last = float(_NODE.get("at") or 0)
+            if self._stable_gm and not _DUMPING.is_set() and (last == 0 or now - last >= 15):
+                threading.Thread(target=find_screen_node, daemon=True).start()
         else:
             self._gm_since = 0.0
             self._stable_gm = False
@@ -739,6 +778,12 @@ def main() -> int:
         portal.try_own(force=True)
         return True
 
+    def _drop_sessions(*_a):
+        n = len(portal.sessions)
+        portal.close_all()
+        log.info("SIGUSR2 — closed %s ScreenCast session(s)", n)
+        return True
+
     def _on_signal(sig, cb=_quit):
         try:
             from gi.repository import GLibUnix  # type: ignore
@@ -750,6 +795,7 @@ def main() -> int:
     _on_signal(signal.SIGINT)
     _on_signal(signal.SIGTERM)
     _on_signal(signal.SIGUSR1, _force_own)
+    _on_signal(signal.SIGUSR2, _drop_sessions)
     loop.run()
     try:
         lock.close()

@@ -5,10 +5,6 @@ MediaEngine flags we can actually set over CDP.
 
 ```
 Settings
-├─ Who's talking
-│  ├─ Enable         names over the game while someone speaks
-│  ├─ Corner / size / opacity
-│  └─ Show me
 ├─ Discord · Voice
 │  ├─ Mute / Deafen
 │  ├─ Input / output devices
@@ -41,5 +37,5 @@ Settings
 Vesktop booleans are written to `settings.json` (Flatpak:
 `~/.var/app/dev.vencord.Vesktop/config/vesktop/settings.json`). Hardware
 acceleration and branch apply on the next Vesktop start. Discord voice
-processing is live via MediaEngine. Deckscord talking-overlay prefs live in
-`~/.local/share/deckscord/settings.json`.
+processing is live via MediaEngine. The who's-talking overlay is parked
+and is not in the QAM.

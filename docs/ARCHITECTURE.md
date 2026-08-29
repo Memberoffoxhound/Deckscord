@@ -38,7 +38,7 @@ The Python backend is stdlib-only (asyncio + a tiny WebSocket client). No pip pa
 
 Deckscord is chat, voice, and **outbound Share game**. There is no inbound live-video viewer and no WebRTC hub.
 
-Share game (Game Mode): `portal_shim.py` owns `org.freedesktop.portal.Desktop` and hands Vesktop the gamescope PipeWire node (`OpenPipeWireRemote`). Discord encodes 720p. Steam Game Recording must be off. Do not ask gamescope for a fixed framerate.
+Share game (Game Mode): `portal_shim.py` owns `org.freedesktop.portal.Desktop` and hands Vesktop the gamescope PipeWire node (`OpenPipeWireRemote`). Discord encodes 720p. Steam Game Recording must be off. Do not ask gamescope for a size or framerate — native DMA-BUF, `0/1` fps. Asking 1280×720 or 30/1 aborts gamescope in `destroy_buffer`.
 
 ## Persistence
 

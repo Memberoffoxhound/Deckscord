@@ -22,7 +22,6 @@ Deckscord
    ├─ Voice strip               (hidden on Chat / Member)
    │  ├─ People in call
    │  │  └─ row A → Member mixer
-   │  ├─ Who's talking          (names over the game)
    │  ├─ Leave voice
    │  ├─ Share game / Stop sharing   (720p Go Live; Game Recording must be off)
    │  ├─ Mute
@@ -64,7 +63,6 @@ Deckscord
    │  └─ Output list
    │
    └─ Settings
-      ├─ Who's talking          names over the game, corner / size / opacity
       ├─ Discord · Voice        mute, devices, echo / noise / AGC
       ├─ Vesktop · Performance  hardware accel (restart)
       ├─ Vesktop · Linux audio  venmic flags

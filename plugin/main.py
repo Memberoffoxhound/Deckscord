@@ -165,19 +165,34 @@ def _kill_stale_portal_shims(keep: int = 0) -> None:
             pass
 
 
+def _portal_pid(pid: int = 0) -> int:
+    if pid:
+        return pid
+    try:
+        return int((DATA_DIR / "portal.pid").read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
 def _nudge_portal_hard(pid: int = 0) -> None:
     _nudge_portal()
-    target = pid
-    if not target:
-        try:
-            target = int((DATA_DIR / "portal.pid").read_text(encoding="utf-8").strip())
-        except Exception:
-            target = 0
+    target = _portal_pid(pid)
     if target:
         try:
             os.kill(target, signal.SIGUSR1)
         except OSError:
             pass
+
+
+def _drop_portal_sessions(pid: int = 0) -> None:
+    """Close ScreenCast sessions so Chromium's PipeWire capture unlinks."""
+    target = _portal_pid(pid)
+    if not target:
+        return
+    try:
+        os.kill(target, signal.SIGUSR2)
+    except OSError:
+        pass
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -406,6 +421,7 @@ def _load_settings() -> dict[str, Any]:
         if isinstance(raw, dict):
             talking = dict(doc["talking"])
             talking.update((raw.get("talking") or {}) if isinstance(raw.get("talking"), dict) else {})
+            talking["enabled"] = False
             doc["talking"] = talking
             golive = dict(doc["golive"])
             golive.update((raw.get("golive") or {}) if isinstance(raw.get("golive"), dict) else {})
@@ -498,6 +514,8 @@ RestartSec=8
 KillMode=control-group
 TimeoutStopSec=12
 TimeoutStartSec=200
+CPUQuota=200%
+CPUWeight=20
 Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
 Environment=DECKSCORD_CDP_PORT={CDP_PORT}
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do pgrep -x kwin_wayland >/dev/null && exit 0; pgrep -x kwin_x11 >/dev/null && exit 0; pgrep -x gamescope >/dev/null && exit 0; pgrep -x gamescope-wl >/dev/null && exit 0; sleep 1; done; exit 1'
@@ -545,21 +563,50 @@ def _install_launch_script() -> None:
 
 
 def _harden_vesktop_unit() -> None:
-    """Wait for a compositor before Electron starts, so linger cannot grab DRM at boot."""
+    """Keep the user unit in sync (compositor wait + CPU cap so Game Mode stays playable)."""
     path = _login_home() / ".config" / "systemd" / "user" / SERVICE
+    want = _vesktop_unit_text()
     try:
         cur = path.read_text(encoding="utf-8") if path.is_file() else ""
     except OSError:
         return
-    if "ExecStartPre=" in cur and "pgrep -x gamescope" in cur:
+    if cur == want:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_vesktop_unit_text(), encoding="utf-8")
+        path.write_text(want, encoding="utf-8")
         _systemctl("daemon-reload", timeout=8)
-        decky.logger.info("rewrote vesktop unit to wait for compositor")
+        decky.logger.info("rewrote vesktop unit")
     except Exception as e:
         decky.logger.warning(f"vesktop unit: {e}")
+
+
+def _pin_vesktop_x11() -> None:
+    """Gamescope ignores CDP minimize and maps Discord at output size (often 4K)."""
+    if not in_game_mode():
+        return
+    env = _overlay_env()
+    try:
+        r = subprocess.run(
+            ["xdotool", "search", "--class", "vesktop"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env=env,
+        )
+    except Exception:
+        return
+    ids = [x for x in (r.stdout or "").split() if x]
+    for wid in ids:
+        for args in (
+            ["xdotool", "windowsize", wid, "960", "540"],
+            ["xdotool", "windowmove", wid, "8000", "8000"],
+        ):
+            try:
+                subprocess.run(args, capture_output=True, timeout=2, check=False, env=env)
+            except Exception:
+                pass
 
 
 def _overlay_env() -> dict[str, str]:
@@ -832,15 +879,25 @@ _AUDIO_SKIP = (
 )
 
 
-def _pw_dump() -> list[Any]:
+_PW_CACHE: tuple[float, list[Any]] = (0.0, [])
+
+
+def _pw_dump(force: bool = False) -> list[Any]:
+    global _PW_CACHE
+    now = time.monotonic()
+    if not force and _PW_CACHE[1] and (now - _PW_CACHE[0]) < 2.0:
+        return _PW_CACHE[1]
     try:
-        r = _run(["/usr/bin/pw-dump"], timeout=5)
+        r = _run(["/usr/bin/pw-dump"], timeout=3)
         if r.returncode != 0:
-            r = _run(["pw-dump"], timeout=5)
-        return json.loads(r.stdout or "[]")
+            r = _run(["pw-dump"], timeout=3)
+        data = json.loads(r.stdout or "[]")
+        if data:
+            _PW_CACHE = (now, data)
+        return data
     except Exception as e:
         decky.logger.warning(f"pw-dump: {e}")
-        return []
+        return list(_PW_CACHE[1] or [])
 
 
 def find_gamescope_node() -> Optional[dict[str, Any]]:
@@ -897,7 +954,7 @@ def game_recording_consumers(data: Optional[list[Any]] = None) -> list[dict[str,
             gamescope_ids.add(n.get("id"))
     if not gamescope_ids:
         return []
-    skip = ("vesktop", "vencord", "discord", "deckscord", "gst-launch", "pipewiresrc")
+    skip = ("vesktop", "vencord", "discord", "deckscord")
     found: list[dict[str, Any]] = []
     for n in data:
         if "Link" not in str(n.get("type") or ""):
@@ -1235,6 +1292,7 @@ class Plugin:
         self._portal_proc: Optional[subprocess.Popen] = None
         self._go_live_until = 0.0
         self._go_live_pending = False
+        self._go_live_stopped_at = 0.0
         self._capture_env_restarted = False
 
     async def _main(self) -> None:
@@ -1342,6 +1400,10 @@ class Plugin:
         raise ConnectionError(str(last_err) if last_err else "CDP connect failed")
 
     async def _hide_window(self) -> None:
+        try:
+            await asyncio.to_thread(_pin_vesktop_x11)
+        except Exception:
+            pass
         if not self._can_hide_window:
             return
         try:
@@ -1349,9 +1411,20 @@ class Plugin:
             wid = (info or {}).get("windowId")
             if wid is None:
                 return
+            # Minimize is ignored on gamescope. Keep a tiny off-screen window
+            # so Chromium does not rasterize at the 4K output size.
             await self.cdp.call(
                 "Browser.setWindowBounds",
-                {"windowId": wid, "bounds": {"windowState": "minimized"}},
+                {
+                    "windowId": wid,
+                    "bounds": {
+                        "windowState": "normal",
+                        "left": 8000,
+                        "top": 8000,
+                        "width": 960,
+                        "height": 540,
+                    },
+                },
                 timeout=3,
             )
         except Exception as e:
@@ -1692,6 +1765,7 @@ class Plugin:
             pass
         self._go_live_pending = False
         self._go_live_until = 0.0
+        self._go_live_stopped_at = time.monotonic()
         decky.logger.info(f"leave_voice result {r}")
         return self._ok(r)
 
@@ -1784,11 +1858,17 @@ class Plugin:
             if wid is None:
                 return {"ok": False, "error": "no windowId"}
             if mode == "minimized":
-                bounds: dict[str, Any] = {"windowState": "minimized"}
+                bounds: dict[str, Any] = {
+                    "windowState": "normal",
+                    "left": 8000,
+                    "top": 8000,
+                    "width": 960,
+                    "height": 540,
+                }
             elif mode == "offscreen":
-                bounds = {"windowState": "normal", "left": -600, "top": 0, "width": 480, "height": 640}
+                bounds = {"windowState": "normal", "left": 8000, "top": 8000, "width": 960, "height": 540}
             else:
-                bounds = {"windowState": "normal", "width": 480, "height": 640}
+                bounds = {"windowState": "normal", "left": 8000, "top": 8000, "width": 960, "height": 540}
             await self.cdp.call("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds}, timeout=3)
             return {"ok": True, "mode": mode}
         except Exception as e:
@@ -1808,6 +1888,11 @@ class Plugin:
         if h not in (720, 1080):
             h = 720
             w = 1280
+        stopped = float(getattr(self, "_go_live_stopped_at", 0.0) or 0.0)
+        if stopped:
+            wait = 2.5 - (time.monotonic() - stopped)
+            if wait > 0:
+                await asyncio.sleep(wait)
         rec = []
         try:
             rec = game_recording_consumers()
@@ -1817,15 +1902,19 @@ class Plugin:
             names = ", ".join(
                 str(x.get("app") or x.get("name") or x.get("binary") or "steam") for x in rec[:3]
             )
-            return {
-                "ok": False,
-                "error": (
+            blob = names.lower()
+            if any(s in blob for s in ("gst", "pipewire", "obs", "pw-cat", "ffmpeg")):
+                msg = (
+                    "Something else is already capturing the game (gst/OBS). "
+                    f"Stop that first. Now using: {names}."
+                )
+            else:
+                msg = (
                     "Turn off Steam Game Recording first (Settings → Game Recording). "
                     "Share game and Game Recording both encode the same APU. "
                     f"Now using: {names}."
-                ),
-                "game_recording": rec,
-            }
+                )
+            return {"ok": False, "error": msg, "game_recording": rec}
         gs = find_gamescope_node()
         if in_game_mode() and not gs:
             return {"ok": False, "error": "gamescope capture node is missing — stay in Game Mode"}
@@ -1871,7 +1960,7 @@ class Plugin:
         await self._ensure_cdp(inject=True)
         await self._inject_bridge()
         try:
-            await self.set_window_mode("normal")
+            await self.set_window_mode("offscreen")
         except Exception as e:
             decky.logger.warning(f"raise for share: {e}")
         r = await self._eval(
@@ -1907,7 +1996,16 @@ class Plugin:
         decky.logger.info("stop_go_live")
         self._go_live_pending = False
         self._go_live_until = 0.0
+        self._go_live_stopped_at = time.monotonic()
         r = await self._bridge("stopGoLive()")
+        try:
+            extra = await self._eval(
+                "window.__deckscord && window.__deckscord.dropDesktopCapture()"
+            )
+            if isinstance(r, dict) and isinstance(extra, dict) and extra.get("dropped"):
+                r["dropped"] = extra.get("dropped")
+        except Exception as e:
+            decky.logger.warning(f"drop desktop capture: {e}")
         try:
             await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
         except Exception:
@@ -1916,8 +2014,81 @@ class Plugin:
             ensure_mic_not_loopback()
         except Exception as e:
             decky.logger.warning(f"voice capture after stop: {e}")
+        try:
+            await self._hide_window()
+        except Exception:
+            pass
+        try:
+            reap = await self._reap_js_workers()
+            if isinstance(r, dict):
+                r["workers"] = reap
+        except Exception as e:
+            decky.logger.warning(f"reap workers: {e}")
+        try:
+            pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+            _drop_portal_sessions(pid)
+        except Exception as e:
+            decky.logger.warning(f"drop portal sessions: {e}")
+        asyncio.create_task(self._drop_capture_later())
         decky.logger.info(f"stop_go_live result {r}")
         return self._ok(r)
+
+    async def _reap_js_workers(self) -> dict[str, Any]:
+        """Terminate leaked DedicatedWorkers left behind by getDesktopSource."""
+        try:
+            proto = await self.cdp.call(
+                "Runtime.evaluate",
+                {"expression": "Worker.prototype", "returnByValue": False},
+                timeout=4,
+            )
+            oid = ((proto or {}).get("result") or {}).get("objectId")
+            if not oid:
+                return {"ok": False, "error": "no Worker.prototype"}
+            objs = await self.cdp.call(
+                "Runtime.queryObjects",
+                {"prototypeObjectId": oid},
+                timeout=8,
+            )
+            aoid = ((objs or {}).get("objects") or {}).get("objectId")
+            if not aoid:
+                return {"ok": True, "killed": 0}
+            r = await self.cdp.call(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": aoid,
+                    "functionDeclaration": (
+                        "function(){ var n=0;"
+                        "for (var i=0;i<this.length;i++){"
+                        "try{ this[i].terminate(); n++; }catch(e){}"
+                        "} return n; }"
+                    ),
+                    "returnByValue": True,
+                },
+                timeout=10,
+            )
+            killed = ((r or {}).get("result") or {}).get("value")
+            decky.logger.info(f"reap js workers killed={killed}")
+            return {"ok": True, "killed": killed}
+        except Exception as e:
+            decky.logger.warning(f"reap js workers: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def _drop_capture_later(self) -> None:
+        await asyncio.sleep(1.0)
+        if self._go_live_pending or time.monotonic() < float(self._go_live_until or 0):
+            return
+        try:
+            await self._eval("window.__deckscord && window.__deckscord.dropDesktopCapture()")
+        except Exception:
+            pass
+        try:
+            await self._reap_js_workers()
+        except Exception:
+            pass
+        try:
+            _drop_portal_sessions()
+        except Exception:
+            pass
 
     async def set_golive_quality(self, height: int = 720, fps: int = 30, **kwargs: Any) -> dict[str, Any]:
         h = int(kwargs.get("height") or height or 720)
@@ -2371,9 +2542,8 @@ print("reload_plugin sent")
                 pass
 
     def _overlay_needed(self) -> bool:
-        """GTK overlay draws the who's-talking roster over Game Mode."""
-        talk = self._settings.get("talking") or {}
-        return bool(talk.get("enabled") and (self._talk_in_voice or self._last_voice_channel))
+        """Who's-talking overlay is parked — it was a 4K gamescope plane."""
+        return False
 
     def _start_pip_overlay(self) -> None:
         if not self._overlay_needed():
@@ -2513,12 +2683,10 @@ print("reload_plugin sent")
         self._write_talking_state(live, True)
 
     async def _pip_loop(self) -> None:
-        talk_at = 0.0
         pin_at = 0.0
+        hide_at = 0.0
         while True:
             try:
-                talk = self._settings.get("talking") or {}
-                talk_pref = bool(talk.get("enabled"))
                 now = time.monotonic()
                 pin_iv = 2.0 if self._last_voice_channel else (1.0 if now < self._mic_pin_until else 12.0)
                 if (self._last_voice_channel or now < self._mic_pin_until) and now - pin_at >= pin_iv:
@@ -2531,19 +2699,15 @@ print("reload_plugin sent")
                         await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
                     except Exception:
                         pass
-                talk_iv = 0.25 if self._talk_in_voice else 1.0
-                if talk_pref and now - talk_at >= talk_iv:
-                    await self._talking_tick()
-                    talk_at = now
-                elif not talk_pref:
-                    self._write_talking_state([], False)
-                talk_on = bool(talk_pref and self._talk_in_voice)
-                if talk_on:
-                    self._start_pip_overlay()
-                    await asyncio.sleep(0.35)
-                else:
-                    self._stop_overlay_if_idle()
-                    await asyncio.sleep(0.45)
+                self._write_talking_state([], False)
+                self._stop_overlay_if_idle()
+                if now - hide_at >= 2.0:
+                    hide_at = now
+                    try:
+                        await asyncio.to_thread(_pin_vesktop_x11)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.45)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

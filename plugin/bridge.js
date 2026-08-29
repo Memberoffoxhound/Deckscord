@@ -4,6 +4,19 @@
  * Every public method returns JSON-safe plain objects.
  */
 (function () {
+  if (!window.__deckscordWorkerHook) {
+    window.__deckscordWorkerHook = true;
+    window.__deckscordWorkers = [];
+    var NativeWorker = window.Worker;
+    function TrackedWorker(url, opts) {
+      var w = new NativeWorker(url, opts);
+      window.__deckscordWorkers.push(w);
+      return w;
+    }
+    TrackedWorker.prototype = NativeWorker.prototype;
+    window.Worker = TrackedWorker;
+  }
+
   function err(e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
@@ -395,9 +408,154 @@
     stopRequested: false,
     gen: 0,
     lastStop: 0,
+    sourceId: null,
     gameAudio: [],
     debug: { picker: "idle" },
+    scaler: null,
   };
+
+  function stopGpuScaler() {
+    var s = GO_LIVE.scaler;
+    GO_LIVE.scaler = null;
+    if (!s) return;
+    s.running = false;
+    try {
+      if (s.orig && typeof s.orig.getTracks === "function") {
+        s.orig.getTracks().forEach(function (t) {
+          try { t.stop(); } catch (eT) {}
+        });
+      }
+    } catch (eO) {}
+    try { s.video && s.video.pause && s.video.pause(); } catch (eP) {}
+    try { s.video && s.video.remove && s.video.remove(); } catch (eR) {}
+  }
+
+  // Downscale AFTER PipeWire capture. Never applyConstraints on the raw
+  // gamescope track — VIDEO_size 720p/30 kills gamescope's PW thread.
+  function gpuDownscaleStream(stream, w, h, fps) {
+    if (!stream || typeof stream.getVideoTracks !== "function") return stream;
+    var vt = stream.getVideoTracks();
+    if (!vt.length) return stream;
+    w = w || 1280;
+    h = h || 720;
+    fps = fps || 30;
+    var minUs = Math.floor(1000000 / fps);
+    stopGpuScaler();
+    var bag = { running: true, orig: stream, video: null };
+    GO_LIVE.scaler = bag;
+
+    function withAudio(videoTrack) {
+      var tracks = [videoTrack].concat(stream.getAudioTracks());
+      return new MediaStream(tracks);
+    }
+
+    if (typeof MediaStreamTrackProcessor === "function" && typeof MediaStreamTrackGenerator === "function") {
+      try {
+        var gen = new MediaStreamTrackGenerator({ kind: "video" });
+        var proc = new MediaStreamTrackProcessor({ track: vt[0] });
+        var canvas = new OffscreenCanvas(w, h);
+        var ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+        var lastTs = -1e18;
+        (async function pump() {
+          var reader = proc.readable.getReader();
+          var writer = gen.writable.getWriter();
+          try {
+            while (bag.running) {
+              var r = await reader.read();
+              if (r.done) break;
+              var frame = r.value;
+              var ts = frame.timestamp || 0;
+              if (ts - lastTs < minUs) {
+                frame.close();
+                continue;
+              }
+              lastTs = ts;
+              ctx.drawImage(frame, 0, 0, w, h);
+              frame.close();
+              var out = new VideoFrame(canvas, { timestamp: ts, alpha: "discard" });
+              await writer.write(out);
+            }
+          } catch (ePump) {
+          } finally {
+            try { reader.releaseLock(); } catch (eL) {}
+            try { await writer.close(); } catch (eW) {}
+          }
+        })();
+        return withAudio(gen);
+      } catch (eProc) {}
+    }
+
+    try {
+      var video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.srcObject = stream;
+      video.setAttribute("style", "position:fixed;left:-9999px;width:2px;height:2px");
+      document.body.appendChild(video);
+      bag.video = video;
+      video.play().catch(function () {});
+      var c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      var c2 = c.getContext("2d", { alpha: false, desynchronized: true });
+      var lastMs = 0;
+      var minMs = 1000 / fps;
+      function tick(now) {
+        if (!bag.running) return;
+        if (!lastMs || now - lastMs >= minMs) {
+          lastMs = now;
+          try { c2.drawImage(video, 0, 0, w, h); } catch (eD) {}
+        }
+        if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(tick);
+        else requestAnimationFrame(tick);
+      }
+      if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(tick);
+      else requestAnimationFrame(tick);
+      return withAudio(c.captureStream(fps).getVideoTracks()[0]);
+    } catch (eCv) {
+      return stream;
+    }
+  }
+
+  function wrapDesktopSourceGpu(eng, srcId, w, h, fps) {
+    try {
+      var pool = eng && eng.desktopInputPool;
+      var src = pool && pool.get && pool.get(srcId);
+      if (!src) return { ok: false, error: "no desktop source" };
+      var raw = src.stream || src.mediaStream || src._stream;
+      if (!raw) return { ok: false, error: "no desktop stream" };
+      var scaled = gpuDownscaleStream(raw, w, h, fps);
+      if (scaled && scaled !== raw) {
+        if ("stream" in src) src.stream = scaled;
+        if ("mediaStream" in src) src.mediaStream = scaled;
+        if ("_stream" in src) src._stream = scaled;
+      }
+      return { ok: true, scaled: !!(scaled && scaled !== raw) };
+    } catch (e) {
+      return err(e);
+    }
+  }
+
+  function pinRtcShareEncodings(height, fps) {
+    try {
+      var eng = mediaEngine();
+      if (!eng || typeof eng.eachConnection !== "function") return;
+      var scale = height >= 1080 ? 2 : 3;
+      eng.eachConnection(function (conn) {
+        var pc = conn && (conn.peerConnection || conn.pc || (conn.input && conn.input.pc));
+        if (!pc || typeof pc.getSenders !== "function") return;
+        pc.getSenders().forEach(function (s) {
+          if (!s || !s.track || s.track.kind !== "video") return;
+          var p = s.getParameters() || {};
+          p.encodings = p.encodings && p.encodings.length ? p.encodings : [{}];
+          p.encodings[0].scaleResolutionDownBy = scale;
+          p.encodings[0].maxFramerate = fps || 30;
+          try { s.setParameters(p); } catch (eP) {}
+        });
+      });
+    } catch (e) {}
+  }
 
   function pinScreenshareQuality(res, fps) {
     try {
@@ -427,6 +585,103 @@
       if (MES && MES.getGoLiveSource && MES.getGoLiveSource()) return { source: "media-engine" };
     } catch (e2) {}
     return null;
+  }
+
+  function mediaEngine() {
+    var MES = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf") || byProps("getMediaEngine");
+    return MES && MES.getMediaEngine ? MES.getMediaEngine() : null;
+  }
+
+  function destroyDesktopEntry(src) {
+    if (!src) return;
+    try {
+      var stream = src.stream || src.mediaStream || src._stream;
+      if (stream && typeof stream.getTracks === "function") {
+        stream.getTracks().forEach(function (t) {
+          try { t.stop(); } catch (eT) {}
+        });
+      }
+    } catch (eS) {}
+    try {
+      if (typeof src.destroy === "function") src.destroy();
+    } catch (eD) {}
+    try {
+      if (typeof src.stop === "function") src.stop();
+    } catch (eSt) {}
+  }
+
+  function dropDesktopCapture() {
+    var dropped = [];
+    try { stopGpuScaler(); dropped.push("scaler"); } catch (eSc) {}
+    var eng = mediaEngine();
+    var MES = store("MediaEngineStore") || byProps("getGoLiveSource");
+    var liveId = GO_LIVE.sourceId;
+    try {
+      var src = MES && MES.getGoLiveSource && MES.getGoLiveSource();
+      if (src && src.desktopSource && src.desktopSource.id) liveId = src.desktopSource.id;
+    } catch (eS) {}
+    function wipeId(id) {
+      if (id == null || id === "") return;
+      var pool = eng && eng.desktopInputPool;
+      try {
+        if (pool && typeof pool.get === "function") destroyDesktopEntry(pool.get(id));
+      } catch (eG) {}
+      try {
+        if (pool && typeof pool.release === "function") pool.release(id);
+      } catch (eR) {}
+      dropped.push(String(id));
+    }
+    wipeId(liveId);
+    wipeId("Entire screen");
+    try {
+      if (eng && typeof eng.handleDesktopSourceEnd === "function") {
+        eng.handleDesktopSourceEnd(liveId || "Entire screen");
+      }
+    } catch (eH) {}
+    try {
+      var vm = window.VesktopNative && window.VesktopNative.virtmic;
+      if (vm && typeof vm.stop === "function") vm.stop();
+    } catch (eV) {}
+    try {
+      var actions = byProps("setGoLiveSource");
+      if (actions && typeof actions.setGoLiveSource === "function") actions.setGoLiveSource(null);
+    } catch (eA) {}
+    try {
+      if (eng && typeof eng.eachConnection === "function") {
+        eng.eachConnection(function (conn) {
+          try {
+            if (conn && conn.input && typeof conn.input.handleDesktopSourceEnd === "function") {
+              conn.input.handleDesktopSourceEnd();
+            }
+          } catch (eIn) {}
+          try {
+            if (conn && typeof conn.handleDesktopSourceEnd === "function") conn.handleDesktopSourceEnd();
+          } catch (eC) {}
+          try {
+            if (conn && typeof conn.setStream === "function") conn.setStream(null);
+          } catch (eSt) {}
+          try {
+            var vid = conn && conn.input && conn.input.video;
+            if (vid && typeof vid.setSource === "function") vid.setSource("disabled");
+            else if (vid && typeof vid.destroy === "function" && !vid.destroyed) vid.destroy();
+          } catch (eVid) {}
+        });
+      }
+    } catch (eE) {}
+    try {
+      var bag = window.__deckscordWorkers;
+      if (bag && bag.length) {
+        var copy = bag.splice(0, bag.length);
+        copy.forEach(function (w) {
+          try { w.terminate(); } catch (eT) {}
+        });
+        dropped.push("workers:" + copy.length);
+      }
+    } catch (eWk) {}
+    GO_LIVE.sourceId = null;
+    GO_LIVE.active = false;
+    GO_LIVE.pending = false;
+    return { ok: true, dropped: dropped };
   }
 
   function clickSharePicker() {
@@ -1301,9 +1556,12 @@
           try { eng && eng.desktopInputPool && eng.desktopInputPool.get(srcId) && eng.desktopInputPool.get(srcId).destroy(); } catch (eD) {}
           return { ok: false, error: "cancelled" };
         }
+        var wrap = wrapDesktopSourceGpu(eng, srcId, width, height, fps);
         startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: null });
         GO_LIVE.active = true;
-        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true, picker: GO_LIVE.debug };
+        GO_LIVE.sourceId = srcId || GO_LIVE.sourceId;
+        setTimeout(function () { pinRtcShareEncodings(height, fps); }, 800);
+        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true, picker: GO_LIVE.debug, gpu: wrap };
       }
 
       if (!eng || typeof eng.getDesktopSource !== "function") {
@@ -1325,7 +1583,7 @@
           (function tick() {
             var busy = currentStream();
             var since = Date.now() - (GO_LIVE.lastStop || 0);
-            if ((!busy && since >= 1200) || GO_LIVE.stopRequested || Date.now() - t0 > 5000) {
+            if ((!busy && since >= 2500) || GO_LIVE.stopRequested || Date.now() - t0 > 8000) {
               resolve();
               return;
             }
@@ -1339,9 +1597,11 @@
           GO_LIVE.active = false;
           return { ok: false, error: "cancelled" };
         }
-        // Size only. Do NOT pass frameRate: gamescope advertises 0/1 and a
-        // 30/1 PipeWire renegotiate has killed the Game Mode capture node.
-        var constraints = { width: width, height: height };
+        // Do NOT pass width/height/frameRate. gamescope advertises native
+        // size (often 3840x2160) at 0/1 fps. Asking 1280x720 or 30/1 makes
+        // it destroy in-flight DMA-BUFs and abort in destroy_buffer() from
+        // paint_pipewire(). Discord still encodes 720p via pinScreenshareQuality.
+        var constraints = {};
         var wantAudio = true;
         var acq = eng.getDesktopSource(constraints, wantAudio);
         var raced = false;
@@ -1378,10 +1638,18 @@
       });
     },
 
+    dropDesktopCapture: function () {
+      try {
+        return dropDesktopCapture();
+      } catch (e) {
+        return err(e);
+      }
+    },
+
     stopGoLive: function () {
       try {
-        if (GO_LIVE.pending) GO_LIVE.stopRequested = true;
-        else GO_LIVE.active = false;
+        GO_LIVE.stopRequested = true;
+        GO_LIVE.active = false;
         GO_LIVE.lastStop = Date.now();
         var s = currentStream();
         var stopFn = findByCode('"STREAM_STOP"');
@@ -1396,10 +1664,13 @@
             try { stopFn(s); } catch (e2) {}
           }
         }
+        var dropped = dropDesktopCapture();
         GO_LIVE.gameAudio = [];
+        GO_LIVE.pending = false;
         try { window.__deckscord.ensureVoiceProcessing(); } catch (eMic) {}
-        return { ok: true, streaming: false };
+        return { ok: true, streaming: false, dropped: dropped && dropped.dropped };
       } catch (e) {
+        try { dropDesktopCapture(); } catch (e2) {}
         return err(e);
       }
     },

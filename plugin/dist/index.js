@@ -52,7 +52,6 @@ const getUpdateStatus = backend("get_update_status");
 const getSettings = backend("get_settings");
 const setVesktopSetting = backend("set_vesktop_setting");
 const setDiscordSetting = backend("set_discord_setting");
-const setTalkingSettings = backend("set_talking_settings");
 const startGoLive = backend("start_go_live");
 const stopGoLive = backend("stop_go_live");
 
@@ -551,7 +550,6 @@ function cycle(list, cur) {
 
 function SettingsHub({ push, handleCancel }) {
   const items = [
-    { page: "settings_talk", title: "Who's talking", sub: "Names over the game while someone speaks" },
     { page: "settings_voice", title: "Discord · Voice", sub: "Mute, devices, echo / noise" },
     { page: "settings_vesktop_perf", title: "Vesktop · Performance", sub: "Hardware acceleration" },
     { page: "settings_vesktop_audio", title: "Vesktop · Linux audio", sub: "Venmic capture flags" },
@@ -1025,22 +1023,7 @@ function App() {
       push({ page: "media", item: payload.item, kind: payload.kind || "image", title: (payload.item && payload.item.name) || "Media" });
     }
   };
-  const talking = (status && status.talking) || (cfg && cfg.talking) || {};
-  const talkingOn = !!talking.enabled;
   const compactVoice = [
-    voice
-      ? e(
-          DFL.PanelSectionRow,
-          { key: "talk" },
-          e(DFL.ToggleField, {
-            label: "Who's talking",
-            description: talkingOn ? (talking.corner || "top-left") + " · over the game" : "Off",
-            checked: talkingOn,
-            onChange: (v) => tap(() => act("Talking overlay", () => setTalkingSettings(v))),
-            ...cancelBind(handleCancel),
-          })
-        )
-      : null,
     voice
       ? e(DFL.PanelSectionRow, { key: "leave" }, e(DFL.ButtonItem, { layout: "below", onClick: () => tap(() => act("Leave", () => leaveVoice())), ...cancelBind(handleCancel) }, "Leave voice"))
       : e(DFL.PanelSectionRow, { key: "idle" }, e("div", { style: { opacity: 0.7, fontSize: 13 } }, "Not in a voice channel")),
@@ -1557,7 +1540,6 @@ function App() {
     const ves = (cfg && cfg.vesktop) || {};
     const audio = ves.audio || {};
     const disc = (cfg && cfg.discord) || {};
-    const talkCfg = (cfg && cfg.talking) || talking || {};
     const reload = () =>
       getSettings()
         .then((r) => {
@@ -1577,127 +1559,7 @@ function App() {
         return r;
       });
     let kids = [];
-    if (view.page === "settings_talk") {
-      kids = [
-        e(
-          DFL.PanelSectionRow,
-          { key: "h" },
-          e(
-            "div",
-            { style: { fontSize: 13, lineHeight: 1.35, opacity: 0.85 } },
-            "While you are in a call, a name and avatar appear over the game only when that person is speaking. Nothing is drawn when the channel is quiet."
-          )
-        ),
-        e(ToggleRow, {
-          key: "en",
-          label: "Show who's talking",
-          description: "Over Game Mode, not the QAM",
-          checked: !!talkCfg.enabled,
-          onChange: (v) =>
-            act("Talking overlay", async () => {
-              const r = await setTalkingSettings(v);
-              await reload();
-              return r;
-            }),
-          handleCancel,
-        }),
-        e(
-          CycleRow,
-          {
-            key: "cr",
-            label: "Corner",
-            value: talkCfg.corner || "top-left",
-            options: [
-              { value: "top-left", label: "Top left" },
-              { value: "top-right", label: "Top right" },
-              { value: "bottom-left", label: "Bottom left" },
-              { value: "bottom-right", label: "Bottom right" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("Talking overlay", async () => {
-                const r = await setTalkingSettings({
-                  enabled: !!talkCfg.enabled,
-                  corner: v,
-                  size: talkCfg.size,
-                  opacity: talkCfg.opacity,
-                  showSelf: talkCfg.showSelf,
-                });
-                await reload();
-                return r;
-              }),
-          }
-        ),
-        e(
-          CycleRow,
-          {
-            key: "sz",
-            label: "Size",
-            value: talkCfg.size || "small",
-            options: [
-              { value: "small", label: "Small" },
-              { value: "large", label: "Large" },
-            ],
-            handleCancel,
-            onPick: (v) =>
-              act("Talking overlay", async () => {
-                const r = await setTalkingSettings({
-                  enabled: !!talkCfg.enabled,
-                  corner: talkCfg.corner,
-                  size: v,
-                  opacity: talkCfg.opacity,
-                  showSelf: talkCfg.showSelf,
-                });
-                await reload();
-                return r;
-              }),
-          }
-        ),
-        e(
-          DFL.PanelSectionRow,
-          { key: "op" },
-          e(DFL.SliderField, {
-            label: "Opacity",
-            value: talkCfg.opacity != null ? talkCfg.opacity : 90,
-            min: 20,
-            max: 100,
-            step: 5,
-            showValue: true,
-            valueSuffix: "%",
-            onChange: (v) =>
-              slideVol("talkop", v, () =>
-                setTalkingSettings({
-                  enabled: !!talkCfg.enabled,
-                  corner: talkCfg.corner,
-                  size: talkCfg.size,
-                  opacity: v,
-                  showSelf: talkCfg.showSelf,
-                }).then(reload)
-              ),
-            ...cancelBind(handleCancel),
-          })
-        ),
-        e(ToggleRow, {
-          key: "me",
-          label: "Show me",
-          description: "Include your name when you talk",
-          checked: talkCfg.showSelf !== false,
-          onChange: (v) =>
-            act("Talking overlay", async () => {
-              const r = await setTalkingSettings({
-                enabled: talkCfg.enabled,
-                corner: talkCfg.corner,
-                size: talkCfg.size,
-                opacity: talkCfg.opacity,
-                showSelf: v,
-              });
-              await reload();
-              return r;
-            }),
-          handleCancel,
-        }),
-      ];
-    } else if (view.page === "settings_voice") {
+    if (view.page === "settings_voice") {
       kids = [
         e(ToggleRow, {
           key: "m",
