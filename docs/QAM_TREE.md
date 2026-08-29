@@ -22,7 +22,8 @@ Deckscord
    │
    ├─ Voice strip               (hidden on Chat / Member / Live video)
    │  ├─ Live tiles             (only if someone has camera or Go Live)
-   │  │  └─ tile A: focus stream (game audio); A again: large Watch overlay
+   │  │  └─ tile A: focus stream (game audio at 30% of output); A again: large Watch overlay
+   │  │     Stream volume slider while watching
    │  │     B on Watch: close overlay, mute stream audio, party voice stays
    │  ├─ People in call         (no duplicate of anyone already on a tile)
    │  │  └─ row A → Member mixer
@@ -49,7 +50,8 @@ Deckscord
    │     └─ people in that VC ─► Member mixer
    │
    ├─ Chat  (#channel or DM)
-   │  ├─ Messages (top of QAM)
+   │  ├─ Messages (timestamps, d-pad scroll)
+   │  │  └─ A on picture/video → overlay (same 30% audio as streams)
    │  ├─ Message field + Send   (Steam keyboard)
    │  ├─ Start voice call       (DMs only)
    │  ├─ Live video (N) ───────► Live video

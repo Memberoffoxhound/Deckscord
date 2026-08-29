@@ -12,9 +12,9 @@
  * mixer with volume, local mute, server mute/deafen.
  *
  * Chat packs attachments, embeds, gifv, stickers (images + video).
+ * A on a picture or video opens a Watch-style overlay (B closes).
+ * Messages show timestamps and d-pad-scroll in the thread pane.
  * B / onCancel pops the view stack until home, then QAM closes.
- * Chat puts messages first (no nested scroller) so the thread sits in
- * the upper half of the QAM and d-pad can move through it.
  *
  * Live video: edge-to-edge JPEG tiles (VideoStack first in voice),
  * exclusive local-mute on tile A, 🔊 pill on the focused stream.

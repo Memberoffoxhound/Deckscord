@@ -13,6 +13,7 @@ charge. Auto-approve is Vesktop/Vencord only.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -185,6 +186,27 @@ def _nudge_fresh() -> bool:
         return p.is_file() and (time.time() - p.stat().st_mtime) < 90
     except OSError:
         return False
+
+
+def _take_singleton():
+    """One shim only. Leftover copies steal org.freedesktop.portal.Desktop from each other."""
+    path = _data_dir() / "portal.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+", encoding="utf-8")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        try:
+            (_data_dir() / "portal.pid").write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+        return fh
+    except OSError as e:
+        log.info("another portal shim already holds the lock (%s) — exiting", e)
+        return None
 
 
 def _write_status(owned: bool) -> None:
@@ -594,15 +616,21 @@ class Portal:
         except Exception as e:
             log.warning("unmask portal: %r", e)
 
-    def try_own(self) -> None:
-        if self.owner_id:
+    def try_own(self, force: bool = False) -> None:
+        if self.owner_id and not force:
             return
         now = time.monotonic()
-        if self._own_at and (now - self._own_at) < 2.0:
+        if not force and self._own_at and (now - self._own_at) < 1.0:
             return
         self._own_at = now
-        if self._stable_gm:
+        if self._stable_gm or _nudge_fresh():
             self._mask_desktop_portal()
+        if self.owner_id:
+            try:
+                Gio.bus_unown_name(self.owner_id)
+            except Exception:
+                pass
+            self.owner_id = 0
         flags = Gio.BusNameOwnerFlags.DO_NOT_QUEUE
         try:
             flags |= Gio.BusNameOwnerFlags.REPLACE
@@ -651,6 +679,12 @@ class Portal:
         # xdg-desktop-portal during boot/login hangs Plasma and gamescope-session.
         if self._stable_gm and ((now - self._started) >= 20.0 or _nudge_fresh()):
             self._mask_desktop_portal()
+            GLib.timeout_add(400, self._retry_own)
+
+    def _retry_own(self) -> bool:
+        if (self._stable_gm or _nudge_fresh()) and not self.owner_id:
+            self.try_own(force=True)
+        return False
 
     def tick(self) -> bool:
         want = in_game_mode()
@@ -662,24 +696,28 @@ class Portal:
             nudged = _nudge_fresh()
             self._stable_gm = nudged or (now - self._gm_since) >= 5.0
             if self._stable_gm and not self.owner_id:
-                self.try_own()
+                self.try_own(force=nudged)
         else:
             self._gm_since = 0.0
             self._stable_gm = False
             self._stopping_portal = False
             if not self._desk_since:
                 self._desk_since = now
-            if self.owner_id and (now - self._desk_since) >= 5.0:
+            # Stay on the name while Share game is still starting.
+            if self.owner_id and (now - self._desk_since) >= 5.0 and not _nudge_fresh():
                 self.drop_name()
                 self._start_desktop_portal()
         return True
 
 
 def main() -> int:
+    lock = _take_singleton()
+    if lock is None:
+        return 0
     portal = Portal()
     GLib.timeout_add_seconds(1, portal.tick)
     portal.tick()
-    log.info("watching for gamescope (idle in Desktop Mode)")
+    log.info("watching for gamescope (idle in Desktop Mode) pid=%s", os.getpid())
     loop = GLib.MainLoop()
 
     def _quit(*_a):
@@ -687,6 +725,13 @@ def main() -> int:
         portal._unmask_desktop_portal()
         loop.quit()
         return False
+
+    def _force_own(*_a):
+        log.info("SIGUSR1 — take ScreenCast name now")
+        portal._gm_since = portal._gm_since or time.monotonic()
+        portal._stable_gm = True
+        portal.try_own(force=True)
+        return True
 
     def _on_signal(sig, cb=_quit):
         try:
@@ -698,7 +743,12 @@ def main() -> int:
 
     _on_signal(signal.SIGINT)
     _on_signal(signal.SIGTERM)
+    _on_signal(signal.SIGUSR1, _force_own)
     loop.run()
+    try:
+        lock.close()
+    except Exception:
+        pass
     return 0
 
 

@@ -58,7 +58,7 @@ In a call, friend is live
 ```
 
 - **Tiles:** video only. No stream audio until you Watch.
-- **Watch:** one focused stream, large, game audio for that user only.
+- **Watch:** one focused stream, large, game audio for that user only at **30% of output volume** (slider to change).
 - **Party mics:** still audible unless you Mute/Deafen/Solo on the member page.
 - **Your game:** stays running under the overlay (Steam/gamescope). Overlay is
   a spectator layer, not a second gamescope session of their title.

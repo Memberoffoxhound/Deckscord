@@ -202,19 +202,70 @@ else
   fi
 fi
 
-bar 90 "Restarting Decky…"
+bar 90 "Reloading Deckscord…"
 
-restarted=0
-if systemctl restart plugin_loader.service 2>/dev/null || systemctl restart plugin_loader 2>/dev/null; then
-  restarted=1
-elif sudo -n systemctl restart plugin_loader.service 2>/dev/null || sudo -n systemctl restart plugin_loader 2>/dev/null; then
-  restarted=1
+reloaded=0
+if /usr/bin/python3 - <<'PY'
+import json, os, struct, time, urllib.request
+from urllib.parse import urlparse
+
+def ws_connect(url, timeout=4):
+    import socket
+    u = urlparse(url)
+    host = u.hostname or "127.0.0.1"
+    port = int(u.port or 1337)
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+    s = socket.create_connection((host, port), timeout=timeout)
+    key = __import__("base64").b64encode(os.urandom(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    s.sendall(req.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(1024)
+        if not chunk:
+            raise ConnectionError("ws handshake closed")
+        buf += chunk
+    if b"101" not in buf.split(b"\r\n", 1)[0]:
+        raise ConnectionError("ws handshake failed")
+    return s
+
+def ws_send(s, text):
+    data = text.encode()
+    mask = os.urandom(4)
+    n = len(data)
+    hdr = bytearray([0x81])
+    if n < 126:
+        hdr.append(0x80 | n)
+    elif n < 65536:
+        hdr.append(0x80 | 126)
+        hdr.extend(struct.pack("!H", n))
+    else:
+        hdr.append(0x80 | 127)
+        hdr.extend(struct.pack("!Q", n))
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    s.sendall(hdr + mask + masked)
+
+token = urllib.request.urlopen("http://127.0.0.1:1337/auth/token", timeout=3).read().decode().strip()
+ws = ws_connect("ws://127.0.0.1:1337/ws?auth=" + token)
+ws_send(ws, json.dumps({"type": 0, "route": "loader/reload_plugin", "args": ["Deckscord"], "id": 1}))
+time.sleep(1.0)
+ws.close()
+print("ok")
+PY
+then
+  reloaded=1
 fi
-if [[ "${restarted}" -eq 1 ]]; then
-  bar 100 "Decky relaunched"
+if [[ "${reloaded}" -eq 1 ]]; then
+  bar 100 "Deckscord reloaded"
   echo
   echo -e "${GREEN}Update complete.${NC}"
 else
-  echo -e "${YELLOW}Files copied, but Decky did not restart.${NC}"
-  echo "  sudo systemctl restart plugin_loader"
+  echo -e "${YELLOW}Files copied, but Deckscord did not reload.${NC}"
+  echo "  Open the QAM → Deckscord, or: Decky → Deckscord → ⋮ → Reload"
 fi

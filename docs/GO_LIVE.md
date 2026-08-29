@@ -117,6 +117,7 @@ No software x264, no GStreamer, no v4l2loopback, no extra 1080p scaler.
 |---|---|
 | Black for viewers, LIVE in QAM | `STREAM_START` without `getDesktopSource` (Discord ≥ 2026-07) |
 | Black in Game Mode, works on desktop | Portal shim not owning the name / gamescope node missing |
+| Toggle on then off, viewers never see it | Leftover portal shims fighting for the D-Bus name — only one shim is allowed now |
 | Viewers hear the call twice | Stream audio fell back to default sink monitor — refuse that |
 | Share button dies after stop→start | getDisplayMedia modal never auto-clicked; wait ≥1.2 s after stop |
 | Other apps lose portal in Game Mode | Shim holds the session-wide portal name; it must step aside in Desktop |

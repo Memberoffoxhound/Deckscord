@@ -38,7 +38,7 @@ The script **always** installs dependencies:
 2. Wayland / PipeWire Flatpak overrides so mic and Game Mode audio work
 3. systemd user service + linger
 4. The Decky plugin (and Decky itself if missing)
-5. Restarts plugin_loader
+5. Reloads the Deckscord plugin (not the whole Decky loader)
 
 Sudo is used for linger, plugin install, and restarting Decky.
 
@@ -74,7 +74,7 @@ Or from a previous install:
 bash ~/.local/share/deckscord/update.sh
 ```
 
-In Game Mode: QAM → Deckscord → **Update from GitHub**. Progress shows in the QAM; Decky restarts when the copy is done.
+In Game Mode: QAM → Deckscord → **Update from GitHub**. Progress shows in the QAM; only Deckscord reloads when the copy is done.
 
 Once Deckscord is listed in the Decky Plugin Store, use the store’s Update button instead.
 

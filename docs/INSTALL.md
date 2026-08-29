@@ -41,7 +41,7 @@ sudo chmod -R u+rwX ~/homebrew/plugins/Deckscord
 ./update.sh --local  # copy this working tree (uncommitted diffs too)
 ```
 
-QAM → **Update from GitHub** git-pulls, shows a progress bar, copies files, then restarts Decky so the new plugin loads.
+QAM → **Update from GitHub** git-pulls, shows a progress bar, copies files, then reloads only the Deckscord plugin.
 
 ## First login
 

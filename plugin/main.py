@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import struct
 import subprocess
 import time
@@ -94,16 +95,114 @@ def _nudge_portal() -> None:
         pass
 
 
+def _portal_shim_pids(keep: int = 0) -> list[int]:
+    found: list[int] = []
+    me = os.getpid()
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            pid = int(p.name)
+            if pid in (me, keep):
+                continue
+            try:
+                cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            if "portal_shim.py" not in cmd:
+                continue
+            if "Deckscord" not in cmd and "deckscord" not in cmd.lower():
+                continue
+            if "Steamcord" in cmd:
+                continue
+            found.append(pid)
+    except OSError:
+        pass
+    return found
+
+
+def _kill_stale_portal_shims(keep: int = 0) -> None:
+    for pid in _portal_shim_pids(keep=keep):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            decky.logger.info(f"stopped leftover portal shim pid={pid}")
+        except OSError:
+            pass
+    time.sleep(0.15)
+    for pid in _portal_shim_pids(keep=keep):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _nudge_portal_hard(pid: int = 0) -> None:
+    _nudge_portal()
+    target = pid
+    if not target:
+        try:
+            target = int((DATA_DIR / "portal.pid").read_text(encoding="utf-8").strip())
+        except Exception:
+            target = 0
+    if target:
+        try:
+            os.kill(target, signal.SIGUSR1)
+        except OSError:
+            pass
+
+
+def _dbus_portal_owner_pid() -> int:
+    r = _run(
+        ["busctl", "--user", "get-name-owner", "org.freedesktop.portal.Desktop"],
+        timeout=2,
+    )
+    name = (r.stdout or "").strip().strip('"')
+    if not name:
+        return 0
+    r2 = _run(
+        [
+            "busctl",
+            "--user",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            "s",
+            name,
+        ],
+        timeout=2,
+    )
+    text = (r2.stdout or "").strip()
+    for tok in text.replace("u ", "").split():
+        if tok.isdigit():
+            return int(tok)
+    return 0
+
+
 def _portal_owned() -> bool:
     try:
         raw = json.loads(PORTAL_STATUS.read_text(encoding="utf-8"))
         if isinstance(raw, dict) and raw.get("owned"):
             ts = float(raw.get("ts") or 0)
-            if ts and time.time() - ts < 20:
+            pid = int(raw.get("pid") or 0)
+            if ts and time.time() - ts < 30 and pid and Path(f"/proc/{pid}").exists():
                 return True
     except Exception:
         pass
-    return False
+    owner = _dbus_portal_owner_pid()
+    if not owner:
+        return False
+    try:
+        cmd = (
+            Path(f"/proc/{owner}/cmdline")
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode(errors="replace")
+        )
+    except OSError:
+        return False
+    return "portal_shim.py" in cmd and "Deckscord" in cmd
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "pip": {
@@ -1034,11 +1133,13 @@ class Plugin:
     def _ensure_portal_shim(self) -> None:
         proc = self._portal_proc
         if proc is not None and proc.poll() is None:
+            _kill_stale_portal_shims(keep=int(proc.pid))
             return
         script = PLUGIN_DIR / "portal_shim.py"
         if not script.is_file():
             decky.logger.warning("portal_shim.py missing")
             return
+        _kill_stale_portal_shims()
         log = DATA_DIR / "portal-shim.log"
         log_f = open(log, "ab")
         log_f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
@@ -1541,13 +1642,17 @@ class Plugin:
                     game_audio.append(v)
         decky.logger.info(f"start_go_live {w}x{h}@{f} game_audio={game_audio}")
         self._go_live_pending = True
-        _nudge_portal()
         try:
             self._ensure_portal_shim()
         except Exception as e:
             decky.logger.warning(f"portal shim: {e}")
-        owned = await self._wait_portal_owned(8.0)
-        decky.logger.info(f"start_go_live portal_owned={owned} game_mode={in_game_mode()}")
+        pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+        _nudge_portal_hard(pid)
+        owned = await self._wait_portal_owned(12.0)
+        decky.logger.info(
+            f"start_go_live portal_owned={owned} game_mode={in_game_mode()} "
+            f"dbus_pid={_dbus_portal_owner_pid()} shim={pid}"
+        )
         try:
             ensure_mic_not_loopback()
         except Exception:
@@ -1558,7 +1663,7 @@ class Plugin:
             "window.__deckscord.startGoLive("
             + json.dumps({"width": w, "height": h, "fps": f, "gameAudio": game_audio})
             + ")",
-            timeout=22.0,
+            timeout=28.0,
         )
         ok = isinstance(r, dict) and r.get("ok") is not False
         if not isinstance(r, dict):
@@ -1678,6 +1783,13 @@ class Plugin:
         r = await self._bridge(f"setOutputVolume({float(vol)})")
         return self._ok(r)
 
+    async def set_stream_volume(self, volume: float = 30, **kwargs: Any) -> dict[str, Any]:
+        vol = kwargs.get("volume", volume)
+        r = await self._bridge(f"setStreamAudioVolume({float(vol)})")
+        if isinstance(r, dict) and r.get("focus"):
+            self._audio_focus = r["focus"]
+        return self._ok(r)
+
     async def set_window_mode(self, mode: str = "minimized", **kwargs: Any) -> dict[str, Any]:
         mode = str(kwargs.get("mode") or mode or "minimized")
         if not self._can_hide_window:
@@ -1706,11 +1818,12 @@ class Plugin:
         self._grab_alive_until = time.monotonic() + 8.0
 
     async def _wait_portal_owned(self, timeout: float = 8.0) -> bool:
-        _nudge_portal()
         try:
             self._ensure_portal_shim()
         except Exception:
             pass
+        pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+        _nudge_portal_hard(pid)
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             if _portal_owned():
@@ -1721,6 +1834,9 @@ class Plugin:
                     self._ensure_portal_shim()
                 except Exception:
                     pass
+                pid = int(self._portal_proc.pid) if self._portal_proc and self._portal_proc.poll() is None else 0
+            if int(time.monotonic() - t0) % 2 == 0:
+                _nudge_portal_hard(pid)
             await asyncio.sleep(0.25)
         return _portal_owned()
 
@@ -1939,23 +2055,69 @@ class Plugin:
         except OSError:
             pass
 
-    def _restart_plugin_loader(self) -> None:
-        """Detach so restarting plugin_loader does not kill this process first."""
-        env = _system_env()
+    def _reload_this_plugin(self) -> None:
+        """Unload/load Deckscord only. Do not restart plugin_loader."""
+        env = _subprocess_env()
         log = DATA_DIR / "update.log"
-        cmd = (
-            "sleep 1; "
-            "systemctl restart plugin_loader.service >/dev/null 2>&1 || "
-            "systemctl restart plugin_loader >/dev/null 2>&1 || "
-            "sudo -n systemctl restart plugin_loader.service >/dev/null 2>&1 || "
-            "sudo -n systemctl restart plugin_loader >/dev/null 2>&1 || "
-            "true"
-        )
         log_f = open(log, "ab")
-        log_f.write(b"restarting plugin_loader\n")
+        log_f.write(b"reloading Deckscord plugin\n")
         log_f.flush()
+        script = r"""
+import json, os, struct, time, urllib.request
+from urllib.parse import urlparse
+
+def ws_connect(url, timeout=4):
+    import socket
+    u = urlparse(url)
+    host = u.hostname or "127.0.0.1"
+    port = int(u.port or 1337)
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+    s = socket.create_connection((host, port), timeout=timeout)
+    key = __import__("base64").b64encode(os.urandom(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+    s.sendall(req.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(1024)
+        if not chunk:
+            raise ConnectionError("ws handshake closed")
+        buf += chunk
+    if b"101" not in buf.split(b"\r\n", 1)[0]:
+        raise ConnectionError("ws handshake failed")
+    return s
+
+def ws_send(s, text):
+    data = text.encode()
+    mask = os.urandom(4)
+    n = len(data)
+    hdr = bytearray([0x81])
+    if n < 126:
+        hdr.append(0x80 | n)
+    elif n < 65536:
+        hdr.append(0x80 | 126)
+        hdr.extend(struct.pack("!H", n))
+    else:
+        hdr.append(0x80 | 127)
+        hdr.extend(struct.pack("!Q", n))
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    s.sendall(hdr + mask + masked)
+
+time.sleep(0.8)
+token = urllib.request.urlopen("http://127.0.0.1:1337/auth/token", timeout=3).read().decode().strip()
+ws = ws_connect("ws://127.0.0.1:1337/ws?auth=" + token)
+ws_send(ws, json.dumps({"type": 0, "route": "loader/reload_plugin", "args": ["Deckscord"], "id": 1}))
+time.sleep(1.2)
+ws.close()
+print("reload_plugin sent")
+"""
         subprocess.Popen(
-            ["/bin/bash", "-c", cmd],
+            ["/usr/bin/python3", "-c", script],
             stdout=log_f,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -2141,8 +2303,8 @@ class Plugin:
             except OSError:
                 pass
             self._bridge_hash = ""
-            self._set_update("restart", 90, "Restarting Decky…", head=head_s)
-            self._restart_plugin_loader()
+            self._set_update("reload", 90, "Reloading Deckscord…", head=head_s)
+            self._reload_this_plugin()
         except PermissionError as e:
             decky.logger.error(f"update_from_github: {e}")
             self._set_update("error", int(self._update.get("percent") or 70), str(e), ok=False, error=str(e))

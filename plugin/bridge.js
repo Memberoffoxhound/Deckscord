@@ -376,13 +376,36 @@
     }
   }
 
-  function muteAllStreamAudioExcept(keepId) {
+  function outputVolumeNow() {
+    try {
+      var MES = store("MediaEngineStore") || byProps("getOutputVolume", "isSelfMute");
+      if (MES && typeof MES.getOutputVolume === "function") {
+        var n = Number(MES.getOutputVolume());
+        if (!isNaN(n) && n > 0) return n;
+      }
+    } catch (e) {}
+    return 100;
+  }
+
+  function defaultStreamVolume() {
+    var n = Math.round(outputVolumeNow() * 0.3);
+    if (n < 1) n = 1;
+    if (n > 200) n = 200;
+    return n;
+  }
+
+  function muteAllStreamAudioExcept(keepId, vol) {
     var bag = collectStreams();
     var ok = false;
+    var focusVol = typeof vol === "number" ? vol : defaultStreamVolume();
+    if (keepId) {
+      window.__deckscordAudioFocus = window.__deckscordAudioFocus || { userId: null, saved: {} };
+      window.__deckscordAudioFocus.streamVolume = focusVol;
+    }
     (bag.streams || []).forEach(function (s) {
       if (s.self) return;
-      var vol = keepId && s.userId === String(keepId) ? 100 : 0;
-      if (setStreamVolume(s.userId, vol)) ok = true;
+      var v = keepId && s.userId === String(keepId) ? focusVol : 0;
+      if (setStreamVolume(s.userId, v)) ok = true;
     });
     (bag.members || []).forEach(function (m) {
       if (m.self) return;
@@ -781,8 +804,46 @@
     var el = attachTrack(s.userId + ":" + s.kind, hit.track);
     dw = dw || 400;
     dh = dh || Math.round(dw * 9 / 16);
-    var q = dw >= 640 ? 0.48 : s.kind === "screenshare" ? 0.42 : 0.38;
+    var q = dw >= 640 ? 0.52 : s.kind === "screenshare" ? 0.5 : 0.42;
     return paintElementToJpeg(el, q, dw, dh);
+  }
+
+  function startFramePump() {
+    var bag = window.__deckscordVideo;
+    if (bag.pump) return;
+    bag.jpegs = bag.jpegs || {};
+    function tick() {
+      bag.pump = setTimeout(tick, 55);
+      try {
+        var live = collectStreams();
+        var list = (live.streams || []).filter(function (s) {
+          return !(s.self && s.kind === "screenshare");
+        }).slice(0, 4);
+        if (!list.length) return;
+        var focus = (window.__deckscordAudioFocus && window.__deckscordAudioFocus.userId) || "";
+        list.forEach(function (s) {
+          var key = s.userId + ":" + s.kind;
+          var big = !!(focus && s.userId === String(focus));
+          var dw = big ? 640 : 400;
+          var dh = Math.round(dw * 9 / 16);
+          var jpeg = jpegFromEngineTrack(s, big, dw, dh);
+          if (jpeg) {
+            bag.jpegs[key] = jpeg;
+            bag.jpegs[key + ":w"] = dw;
+            bag.jpegs[key + ":h"] = dh;
+          }
+        });
+      } catch (eP) {}
+    }
+    tick();
+  }
+
+  function stopFramePump() {
+    var bag = window.__deckscordVideo;
+    if (bag.pump) {
+      clearTimeout(bag.pump);
+      bag.pump = 0;
+    }
   }
 
   function cameraStreamId(userId) {
@@ -863,6 +924,8 @@
       });
     }
     window.__deckscordVideo.sinks = !!enable;
+    if (enable) startFramePump();
+    else stopFramePump();
     return { ok: true, enabled: !!enable, n: bag.streams.length, hasAdd: !!add, watched: Object.keys(window.__deckscordVideo.watched || {}) };
   }
 
@@ -1126,6 +1189,31 @@
     return "file";
   }
 
+  function messageTime(m) {
+    var t = m && (m.timestamp || m.timeStamp || m.editedTimestamp);
+    if (t && typeof t === "object") {
+      try {
+        if (typeof t.toISOString === "function") t = t.toISOString();
+        else if (typeof t.format === "function") t = t.format();
+        else if (typeof t.valueOf === "function" && !isNaN(Number(t.valueOf()))) t = new Date(Number(t.valueOf())).toISOString();
+        else t = String(t);
+      } catch (eT) {
+        t = String(t);
+      }
+    }
+    t = t ? String(t) : "";
+    if ((!t || t === "[object Object]") && m && m.id) {
+      try {
+        var snow = BigInt(String(m.id));
+        var ms = Number((snow >> 22n) + 1420070400000n);
+        t = new Date(ms).toISOString();
+      } catch (eS) {
+        t = "";
+      }
+    }
+    return t;
+  }
+
   window.__deckscord = {
     ping: function () {
       try {
@@ -1205,6 +1293,7 @@
             members: members,
             hasVideo: !!(bag.streams && bag.streams.length),
             focusedUserId: (af && af.userId) || null,
+            streamVolume: typeof af.streamVolume === "number" ? af.streamVolume : defaultStreamVolume(),
             streams: bag.streams || [],
             streaming: !!mine || GO_LIVE.active,
           };
@@ -1376,6 +1465,7 @@
         opts = opts || {};
         var bag = collectStreams();
         try { ensureVideoSinks(true); } catch (eSink) {}
+        startFramePump();
         var pipId = opts.userId ? String(opts.userId) : "";
         var pipW = Number(opts.w) || 0;
         var pipH = Number(opts.h) || 0;
@@ -1385,16 +1475,24 @@
         });
         if (pipId) copied = copied.slice(0, 1);
         else copied = copied.slice(0, 4);
+        var cache = window.__deckscordVideo.jpegs || {};
         var jobs = copied.map(function (s) {
           var key = s.userId + ":" + s.kind;
           var dw = pipId && pipW ? pipW : 400;
           var dh = pipId && pipH ? pipH : Math.round(dw * 9 / 16);
           var big = dw >= 640;
-          var jpeg = jpegFromEngineTrack(s, big, dw, dh);
+          var jpeg = cache[key] || null;
+          if (!jpeg || big) {
+            var live = jpegFromEngineTrack(s, big, dw, dh);
+            if (live) {
+              jpeg = live;
+              cache[key] = live;
+            }
+          }
           if (!jpeg) {
             var cached = window.__deckscordVideo.canvases[key];
             if (cached && !lumaBlack(cached)) {
-              jpeg = jpegFromCanvas(cached, big ? 0.48 : 0.4);
+              jpeg = jpegFromCanvas(cached, big ? 0.5 : 0.42);
             }
           }
           var next = Promise.resolve(jpeg);
@@ -1403,6 +1501,7 @@
           }
           return next.then(function (j) {
             var outJpeg = j || jpeg;
+            if (outJpeg) cache[key] = outJpeg;
             return {
               userId: s.userId,
               kind: s.kind,
@@ -1512,7 +1611,7 @@
         var id = String(userId || "");
         if (!id || id === String(bag.meId || "")) {
           muteAllStreamAudioExcept(null);
-          window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null };
+          window.__deckscordAudioFocus = { userId: null, saved: {}, kind: null, streamVolume: defaultStreamVolume() };
           return { ok: true, cleared: true };
         }
         var s = null;
@@ -1521,9 +1620,32 @@
           if (x.userId === id && x.kind === "screenshare") s = x;
         });
         if (s && s.kind === "screenshare") watchScreenShare(s);
-        muteAllStreamAudioExcept(id);
-        window.__deckscordAudioFocus = { userId: id, saved: (window.__deckscordAudioFocus && window.__deckscordAudioFocus.saved) || {}, kind: "stream" };
-        return { ok: true, user_id: id, kind: "stream", streamAudio: true, focus: window.__deckscordAudioFocus };
+        var prev = window.__deckscordAudioFocus || {};
+        var vol = typeof prev.streamVolume === "number" ? prev.streamVolume : defaultStreamVolume();
+        muteAllStreamAudioExcept(id, vol);
+        window.__deckscordAudioFocus = {
+          userId: id,
+          saved: prev.saved || {},
+          kind: "stream",
+          streamVolume: vol,
+        };
+        return { ok: true, user_id: id, kind: "stream", streamAudio: true, streamVolume: vol, focus: window.__deckscordAudioFocus };
+      } catch (e) {
+        return err(e);
+      }
+    },
+
+    setStreamAudioVolume: function (volume) {
+      try {
+        var n = Number(volume);
+        if (isNaN(n)) n = defaultStreamVolume();
+        if (n < 0) n = 0;
+        if (n > 200) n = 200;
+        var af = window.__deckscordAudioFocus || { userId: null, saved: {} };
+        af.streamVolume = n;
+        window.__deckscordAudioFocus = af;
+        if (af.userId && af.kind === "stream") muteAllStreamAudioExcept(af.userId, n);
+        return { ok: true, streamVolume: n, focus: af };
       } catch (e) {
         return err(e);
       }
@@ -1724,7 +1846,7 @@
 
       var MediaEngineStore = store("MediaEngineStore") || byProps("isSelfMute", "isSelfDeaf");
       var eng = MediaEngineStore && MediaEngineStore.getMediaEngine && MediaEngineStore.getMediaEngine();
-      GO_LIVE.active = true;
+      GO_LIVE.active = false;
       GO_LIVE.stopRequested = false;
 
       function finishStart(srcId) {
@@ -1775,7 +1897,7 @@
         var wantAudio = GO_LIVE.gameAudio.length > 0;
         var acq = eng.getDesktopSource(constraints, wantAudio);
         var timed = new Promise(function (_, rej) {
-          setTimeout(function () { rej(new Error("getDesktopSource timeout (12s)")); }, 12000);
+          setTimeout(function () { rej(new Error("getDesktopSource timeout (20s)")); }, 20000);
         });
         return Promise.race([acq, timed]).then(function (srcId) {
           if (myGen !== GO_LIVE.gen) {
@@ -1894,7 +2016,7 @@
 
     getMessages: function (channelId, limit) {
       try {
-        limit = limit || 40;
+        limit = limit || 50;
         var id = String(channelId);
         var MessageStore = store("MessageStore") || byProps("getMessages", "getMessage");
         if (!MessageStore) throw new Error("MessageStore not found");
@@ -1959,7 +2081,7 @@
               author: author.globalName || author.username || "Unknown",
               author_id: String(author.id || ""),
               avatar: avatarFromUser(author, 48),
-              ts: m.timestamp ? String(m.timestamp) : "",
+              ts: messageTime(m),
               attachments: attachments,
               embeds: embeds,
               stickers: stickers,

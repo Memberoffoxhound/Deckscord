@@ -61,6 +61,7 @@ const setVesktopSetting = backend("set_vesktop_setting");
 const setDiscordSetting = backend("set_discord_setting");
 const setGoLiveQuality = backend("set_golive_quality");
 const setTalkingSettings = backend("set_talking_settings");
+const setStreamVolume = backend("set_stream_volume");
 
 const e = window.SP_REACT.createElement;
 const { useState, useEffect, useCallback, useRef, useContext, createContext } = window.SP_REACT;
@@ -99,16 +100,37 @@ function phaseOf(status) {
   return status.phase || (status.ready ? "ready" : "loading");
 }
 
-function mediaUrl(url) {
+function mediaUrl(url, full) {
   if (!url) return url;
   let u = String(url);
   if (u.indexOf("cdn.discordapp.com/attachments") !== -1) {
     u = u.replace("cdn.discordapp.com/attachments", "media.discordapp.net/attachments");
   }
-  if (u.indexOf("media.discordapp.net") !== -1) {
+  if (!full && u.indexOf("media.discordapp.net") !== -1) {
     u += (u.indexOf("?") >= 0 ? "&" : "?") + "width=380&height=380";
   }
   return u;
+}
+
+function fmtTs(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) {
+    const s = String(ts);
+    const m = s.match(/(\d{1,2}:\d{2})/);
+    return m ? m[1] : "";
+  }
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const t = hh + ":" + mm;
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return t;
+  return d.getMonth() + 1 + "/" + d.getDate() + " " + t;
+}
+
+function defaultStreamVol(outVol) {
+  const n = Math.round((Number(outVol) || 100) * 0.3);
+  return Math.max(1, Math.min(200, n));
 }
 
 function Avatar({ src, name, size, radius }) {
@@ -227,48 +249,86 @@ function Sub({ children }) {
   );
 }
 
-function Media({ item, kind, video }) {
+function Media({ item, kind, video, onOpen }) {
   const [bad, setBad] = useState(false);
+  const onCancel = useContext(BackNav);
   if (!item || !item.url) return null;
   const isVid = kind === "video" || video || (item.type && String(item.type).indexOf("video/") === 0);
+  const go = () => {
+    if (onOpen) onOpen({ item, kind: isVid ? "video" : "image" });
+  };
   if (bad) {
     return e("div", { style: { opacity: 0.7, fontSize: 12, marginTop: 6 } }, item.name || "Can't load media");
   }
-  if (isVid) {
-    return e("video", {
-      src: item.url,
-      controls: true,
-      playsInline: true,
-      style: {
-        width: "100%",
-        maxWidth: "100%",
-        maxHeight: 180,
-        marginTop: 6,
-        borderRadius: 6,
-        background: "#000",
-        display: "block",
-      },
-      onError: () => setBad(true),
-    });
-  }
-  return e("img", {
-    src: mediaUrl(item.url),
-    alt: item.name || "",
-    style: {
-      width: "100%",
-      maxWidth: "100%",
-      maxHeight: 180,
-      objectFit: "contain",
-      marginTop: 6,
-      borderRadius: 6,
-      background: "rgba(0,0,0,0.35)",
-      display: "block",
+  const thumb = isVid
+    ? e("video", {
+        src: item.url,
+        muted: true,
+        playsInline: true,
+        preload: "metadata",
+        style: {
+          width: "100%",
+          maxWidth: "100%",
+          maxHeight: 180,
+          marginTop: 6,
+          borderRadius: 6,
+          background: "#000",
+          display: "block",
+          pointerEvents: "none",
+        },
+        onError: () => setBad(true),
+      })
+    : e("img", {
+        src: mediaUrl(item.url),
+        alt: item.name || "",
+        style: {
+          width: "100%",
+          maxWidth: "100%",
+          maxHeight: 180,
+          objectFit: "contain",
+          marginTop: 6,
+          borderRadius: 6,
+          background: "rgba(0,0,0,0.35)",
+          display: "block",
+          pointerEvents: "none",
+        },
+        onError: () => setBad(true),
+      });
+  return e(
+    Focusable,
+    {
+      className: cx(fieldClass(), "deckscord-media"),
+      onActivate: go,
+      onOKButton: go,
+      onClick: go,
+      ...cancelBind(onCancel),
+      style: { ...FILL, position: "relative" },
     },
-    onError: () => setBad(true),
-  });
+    [
+      thumb,
+      e(
+        "div",
+        {
+          key: "hint",
+          style: {
+            position: "absolute",
+            right: 8,
+            bottom: 10,
+            pointerEvents: "none",
+            background: "rgba(0,0,0,0.55)",
+            borderRadius: 4,
+            padding: "2px 6px",
+            fontSize: 11,
+            color: "#fff",
+          },
+        },
+        isVid ? "A · play" : "A · open"
+      ),
+    ]
+  );
 }
 
-function EmbedView({ embed }) {
+function EmbedView({ embed, onOpenMedia }) {
   if (!embed) return null;
   const kids = [];
   if (embed.title) kids.push(e("div", { key: "t", style: { fontWeight: 600, fontSize: 13 } }, embed.title));
@@ -281,27 +341,15 @@ function EmbedView({ embed }) {
       )
     );
   if (embed.video && embed.video.url) {
-    kids.push(
-      e("video", {
-        key: "v",
-        src: embed.video.url,
-        poster: embed.image && embed.image.url,
-        controls: true,
-        autoPlay: embed.type === "gifv",
-        loop: embed.type === "gifv",
-        muted: embed.type === "gifv",
-        playsInline: true,
-        style: { width: "100%", maxWidth: "100%", maxHeight: 180, marginTop: 6, borderRadius: 6, background: "#000", display: "block" },
-      })
-    );
+    kids.push(e(Media, { key: "v", item: embed.video, kind: embed.type === "gifv" ? "image" : "video", onOpen: onOpenMedia }));
   } else if (embed.image) {
-    kids.push(e(Media, { key: "i", item: embed.image, kind: "image" }));
+    kids.push(e(Media, { key: "i", item: embed.image, kind: "image", onOpen: onOpenMedia }));
   }
   if (!kids.length) return null;
   return e("div", { style: { marginTop: 6, padding: 8, background: "rgba(255,255,255,0.04)", borderRadius: 6 } }, kids);
 }
 
-function MessageBody({ m }) {
+function MessageBody({ m, onOpenMedia }) {
   const kids = [];
   if (m.content)
     kids.push(
@@ -312,18 +360,18 @@ function MessageBody({ m }) {
       )
     );
   (m.attachments || []).forEach((a, i) => {
-    if (a.kind === "image") kids.push(e(Media, { key: "a" + i, item: a, kind: "image" }));
-    else if (a.kind === "video") kids.push(e(Media, { key: "a" + i, item: a, kind: "video" }));
+    if (a.kind === "image") kids.push(e(Media, { key: "a" + i, item: a, kind: "image", onOpen: onOpenMedia }));
+    else if (a.kind === "video") kids.push(e(Media, { key: "a" + i, item: a, kind: "video", onOpen: onOpenMedia }));
     else if (a.kind === "audio")
       kids.push(e("audio", { key: "a" + i, src: a.url, controls: true, style: { width: "100%", marginTop: 6 } }));
     else kids.push(e("div", { key: "a" + i, style: { fontSize: 12, opacity: 0.75, marginTop: 6 } }, a.name || "attachment"));
   });
-  (m.embeds || []).forEach((emb, i) => kids.push(e(EmbedView, { key: "e" + i, embed: emb })));
+  (m.embeds || []).forEach((emb, i) => kids.push(e(EmbedView, { key: "e" + i, embed: emb, onOpenMedia })));
   (m.stickers || []).forEach((s, i) => {
-    if (s.url) kids.push(e(Media, { key: "s" + i, item: { url: s.url, name: s.name }, kind: "image" }));
+    if (s.url) kids.push(e(Media, { key: "s" + i, item: { url: s.url, name: s.name }, kind: "image", onOpen: onOpenMedia }));
   });
   if (!kids.length) kids.push(e("div", { key: "empty", style: { opacity: 0.6, fontSize: 13 } }, "(no text)"));
-  return e("div", { style: FILL }, kids);
+  return e("div", { style: { width: "100%", maxWidth: "100%", minWidth: 0 } }, kids);
 }
 
 function ChatComposer({ value, onChange, onSend, disabled }) {
@@ -365,7 +413,19 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
       });
 
   return e("div", { ref: wrapRef, style: FILL }, [
-    e(Focusable, { key: "tf", onActivate: openKb, onOKButton: openKb, onClick: openKb }, field),
+    e(
+      Focusable,
+      {
+        key: "tf",
+        className: cx(fieldClass(), "deckscord-field"),
+        onActivate: openKb,
+        onOKButton: openKb,
+        onClick: openKb,
+        ...cancelBind(onCancel),
+        style: { ...FILL, borderRadius: 6, padding: 2 },
+      },
+      field
+    ),
     e(
       DFL.PanelSectionRow,
       { key: "send" },
@@ -383,10 +443,11 @@ function ChatComposer({ value, onChange, onSend, disabled }) {
   ]);
 }
 
-function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed }) {
+function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed, outputVolume }) {
   const onCancel = useContext(BackNav);
   const [jpeg, setJpeg] = useState(null);
   const [hint, setHint] = useState("Starting…");
+  const [vol, setVol] = useState(defaultStreamVol(outputVolume));
   const keepAudio = useRef(false);
   useEffect(() => {
     let stop = false;
@@ -406,7 +467,7 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed }) {
             setHint("");
           }
         } catch (_) {}
-        await new Promise((res) => setTimeout(res, 160));
+        await new Promise((res) => setTimeout(res, 80));
       }
     })();
     return () => {
@@ -494,6 +555,25 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed }) {
       ),
       e(
         DFL.PanelSectionRow,
+        { key: "svol" },
+        e(DFL.SliderField, {
+          label: "Stream volume",
+          description: "Default is 30% of output volume",
+          value: vol,
+          min: 0,
+          max: 200,
+          step: 5,
+          showValue: true,
+          valueSuffix: "%",
+          onChange: (v) => {
+            setVol(v);
+            setStreamVolume(v).catch(() => {});
+          },
+          ...cancelBind(onCancel || close),
+        })
+      ),
+      e(
+        DFL.PanelSectionRow,
         { key: "pin" },
         e(
           DFL.ButtonItem,
@@ -510,6 +590,108 @@ function WatchOverlay({ userId, name, kind, closeModal, onPinned, onClosed }) {
   );
 }
 
+function MediaOverlay({ item, kind, outputVolume, closeModal }) {
+  const onCancel = useContext(BackNav);
+  const [volPct, setVolPct] = useState(defaultStreamVol(outputVolume));
+  const close = () => {
+    if (closeModal) closeModal();
+  };
+  const htmlVol = Math.min(1, Math.max(0, (Number(volPct) || 0) / 100));
+  const isVid = kind === "video";
+  const Inner = closeModal && DFL.ModalRoot ? DFL.ModalRoot : "div";
+  return e(
+    Inner,
+    {
+      closeModal: close,
+      onCancel: close,
+      onCancelButton: close,
+      bDisableBackgroundDismiss: false,
+      ...cancelBind(onCancel || close),
+      style: {
+        width: "100%",
+        height: "100%",
+        background: "#000",
+        padding: 0,
+        margin: 0,
+      },
+    },
+    [
+      isVid
+        ? e("video", {
+            key: "v",
+            className: "deckscord-media-player",
+            src: item && item.url,
+            controls: true,
+            autoPlay: true,
+            playsInline: true,
+            volume: htmlVol,
+            onLoadedMetadata: (ev) => {
+              try {
+                if (ev && ev.currentTarget) ev.currentTarget.volume = htmlVol;
+              } catch (_) {}
+            },
+            style: {
+              width: "100%",
+              height: "auto",
+              maxHeight: "70vh",
+              background: "#000",
+              display: "block",
+            },
+          })
+        : e("img", {
+            key: "i",
+            src: mediaUrl(item && item.url, true),
+            alt: (item && item.name) || "",
+            style: {
+              width: "100%",
+              height: "auto",
+              maxHeight: "75vh",
+              objectFit: "contain",
+              display: "block",
+              background: "#000",
+            },
+          }),
+      e(
+        "div",
+        {
+          key: "cap",
+          style: {
+            color: "#fff",
+            fontSize: 13,
+            padding: "8px 12px",
+            textShadow: "0 1px 4px #000",
+          },
+        },
+        ((item && item.name) || (isVid ? "Video" : "Image")) + (isVid ? " · B to close" : " · B to close")
+      ),
+      isVid
+        ? e(
+            DFL.PanelSectionRow,
+            { key: "svol" },
+            e(DFL.SliderField, {
+              label: "Volume",
+              description: "Default is 30% of voice output",
+              value: volPct,
+              min: 0,
+              max: 200,
+              step: 5,
+              showValue: true,
+              valueSuffix: "%",
+              onChange: (v) => {
+                setVolPct(v);
+                try {
+                  const el = document.querySelector(".deckscord-media-player");
+                  if (el) el.volume = Math.min(1, Math.max(0, Number(v) / 100));
+                } catch (_) {}
+              },
+              ...cancelBind(onCancel || close),
+            })
+          )
+        : null,
+    ]
+  );
+}
+
 function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWatch }) {
   const onCancel = useContext(BackNav);
   const go = () => {
@@ -522,7 +704,7 @@ function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWa
   return e(
     Focusable,
     {
-      className: fieldClass(),
+      className: cx(fieldClass(), "deckscord-tile"),
       onActivate: go,
       onOKButton: go,
       onClick: go,
@@ -535,6 +717,7 @@ function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWa
         margin: "0 0 6px",
         overflow: "hidden",
         background: "#000",
+        border: focused ? "3px solid #3ba55d" : "3px solid transparent",
         boxShadow: focused
           ? "inset 0 0 0 2px #3ba55d"
           : speaking
@@ -620,7 +803,7 @@ function VideoTile({ stream, focused, jpeg, speaking, pinned, onOpenMember, onWa
   );
 }
 
-function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onOpenMember, onWatch, onMore, onPin, onStop, onUnpin }) {
+function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId, max, onOpenMember, onWatch, onMore, onPin, onStop, onUnpin, streamVolume, onStreamVolume }) {
   const onCancel = useContext(BackNav);
   const list = streams || [];
   const copied = list.slice(0, max);
@@ -656,6 +839,26 @@ function VideoStack({ streams, frames, focusedUserId, speakingIds, pinnedUserId,
         )
       )
     );
+    if (onStreamVolume) {
+      actions.push(
+        e(
+          DFL.PanelSectionRow,
+          { key: "svol" },
+          e(DFL.SliderField, {
+            label: "Stream volume",
+            description: "Game audio for the focused stream. Default is 30% of output volume so voice stays louder.",
+            value: streamVolume == null ? 30 : streamVolume,
+            min: 0,
+            max: 200,
+            step: 5,
+            showValue: true,
+            valueSuffix: "%",
+            onChange: onStreamVolume,
+            ...cancelBind(onCancel),
+          })
+        )
+      );
+    }
   }
   if (pinnedUserId && onUnpin) {
     actions.push(
@@ -803,6 +1006,7 @@ function App() {
   const tapLock = useRef(0);
   const volTimer = useRef(null);
   const grabBusy = useRef(false);
+  const reloadOnce = useRef(false);
 
   const view = stack[stack.length - 1] || { page: "home" };
   const canBack = stack.length > 1;
@@ -867,7 +1071,7 @@ function App() {
           setUpdateProg((p) => ({
             phase: "restart",
             percent: 96,
-            message: "Decky is reloading…",
+            message: "Reloading Deckscord…",
             ok: true,
             head: (p && p.head) || "",
           }));
@@ -883,6 +1087,27 @@ function App() {
   }, [updatePhase]);
 
   useEffect(() => {
+    if (!updatePhase || (updatePhase !== "reload" && updatePhase !== "restart")) return;
+    if (reloadOnce.current) return;
+    reloadOnce.current = true;
+    const go = async () => {
+      try {
+        if (window.DeckyBackend && typeof window.DeckyBackend.call === "function") {
+          await window.DeckyBackend.call("loader/reload_plugin", "Deckscord");
+          return;
+        }
+      } catch (_) {}
+      try {
+        if (window.DeckyPluginLoader && typeof window.DeckyPluginLoader.importPlugin === "function") {
+          await window.DeckyPluginLoader.importPlugin("Deckscord");
+        }
+      } catch (_) {}
+    };
+    const t = setTimeout(go, 400);
+    return () => clearTimeout(t);
+  }, [updatePhase]);
+
+  useEffect(() => {
     const ready = !!(status && status.ready);
     const id = setInterval(() => setTick((n) => n + 1), ready ? 2500 : 1000);
     return () => clearInterval(id);
@@ -894,7 +1119,7 @@ function App() {
     let stop = false;
     const pull = async () => {
       try {
-        const r = await getMessages(chatId, 40);
+        const r = await getMessages(chatId, 50);
         if (!stop && r && r.ok) setMessages(r.messages || []);
       } catch (_) {}
     };
@@ -924,8 +1149,8 @@ function App() {
       grabBusy.current = false;
     };
     pull();
-    const fps = streamCount <= 1 ? 6 : streamCount === 2 ? 5 : 4;
-    const id = setInterval(pull, Math.max(180, Math.floor(1000 / fps)));
+    const fps = streamCount <= 1 ? 12 : streamCount === 2 ? 10 : 8;
+    const id = setInterval(pull, Math.max(80, Math.floor(1000 / fps)));
     return () => {
       stop = true;
       clearInterval(id);
@@ -1101,7 +1326,7 @@ function App() {
           {
             layout: "below",
             disabled: !!(updateProg && updateProg.phase && updateProg.phase !== "idle" && updateProg.phase !== "error" && updateProg.phase !== "done"),
-            description: "git pull, copy files, restart Decky",
+            description: "git pull, copy files, reload plugin",
             onClick: () =>
               tap(() =>
                 act("Updating", async () => {
@@ -1165,7 +1390,7 @@ function App() {
               (updateProg.ok === false ? "Failed · " : "") +
                 Math.round(Number(updateProg.percent) || 0) +
                 "%" +
-                (updateProg.phase === "restart" ? " · Decky is reloading" : "")
+                (updateProg.phase === "reload" || updateProg.phase === "restart" ? " · Reloading Deckscord" : "")
             ),
           ]
         )
@@ -1180,6 +1405,20 @@ function App() {
   const hasVideo = !!(voice && voice.hasVideo);
   const liveStreams = (voice && voice.streams) || [];
   const focusedUserId = (voice && voice.focusedUserId) || null;
+  const streamVol =
+    volLocal.stream != null
+      ? volLocal.stream
+      : voice && voice.streamVolume != null
+        ? voice.streamVolume
+        : defaultStreamVol(outVol);
+  const openMedia = (payload) => {
+    if (!payload || !payload.item) return;
+    if (typeof DFL.showModal === "function") {
+      DFL.showModal(e(MediaOverlay, { item: payload.item, kind: payload.kind || "image", outputVolume: outVol }));
+    } else {
+      push({ page: "media", item: payload.item, kind: payload.kind || "image", title: (payload.item && payload.item.name) || "Media" });
+    }
+  };
   const showLiveVideo = videoEnabled && hasVideo;
   const openVideoPage = () => tap(() => push({ page: "video", title: "Live video" }));
   const pip = (status && status.pip) || (cfg && cfg.pip) || {};
@@ -1194,6 +1433,7 @@ function App() {
           userId: s.userId,
           name: s.name,
           kind: s.kind || "screenshare",
+          outputVolume: outVol,
           onPinned: () => refresh(),
         })
       );
@@ -1409,6 +1649,8 @@ function App() {
         onPin: onPinStream,
         onStop: onStopWatch,
         onUnpin: onUnpinStream,
+        streamVolume: streamVol,
+        onStreamVolume: (v) => slideVol("stream", v, () => setStreamVolume(v)),
       })
     : null;
 
@@ -1417,6 +1659,8 @@ function App() {
     view.page !== "chat" &&
     view.page !== "member" &&
     view.page !== "video" &&
+    view.page !== "watch" &&
+    view.page !== "media" &&
     String(view.page || "").indexOf("settings") !== 0;
   const people = [];
   if (showLiveVideo && view.page !== "devices" && videoStack) people.push(videoStack);
@@ -1581,18 +1825,19 @@ function App() {
         act("Send", () => sendMessage(view.channelId, c));
       },
     });
-    const shown = messages.length ? messages.slice(-20) : [{ id: "empty", author: "", content: "No messages yet." }];
+    const shown = messages.length ? messages : [{ id: "empty", author: "", content: "No messages yet." }];
     const msgList = shown.map((m) =>
       e(
         Focusable,
         {
           key: m.id,
+          className: cx(fieldClass(), "deckscord-msg"),
           ...cancelBind(handleCancel),
           onFocus: (ev) => {
             const t = ev && (ev.currentTarget || ev.target);
             if (t && typeof t.scrollIntoView === "function") t.scrollIntoView({ block: "nearest" });
           },
-          style: { ...FILL, marginBottom: 10, padding: "4px 0" },
+          style: { width: "100%", maxWidth: "100%", minWidth: 0, marginBottom: 10, padding: "6px 4px", borderRadius: 6 },
         },
         [
           m.author &&
@@ -1601,10 +1846,13 @@ function App() {
               { key: "h", style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4 } },
               [
                 e(Avatar, { key: "a", src: m.avatar, name: m.author, size: 22, radius: 11 }),
-                e("div", { key: "n", style: { fontWeight: 600, fontSize: 13 } }, m.author),
+                e("div", { key: "n", style: { fontWeight: 600, fontSize: 13, minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis" } }, m.author),
+                m.ts
+                  ? e("div", { key: "ts", style: { fontSize: 11, opacity: 0.65, flexShrink: 0, fontVariantNumeric: "tabular-nums" } }, fmtTs(m.ts))
+                  : null,
               ]
             ),
-          e(MessageBody, { key: "b", m }),
+          e(MessageBody, { key: "b", m, onOpenMedia: openMedia }),
         ]
       )
     );
@@ -1624,7 +1872,22 @@ function App() {
               voice && voice.channelId === view.channelId ? "In call" : "Start voice call"
             )
           ),
-        e("div", { key: "msgs", style: FILL }, msgList),
+        e(
+          "div",
+          {
+            key: "msgs",
+            style: {
+              width: "100%",
+              maxWidth: "100%",
+              minWidth: 0,
+              maxHeight: "48vh",
+              overflowY: "auto",
+              overflowX: "hidden",
+              paddingRight: 2,
+            },
+          },
+          msgList
+        ),
         e("div", { key: "compose", style: FILL }, composer),
         showLiveVideo &&
           e(
@@ -1793,6 +2056,8 @@ function App() {
         onPin: onPinStream,
         onStop: onStopWatch,
         onUnpin: onUnpinStream,
+        streamVolume: streamVol,
+        onStreamVolume: (v) => slideVol("stream", v, () => setStreamVolume(v)),
       }),
     ].concat(compactVoice));
   } else if (view.page === "watch") {
@@ -1805,6 +2070,7 @@ function App() {
           userId: view.userId,
           name: ws.name || view.title,
           kind: ws.kind || view.kind || "screenshare",
+          outputVolume: outVol,
           onPinned: () => {
             refresh();
             back();
@@ -1812,6 +2078,8 @@ function App() {
         }),
       ]
     );
+  } else if (view.page === "media") {
+    body = e(MediaOverlay, { item: view.item, kind: view.kind || "image", outputVolume: outVol });
   } else if (view.page === "settings") {
     body = e(SettingsHub, { push, handleCancel });
   } else if (String(view.page || "").indexOf("settings_") === 0) {
@@ -2375,7 +2643,11 @@ function App() {
         "style",
         { key: "css" },
         ".deckscord-root{width:100%!important;max-width:100%!important;overflow-x:hidden;box-sizing:border-box}" +
-          ".deckscord-root input,.deckscord-root textarea,.deckscord-root video,.deckscord-root img{max-width:100%}"
+          ".deckscord-root input,.deckscord-root textarea,.deckscord-root video,.deckscord-root img{max-width:100%}" +
+          ".deckscord-root .gpfocus,.deckscord-root .gpfocuswithin{outline:3px solid #59d0ff!important;outline-offset:-3px;box-shadow:inset 0 0 0 2px #59d0ff,0 0 10px rgba(89,208,255,.75)!important}" +
+          ".deckscord-tile.gpfocus,.deckscord-tile.gpfocuswithin{outline:4px solid #59d0ff!important;outline-offset:-4px;border-color:#59d0ff!important}" +
+          ".deckscord-field.gpfocus,.deckscord-field.gpfocuswithin,.deckscord-field:focus-within{outline:3px solid #59d0ff!important;background:rgba(89,208,255,.12)}" +
+          ".deckscord-media.gpfocus,.deckscord-msg.gpfocus{outline:3px solid #59d0ff!important}"
       ),
       navHeader,
       voiceSection,
