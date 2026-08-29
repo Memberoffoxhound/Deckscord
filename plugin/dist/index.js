@@ -758,6 +758,7 @@ function App() {
   const [speakingIds, setSpeakingIds] = useState({});
   const [updateProg, setUpdateProg] = useState(null);
   const [cfg, setCfg] = useState(null);
+  const [shareLocal, setShareLocal] = useState(null);
   const refreshBusy = useRef(false);
   const tapLock = useRef(0);
   const volTimer = useRef(null);
@@ -917,6 +918,16 @@ function App() {
       clearInterval(id);
     };
   }, [inVoice]);
+
+  const streamFlag = !!(status && (status.streaming || (status.stream && status.stream.active) || (status.voice && status.voice.streaming)));
+  useEffect(() => {
+    setShareLocal((cur) => {
+      if (cur == null) return cur;
+      if (cur === true && streamFlag) return null;
+      if (cur === false && !streamFlag) return null;
+      return cur;
+    });
+  }, [streamFlag]);
 
   const onSettingsPage = String(view.page || "").indexOf("settings") === 0;
   useEffect(() => {
@@ -1136,7 +1147,7 @@ function App() {
   const pip = (status && status.pip) || (cfg && cfg.pip) || {};
   const pipOn = !!(pip.enabled && pip.userId);
   const talking = (status && status.talking) || (cfg && cfg.talking) || {};
-  const talkingOn = talking.enabled !== false;
+  const talkingOn = !!talking.enabled;
   const onWatchStream = (s) => {
     tap(() => act("Watch", () => focusStream(s.userId), { quiet: true }));
     if (typeof DFL.showModal === "function") {
@@ -1163,7 +1174,9 @@ function App() {
     openMember(m);
   };
 
-  const streaming = !!(status && (status.streaming || (status.stream && status.stream.active) || (voice && voice.streaming)));
+  const streaming = streamFlag || !!(voice && voice.streaming);
+  const shareOn = shareLocal == null ? streaming : shareLocal;
+  const sharePending = !!(status && status.stream && status.stream.pending) || (shareOn && !streaming);
   const compactVoice = [
     voice
       ? e(
@@ -1171,12 +1184,30 @@ function App() {
           { key: "share" },
           e(DFL.ToggleField, {
             label: "Share game",
-            description: streaming ? "Live · 720p 30" : "720p 30 · game screen + game audio",
-            checked: streaming,
+            description: shareOn
+              ? sharePending
+                ? "Starting… game audio only for viewers"
+                : "Live · 720p 30 · viewers hear game audio, voice stays on your mic"
+              : "720p 30 · game screen + game audio for stream viewers only",
+            checked: shareOn,
             onChange: () =>
-              tap(() =>
-                act(streaming ? "Stop share" : "Share game", () => (streaming ? stopGoLive() : startGoLive((cfg && cfg.golive && cfg.golive.width) || 1280, (cfg && cfg.golive && cfg.golive.height) || 720, (cfg && cfg.golive && cfg.golive.fps) || 30)))
-              ),
+              tap(() => {
+                if (shareOn) {
+                  setShareLocal(false);
+                  act("Stop share", () => stopGoLive());
+                } else {
+                  setShareLocal(true);
+                  act("Share game", async () => {
+                    const r = await startGoLive(
+                      (cfg && cfg.golive && cfg.golive.width) || 1280,
+                      (cfg && cfg.golive && cfg.golive.height) || 720,
+                      (cfg && cfg.golive && cfg.golive.fps) || 30
+                    );
+                    if (r && r.ok === false) setShareLocal(false);
+                    return r;
+                  });
+                }
+              }),
             ...cancelBind(handleCancel),
           })
         )
@@ -1564,7 +1595,7 @@ function App() {
       ]),
     ]);
   } else if (view.page === "devices") {
-    const inList = (devices.input || []).filter((d) => !/monitor|loopback|stereo mix|vencord-screen-share|venmic/i.test(String(d.name || d.id || "")));
+    const inList = (devices.input || []).filter((d) => !/monitor|loopback|stereo mix|vencord-screen-share|venmic|screen-?share|desktop audio|system audio|chromium|^default$/i.test(String(d.name || d.id || "")));
     const outList = devices.output || [];
     body = e("div", { style: FILL }, [
       e(
@@ -1864,7 +1895,7 @@ function App() {
           key: "en",
           label: "Show who's talking",
           description: "Over Game Mode, not the QAM",
-          checked: talkCfg.enabled !== false,
+          checked: !!talkCfg.enabled,
           onChange: (v) =>
             act("Talking overlay", async () => {
               const r = await setTalkingSettings(v);
@@ -1889,7 +1920,7 @@ function App() {
             onPick: (v) =>
               act("Talking overlay", async () => {
                 const r = await setTalkingSettings({
-                  enabled: talkCfg.enabled !== false,
+                  enabled: !!talkCfg.enabled,
                   corner: v,
                   size: talkCfg.size,
                   opacity: talkCfg.opacity,
@@ -1914,7 +1945,7 @@ function App() {
             onPick: (v) =>
               act("Talking overlay", async () => {
                 const r = await setTalkingSettings({
-                  enabled: talkCfg.enabled !== false,
+                  enabled: !!talkCfg.enabled,
                   corner: talkCfg.corner,
                   size: v,
                   opacity: talkCfg.opacity,
@@ -1939,7 +1970,7 @@ function App() {
             onChange: (v) =>
               slideVol("talkop", v, () =>
                 setTalkingSettings({
-                  enabled: talkCfg.enabled !== false,
+                  enabled: !!talkCfg.enabled,
                   corner: talkCfg.corner,
                   size: talkCfg.size,
                   opacity: v,

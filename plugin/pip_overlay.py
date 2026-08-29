@@ -5,7 +5,8 @@ One transparent fullscreen X11 window (GAMESCOPE_EXTERNAL_OVERLAY):
   - PiP stamp from state.json + frame.jpg
   - Who's-talking roster from talking.json (avatar + name, speakers only)
 
-Alpha is a compositor multiply. Clicks pass through so the game keeps input.
+Game Mode only. Mapping this onto KWin/SDDM (the first :0 socket) covers
+login and steals Steam's overlay. Clicks pass through so the game keeps input.
 """
 
 from __future__ import annotations
@@ -31,22 +32,154 @@ os.environ.setdefault("GDK_BACKEND", "x11")
 os.environ.pop("WAYLAND_DISPLAY", None)
 os.environ.pop("GAMESCOPE_WAYLAND_DISPLAY", None)
 
+KWIN = {"kwin_wayland", "kwin_x11"}
+GAMESCOPE = {"gamescope", "gamescope-wl"}
+
 
 def _die(msg: str, code: int = 1) -> None:
     print(f"overlay: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
+def _comms() -> set[str]:
+    names: set[str] = set()
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                names.add((p / "comm").read_text().strip())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return names
+
+
+def in_game_mode() -> bool:
+    names = _comms()
+    if names & KWIN:
+        return False
+    return bool(names & GAMESCOPE)
+
+
+def _display_is_gamescope(disp: str) -> bool:
+    """True if this X server interned gamescope's root atoms (not KWin Xwayland)."""
+    try:
+        from ctypes import c_char_p, c_int, c_ulong, c_void_p, cdll
+
+        x = cdll.LoadLibrary("libX11.so.6")
+        x.XOpenDisplay.argtypes = [c_char_p]
+        x.XOpenDisplay.restype = c_void_p
+        x.XInternAtom.argtypes = [c_void_p, c_char_p, c_int]
+        x.XInternAtom.restype = c_ulong
+        x.XCloseDisplay.argtypes = [c_void_p]
+        d = x.XOpenDisplay(disp.encode())
+        if not d:
+            return False
+        try:
+            return bool(x.XInternAtom(d, b"GAMESCOPE_FOCUSED_WINDOW", True))
+        finally:
+            x.XCloseDisplay(d)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["xprop", "-display", disp, "-root"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return "GAMESCOPE_" in (r.stdout or "")
+    except Exception:
+        return False
+
+
 def _pick_display() -> str | None:
+    """Gamescope Xwayland only. Never the first :0 on a desktop session."""
+    cands: list[str] = []
     raw = os.environ.get("DISPLAY") or ""
     if raw:
         n = raw.lstrip(":").split(".")[0]
-        if Path(f"/tmp/.X11-unix/X{n}").exists():
-            return raw if raw.startswith(":") else f":{n}"
+        sock = Path(f"/tmp/.X11-unix/X{n}")
+        if sock.exists():
+            cands.append(raw if raw.startswith(":") else f":{n}")
     for n in range(0, 8):
         if Path(f"/tmp/.X11-unix/X{n}").exists():
-            return f":{n}"
+            cands.append(f":{n}")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for d in cands:
+        if d not in seen:
+            seen.add(d)
+            ordered.append(d)
+    gs = [d for d in ordered if _display_is_gamescope(d)]
+    if gs:
+        return gs[0]
+    if in_game_mode() and len(ordered) == 1:
+        return ordered[0]
     return None
+
+
+def _set_overlay_atoms(xid: int) -> None:
+    """GAMESCOPE_EXTERNAL_OVERLAY=1 plus OSD window type, before Steam takes focus."""
+    try:
+        from ctypes import POINTER, c_char_p, c_int, c_ulong, c_void_p, cdll
+
+        x = cdll.LoadLibrary("libX11.so.6")
+        x.XOpenDisplay.argtypes = [c_char_p]
+        x.XOpenDisplay.restype = c_void_p
+        x.XInternAtom.argtypes = [c_void_p, c_char_p, c_int]
+        x.XInternAtom.restype = c_ulong
+        x.XChangeProperty.argtypes = [
+            c_void_p, c_ulong, c_ulong, c_ulong, c_int, c_int, POINTER(c_ulong), c_int,
+        ]
+        x.XSync.argtypes = [c_void_p, c_int]
+        x.XCloseDisplay.argtypes = [c_void_p]
+        d = x.XOpenDisplay(None)
+        if not d:
+            raise RuntimeError("XOpenDisplay failed")
+        try:
+            xa_atom, xa_cardinal, replace = 4, 6, 0
+            one = (c_ulong * 1)(1)
+            x.XChangeProperty(
+                d, xid, x.XInternAtom(d, b"GAMESCOPE_EXTERNAL_OVERLAY", False),
+                xa_cardinal, 32, replace, one, 1,
+            )
+            types = (c_ulong * 2)(
+                x.XInternAtom(d, b"_KDE_NET_WM_WINDOW_TYPE_ON_SCREEN_DISPLAY", False),
+                x.XInternAtom(d, b"_NET_WM_WINDOW_TYPE_NOTIFICATION", False),
+            )
+            x.XChangeProperty(
+                d, xid, x.XInternAtom(d, b"_NET_WM_WINDOW_TYPE", False),
+                xa_atom, 32, replace, types, 2,
+            )
+            x.XSync(d, False)
+        finally:
+            x.XCloseDisplay(d)
+        return
+    except Exception as e:
+        print(f"overlay: xlib atoms failed: {e}", flush=True)
+    try:
+        subprocess.run(
+            [
+                "xprop",
+                "-id",
+                str(xid),
+                "-f",
+                "GAMESCOPE_EXTERNAL_OVERLAY",
+                "32c",
+                "-set",
+                "GAMESCOPE_EXTERNAL_OVERLAY",
+                "1",
+            ],
+            check=False,
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
 
 
 def _load(path: Path) -> dict:
@@ -62,9 +195,12 @@ def main() -> None:
     if not state_dir.is_dir():
         _die("usage: pip_overlay.py <state-dir>")
 
+    if not in_game_mode():
+        _die("not Game Mode (kwin present or no gamescope) — refusing to map")
+
     disp = _pick_display()
     if not disp:
-        _die("no X11 display")
+        _die("no gamescope X11 display")
     os.environ["DISPLAY"] = disp
 
     try:
@@ -87,6 +223,10 @@ def main() -> None:
     win.set_app_paintable(True)
     win.set_accept_focus(False)
     win.set_focus_on_map(False)
+    try:
+        win.set_can_focus(False)
+    except Exception:
+        pass
     win.set_keep_above(True)
     win.set_skip_taskbar_hint(True)
     win.set_skip_pager_hint(True)
@@ -101,9 +241,28 @@ def main() -> None:
     if visual:
         win.set_visual(visual)
 
-    sw = screen.get_width() if screen else 1280
-    sh = screen.get_height() if screen else 800
+    sw, sh = 1280, 800
+    try:
+        gd = Gdk.Display.get_default()
+        mon = gd.get_primary_monitor() if gd else None
+        if mon is None and gd:
+            mon = gd.get_monitor(0)
+        geo = mon.get_geometry() if mon else None
+        if geo and geo.width > 0 and geo.height > 0:
+            sw, sh = int(geo.width), int(geo.height)
+        elif screen:
+            sw = screen.get_width()
+            sh = screen.get_height()
+    except Exception:
+        if screen:
+            sw = screen.get_width() or sw
+            sh = screen.get_height() or sh
     win.set_default_size(sw, sh)
+    win.set_size_request(sw, sh)
+    try:
+        win.move(0, 0)
+    except Exception:
+        pass
     win.resize(sw, sh)
 
     bag = {
@@ -307,6 +466,12 @@ def main() -> None:
         if not gdk_win:
             return
         try:
+            xid = int(gdk_win.get_xid())
+        except Exception:
+            xid = 0
+        if xid:
+            _set_overlay_atoms(xid)
+        try:
             atom = Gdk.Atom.intern("GAMESCOPE_EXTERNAL_OVERLAY", False)
             Gdk.property_change(
                 gdk_win,
@@ -317,29 +482,13 @@ def main() -> None:
                 [1],
             )
         except Exception:
-            try:
-                xid = int(gdk_win.get_xid())
-                subprocess.run(
-                    [
-                        "xprop",
-                        "-id",
-                        str(xid),
-                        "-f",
-                        "GAMESCOPE_EXTERNAL_OVERLAY",
-                        "32c",
-                        "-set",
-                        "GAMESCOPE_EXTERNAL_OVERLAY",
-                        "1",
-                    ],
-                    check=False,
-                    timeout=2,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
+            pass
 
     def tick() -> bool:
+        if not in_game_mode():
+            print("overlay: left Game Mode, quitting", flush=True)
+            Gtk.main_quit()
+            return False
         pip = _load(state_dir / "state.json")
         talk = _load(state_dir / "talking.json")
         bag["pip"] = pip
@@ -363,10 +512,6 @@ def main() -> None:
         return True
 
     def on_map(_w) -> None:
-        try:
-            win.fullscreen()
-        except Exception:
-            pass
         mark_overlay()
         pass_clicks()
 
@@ -374,14 +519,16 @@ def main() -> None:
     win.connect("destroy", Gtk.main_quit)
     win.realize()
     mark_overlay()
-    win.show_all()
     try:
         win.fullscreen()
     except Exception:
         pass
+    win.show_all()
+    mark_overlay()
+    pass_clicks()
     GLib.timeout_add(33, tick)
     tick()
-    print(f"overlay: display={disp} {sw}x{sh}", flush=True)
+    print(f"overlay: display={disp} {sw}x{sh} gamescope", flush=True)
     Gtk.main()
 
 

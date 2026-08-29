@@ -55,10 +55,16 @@ Gamescope already exports a PipeWire node (same one Steam Game Recording
 uses). In Game Mode there is **no** xdg-desktop-portal backend, which is why
 stock Discord Go Live is a black screen.
 
-`plugin/portal_shim.py` owns `org.freedesktop.portal.Desktop` **only while a
-gamescope session is the active session** and answers ScreenCast v2 with that
-node. It auto-approves Vesktop/Vencord and refuses everyone else. In Desktop
-Mode it releases the name so KWin’s portal keeps working.
+`plugin/portal_shim.py` owns `org.freedesktop.portal.Desktop` **only after
+gamescope has been the session compositor for a few seconds** and answers
+ScreenCast v2 with that node. It auto-approves Vesktop/Vencord and refuses
+everyone else. A D-Bus filter must never throw — that wedged the session bus
+and hung Game Mode boot / Plasma login. It waits before stopping
+`xdg-desktop-portal`, and starts it again when KWin is back.
+
+Voice capture is a microphone (or silence) only — never a speaker monitor
+or Vesktop’s screenshare virtmic. Game audio rides the Go Live track so
+**only people watching the stream** hear it, same as desktop Discord.
 
 Chromium then reads DMA-BUF frames from PipeWire. We do not convert, scale, or
 JPEG them. Resolution/FPS are handed to Discord as capture constraints

@@ -53,6 +53,9 @@ pick_mic_source() {
     [[ "${name,,}" == *loopback* ]] && continue
     [[ "${name,,}" == *vencord-screen-share* ]] && continue
     [[ "${name,,}" == *venmic* ]] && continue
+    [[ "${name,,}" == *screen-share* || "${name,,}" == *screenshare* ]] && continue
+    [[ "${name,,}" == *desktop*audio* || "${name,,}" == *system*audio* ]] && continue
+    [[ "${name}" == alsa_output* || "${name}" == bluez_output* ]] && continue
     [[ "${name}" == deckscord.mic ]] && continue
     printf '%s' "${name}"
     return 0

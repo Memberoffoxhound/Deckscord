@@ -933,8 +933,43 @@
     return null;
   }
 
+  function voiceInputForbiddenName(n) {
+    n = String(n || "").toLowerCase();
+    if (!n || n === "default" || n === "communications") return true;
+    return (
+      n.indexOf("monitor") !== -1 ||
+      n.indexOf("loopback") !== -1 ||
+      n.indexOf("stereo mix") !== -1 ||
+      n.indexOf("vencord-screen-share") !== -1 ||
+      n.indexOf("venmic") !== -1 ||
+      n.indexOf("what-u-hear") !== -1 ||
+      n.indexOf("screen-share") !== -1 ||
+      n.indexOf("screenshare") !== -1 ||
+      n.indexOf("screen share") !== -1 ||
+      n.indexOf("audio share") !== -1 ||
+      n.indexOf("share audio") !== -1 ||
+      n.indexOf("desktop audio") !== -1 ||
+      n.indexOf("system audio") !== -1 ||
+      n.indexOf("entire system") !== -1 ||
+      n.indexOf("chromium") !== -1 ||
+      n.indexOf("chrome") !== -1
+    );
+  }
+
+  function isForbiddenVoice(d) {
+    return voiceInputForbiddenName((d && (d.name || d.label || d.id)) || "");
+  }
+
+  function isRealMic(d) {
+    if (!d || isForbiddenVoice(d)) return false;
+    var n = String((d.name || d.label || d.id) || "").toLowerCase();
+    if (n.indexOf("deckscord") !== -1 && n.indexOf("silent") !== -1) return false;
+    return true;
+  }
+
   function clickSharePicker() {
-    if (!GO_LIVE.active) return;
+    if (currentStream() && !GO_LIVE.pending) return;
+    if (!GO_LIVE.active && !GO_LIVE.pending) return;
     var roots = document.querySelectorAll(".vcd-screen-picker, [class*='screen-picker']");
     var root = null;
     for (var i = 0; i < roots.length; i++) {
@@ -1385,12 +1420,26 @@
             Object.keys(s).forEach(function (id) { ids.push(String(id)); });
           }
         }
+        var voiceInputOk = true;
+        try {
+          var MES = store("MediaEngineStore") || byProps("getInputDeviceId");
+          var inId = MES && MES.getInputDeviceId && MES.getInputDeviceId();
+          var inMap = (MES && MES.getInputDevices && MES.getInputDevices()) || {};
+          var inDev = Array.isArray(inMap)
+            ? inMap.find(function (d) { return String(d && d.id) === String(inId); })
+            : inMap[inId];
+          if (voiceInputForbiddenName(inId) || isForbiddenVoice(inDev || { id: inId })) voiceInputOk = false;
+        } catch (eIn) {}
         var bag = collectStreams();
         (bag.members || []).forEach(function (m) {
+          if (m.self && !voiceInputOk) return;
           if (isUserSpeaking(m.id, meId) && ids.indexOf(m.id) === -1) ids.push(m.id);
         });
-        if (meId && Sp && typeof Sp.isCurrentUserSpeaking === "function" && Sp.isCurrentUserSpeaking()) {
+        if (voiceInputOk && meId && Sp && typeof Sp.isCurrentUserSpeaking === "function" && Sp.isCurrentUserSpeaking()) {
           if (ids.indexOf(meId) === -1) ids.push(meId);
+        }
+        if (!voiceInputOk && meId) {
+          ids = ids.filter(function (id) { return String(id) !== String(meId); });
         }
         var SelectedChannelStore = store("SelectedChannelStore") || byProps("getVoiceChannelId", "getChannelId");
         var voiceChannelId = SelectedChannelStore && SelectedChannelStore.getVoiceChannelId && SelectedChannelStore.getVoiceChannelId();
@@ -1546,25 +1595,6 @@
           }
         } catch (eIn) {}
         var cur = MediaEngineStore && MediaEngineStore.getInputDeviceId && MediaEngineStore.getInputDeviceId();
-        function isForbiddenVoice(d) {
-          var n = String((d && (d.name || d.label || d.id)) || "").toLowerCase();
-          return (
-            n.indexOf("monitor") !== -1 ||
-            n.indexOf("loopback") !== -1 ||
-            n.indexOf("stereo mix") !== -1 ||
-            n.indexOf("vencord-screen-share") !== -1 ||
-            n.indexOf("venmic") !== -1 ||
-            n.indexOf("what-u-hear") !== -1 ||
-            n === "default" ||
-            n === "communications"
-          );
-        }
-        function isRealMic(d) {
-          if (!d || isForbiddenVoice(d)) return false;
-          var n = String((d.name || d.label || d.id) || "").toLowerCase();
-          if (n.indexOf("deckscord") !== -1 && n.indexOf("silent") !== -1) return false;
-          return true;
-        }
         var curDev = null;
         for (var i = 0; i < inputs.length; i++) {
           if (String(inputs[i].id) === String(cur)) curDev = inputs[i];
@@ -1584,6 +1614,15 @@
             for (var k = 0; k < inputs.length; k++) {
               if (isRealMic(inputs[k]) && String(inputs[k].id) !== "default") {
                 pick = inputs[k];
+                break;
+              }
+            }
+          }
+          if (!pick) {
+            for (var s = 0; s < inputs.length; s++) {
+              var sn = String((inputs[s].name || inputs[s].label || "")).toLowerCase();
+              if (sn.indexOf("deckscord") !== -1 && sn.indexOf("silent") !== -1) {
+                pick = inputs[s];
                 break;
               }
             }
@@ -1666,7 +1705,8 @@
           return { ok: false, error: "cancelled" };
         }
         startFn(guildId, cid, { pid: null, sourceId: srcId, sourceName: "Deckscord" });
-        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps };
+        GO_LIVE.active = true;
+        return { ok: true, sourceId: srcId, width: width, height: height, fps: fps, streaming: true };
       }
 
       if (!eng || typeof eng.getDesktopSource !== "function") {
@@ -1781,13 +1821,7 @@
     setInputDevice: function (deviceId) {
       try {
         var id = String(deviceId);
-        var n = id.toLowerCase();
-        if (
-          n.indexOf("monitor") !== -1 ||
-          n.indexOf("loopback") !== -1 ||
-          n.indexOf("vencord-screen-share") !== -1 ||
-          n.indexOf("venmic") !== -1
-        ) {
+        if (voiceInputForbiddenName(id)) {
           return { ok: false, error: "that input is desktop/game capture, not a microphone" };
         }
         var fn = findFn("setInputDevice");

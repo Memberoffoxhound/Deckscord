@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault(
@@ -144,11 +145,42 @@ def _comms() -> set[str]:
 
 
 def in_game_mode() -> bool:
-    # Nested gamescope under KWin is still Desktop Mode.
+    # Nested gamescope under KWin is still Desktop Mode. During login, kwin
+    # is not up yet — do not treat a leftover gamescope binary as Game Mode
+    # unless gamescope is actually the session compositor.
     names = _comms()
     if names & KWIN:
         return False
     return bool(names & GAMESCOPE)
+
+
+def _msg_path(message) -> str:
+    for name in ("get_path", "get_object_path"):
+        fn = getattr(message, name, None)
+        if callable(fn):
+            try:
+                return fn() or ""
+            except Exception:
+                continue
+    return ""
+
+
+def _systemctl_user(*args: str, timeout: int = 8) -> None:
+    subprocess.run(
+        ["systemctl", "--user", *args],
+        timeout=timeout,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _nudge_fresh() -> bool:
+    home = Path(os.environ.get("HOME") or "")
+    p = home / ".local" / "share" / "deckscord" / "want-portal"
+    try:
+        return p.is_file() and (time.time() - p.stat().st_mtime) < 90
+    except OSError:
+        return False
 
 
 def sender_token(sender: str) -> str:
@@ -239,6 +271,11 @@ class Portal:
         self.sessions: dict[str, dict] = {}
         self.owner_id = 0
         self._stopping_portal = False
+        self._started = time.monotonic()
+        self._gm_since = 0.0
+        self._desk_since = 0.0
+        self._last_stop = 0.0
+        self._stable_gm = False
 
     def sender_is_vesktop(self, sender: str) -> bool:
         if not self.conn or not sender:
@@ -452,11 +489,20 @@ class Portal:
         return None
 
     def on_filter(self, conn, message, incoming):
+        # Must never raise: a thrown filter wedges the session bus and hangs
+        # Game Mode / Plasma login (Legion splash, "logging in" forever).
+        try:
+            return self._on_filter(conn, message, incoming)
+        except Exception as e:
+            log.warning("filter: %r", e)
+            return message
+
+    def _on_filter(self, conn, message, incoming):
         if not incoming:
             return message
         iface = message.get_interface()
         member = message.get_member()
-        path = message.get_object_path() or ""
+        path = _msg_path(message)
         if member == "Close" and iface == SESS_IFACE and path in self.sessions:
             self.close_session(path)
             try:
@@ -524,6 +570,13 @@ class Portal:
         self.unregister()
         log.info("released %s", PORTAL_NAME)
 
+    def _start_desktop_portal(self) -> None:
+        try:
+            _systemctl_user("start", "xdg-desktop-portal.service")
+            log.info("started xdg-desktop-portal for Desktop Mode")
+        except Exception as e:
+            log.warning("start portal: %r", e)
+
     def on_bus_acquired(self, conn, _name):
         self.register(conn)
 
@@ -535,30 +588,49 @@ class Portal:
         log.info("name lost")
         self.unregister()
         self.owner_id = 0
-        if in_game_mode() and not self._stopping_portal:
+        now = time.monotonic()
+        # Only steal the name after Game Mode has been up for a bit. Stopping
+        # xdg-desktop-portal during boot/login hangs Plasma and gamescope-session.
+        if (
+            self._stable_gm
+            and not self._stopping_portal
+            and (now - self._last_stop) >= 30.0
+            and ((now - self._started) >= 20.0 or _nudge_fresh())
+        ):
             self._stopping_portal = True
+            self._last_stop = now
             log.info("stopping leftover xdg-desktop-portal so Game Mode can capture")
             try:
-                subprocess.run(
-                    ["systemctl", "--user", "stop", "xdg-desktop-portal.service"],
-                    timeout=8,
-                    capture_output=True,
-                )
+                _systemctl_user("stop", "xdg-desktop-portal.service")
             except Exception as e:
                 log.warning("stop portal: %r", e)
 
     def tick(self) -> bool:
         want = in_game_mode()
-        if want and not self.owner_id:
-            self.try_own()
-        elif not want and self.owner_id:
-            self.drop_name()
+        now = time.monotonic()
+        if want:
+            self._desk_since = 0.0
+            if not self._gm_since:
+                self._gm_since = now
+            nudged = _nudge_fresh()
+            self._stable_gm = nudged or (now - self._gm_since) >= 8.0
+            if self._stable_gm and not self.owner_id:
+                self.try_own()
+        else:
+            self._gm_since = 0.0
+            self._stable_gm = False
+            self._stopping_portal = False
+            if not self._desk_since:
+                self._desk_since = now
+            if self.owner_id and (now - self._desk_since) >= 2.0:
+                self.drop_name()
+                self._start_desktop_portal()
         return True
 
 
 def main() -> int:
     portal = Portal()
-    GLib.timeout_add_seconds(3, portal.tick)
+    GLib.timeout_add_seconds(1, portal.tick)
     portal.tick()
     log.info("watching for gamescope (idle in Desktop Mode)")
     loop = GLib.MainLoop()

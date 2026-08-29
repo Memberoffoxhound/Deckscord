@@ -21,6 +21,7 @@ import decky
 
 CDP_PORT = int(os.environ.get("DECKSCORD_CDP_PORT", "9222"))
 SERVICE = "deckscord-vesktop.service"
+FLATPAK_ID = "dev.vencord.Vesktop"
 PLUGIN_DIR = Path(getattr(decky, "DECKY_PLUGIN_DIR", Path(__file__).parent))
 BRIDGE_PATH = PLUGIN_DIR / "bridge.js"
 REPO_URL = os.environ.get(
@@ -82,6 +83,14 @@ def _ensure_dir(path: Path) -> Path:
 DATA_DIR = _ensure_dir(_login_home() / ".local" / "share" / "deckscord")
 SETTINGS_PATH = DATA_DIR / "settings.json"
 PIP_DIR = _ensure_dir(DATA_DIR / "pip")
+WANT_PORTAL = DATA_DIR / "want-portal"
+
+
+def _nudge_portal() -> None:
+    try:
+        WANT_PORTAL.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "pip": {
@@ -94,7 +103,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "name": "",
     },
     "talking": {
-        "enabled": True,
+        "enabled": False,
         "corner": "top-left",
         "size": "small",
         "opacity": 90,
@@ -346,6 +355,48 @@ def _pick_display() -> Optional[str]:
     return None
 
 
+def _vesktop_unit_text() -> str:
+    return f"""[Unit]
+Description=Deckscord Vesktop (Discord) for Game Mode
+After=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=8
+KillMode=control-group
+TimeoutStopSec=12
+TimeoutStartSec=200
+Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
+Environment=DECKSCORD_CDP_PORT={CDP_PORT}
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do pgrep -x kwin_wayland >/dev/null && exit 0; pgrep -x kwin_x11 >/dev/null && exit 0; pgrep -x gamescope >/dev/null && exit 0; pgrep -x gamescope-wl >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
+ExecStop=/usr/bin/flatpak kill {FLATPAK_ID}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _harden_vesktop_unit() -> None:
+    """Wait for a compositor before Electron starts, so linger cannot grab DRM at boot."""
+    path = _login_home() / ".config" / "systemd" / "user" / SERVICE
+    try:
+        cur = path.read_text(encoding="utf-8") if path.is_file() else ""
+    except OSError:
+        return
+    if "ExecStartPre=" in cur and "pgrep -x gamescope" in cur:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_vesktop_unit_text(), encoding="utf-8")
+        _systemctl("daemon-reload", timeout=8)
+        decky.logger.info("rewrote vesktop unit to wait for compositor")
+    except Exception as e:
+        decky.logger.warning(f"vesktop unit: {e}")
+
+
 def _overlay_env() -> dict[str, str]:
     env = _subprocess_env()
     home = _login_home()
@@ -395,15 +446,32 @@ _VOICE_SKIP = (
     "wave out",
     "vencord-screen-share",
     "venmic",
+    "screen-share",
+    "screenshare",
+    "screen share",
+    "audio share",
+    "share audio",
+    "desktop audio",
+    "system audio",
+    "entire system",
+    "chromium",
+    "chrome",
     "deckscord_silence",
     "deckscord.silence",
 )
 
 
 def _is_monitor_source(name: str) -> bool:
-    n = (name or "").lower()
+    """True for anything that is not a microphone (speakers, share virtmic, default)."""
+    n = (name or "").lower().strip()
+    if not n:
+        return True
     if n == SILENCE_MIC or n.startswith("deckscord.mic"):
         return False
+    if n in ("default", "communications"):
+        return True
+    if n.startswith("alsa_output") or n.startswith("bluez_output"):
+        return True
     return any(s in n for s in _VOICE_SKIP)
 
 
@@ -478,7 +546,7 @@ def ensure_mic_not_loopback() -> dict[str, Any]:
         silent = bool(mic)
         sources = _pulse_sources()
     changed = False
-    if mic and (not cur or _is_monitor_source(cur)):
+    if mic and (not cur or _is_monitor_source(cur) or (not silent and cur == SILENCE_MIC)):
         _pactl("set-default-source", mic)
         changed = True
         cur = mic
@@ -828,9 +896,16 @@ class Plugin:
         self._talk_hold: dict[str, float] = {}
         self._talk_last: dict[str, dict[str, Any]] = {}
         self._talk_in_voice = False
+        self._mic_pin_until = 0.0
+        self._go_live_until = 0.0
+        self._go_live_pending = False
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
+        try:
+            _harden_vesktop_unit()
+        except Exception as e:
+            decky.logger.warning(f"vesktop unit: {e}")
         try:
             svc = await self._ensure_vesktop(wait=True)
             decky.logger.info(f"vesktop service: {svc}")
@@ -1246,6 +1321,28 @@ class Plugin:
             talk = dict(self._settings.get("talking") or {})
             out["talking"] = dict(talk)
             out["talking"]["live"] = bool(talk.get("enabled") and vch)
+            now_m = time.monotonic()
+            snap_live = bool(
+                out.get("streaming")
+                or (
+                    isinstance(out.get("stream"), dict)
+                    and out["stream"].get("active")
+                )
+                or (isinstance(voice, dict) and voice.get("streaming"))
+            )
+            if snap_live:
+                self._go_live_until = max(self._go_live_until, now_m + 8.0)
+                self._go_live_pending = False
+            if self._go_live_pending or now_m < self._go_live_until:
+                out["streaming"] = True
+                st = dict(out["stream"]) if isinstance(out.get("stream"), dict) else {}
+                st["active"] = True
+                st["pending"] = bool(self._go_live_pending and not snap_live)
+                out["stream"] = st
+                if isinstance(out.get("voice"), dict):
+                    v = dict(out["voice"])
+                    v["streaming"] = True
+                    out["voice"] = v
             try:
                 if pip_on or (self._video_enabled and time.monotonic() < self._grab_alive_until):
                     pass
@@ -1295,6 +1392,7 @@ class Plugin:
         await self._clear_audio_focus_safe()
         try:
             hy = ensure_mic_not_loopback()
+            self._mic_pin_until = time.monotonic() + 20.0
             decky.logger.info(f"join capture source: {hy}")
         except Exception as e:
             decky.logger.warning(f"join capture source: {e}")
@@ -1348,6 +1446,8 @@ class Plugin:
                 if v and v not in game_audio:
                     game_audio.append(v)
         decky.logger.info(f"start_go_live {w}x{h}@{f} game_audio={game_audio}")
+        self._go_live_pending = True
+        _nudge_portal()
         try:
             self._ensure_portal_shim()
         except Exception as e:
@@ -1364,19 +1464,33 @@ class Plugin:
             + ")",
             timeout=28.0,
         )
-        try:
-            await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
-        except Exception:
-            pass
-        try:
-            ensure_mic_not_loopback()
-        except Exception:
-            pass
+        ok = isinstance(r, dict) and r.get("ok") is not False
+        self._go_live_pending = False
+        if ok:
+            self._go_live_until = time.monotonic() + 20.0
+        else:
+            self._go_live_until = 0.0
+        self._mic_pin_until = time.monotonic() + 25.0
+        asyncio.create_task(self._pin_mic_burst())
         decky.logger.info(f"start_go_live result {r}")
         return self._ok(r)
 
+    async def _pin_mic_burst(self) -> None:
+        for _ in range(8):
+            try:
+                await asyncio.to_thread(ensure_mic_not_loopback)
+            except Exception:
+                pass
+            try:
+                await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+            except Exception:
+                pass
+            await asyncio.sleep(0.35)
+
     async def stop_go_live(self) -> dict[str, Any]:
         decky.logger.info("stop_go_live")
+        self._go_live_pending = False
+        self._go_live_until = 0.0
         r = await self._bridge("stopGoLive()")
         try:
             await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
@@ -1928,6 +2042,8 @@ class Plugin:
         self._write_pip_state()
         if not self._overlay_needed():
             return
+        if not in_game_mode():
+            return
         proc = self._pip_proc
         if proc is not None and proc.poll() is None:
             return
@@ -2020,7 +2136,7 @@ class Plugin:
     def _write_talking_state(self, speakers: list[dict[str, Any]], live: bool) -> None:
         talk = dict(self._settings.get("talking") or {})
         blob = {
-            "enabled": bool(live and talk.get("enabled", True)),
+            "enabled": bool(live and talk.get("enabled")),
             "corner": talk.get("corner") or "top-left",
             "size": talk.get("size") or "small",
             "opacity": talk.get("opacity", 90),
@@ -2030,7 +2146,7 @@ class Plugin:
 
     async def _talking_tick(self) -> None:
         talk = dict(self._settings.get("talking") or {})
-        if not talk.get("enabled", True):
+        if not talk.get("enabled"):
             self._write_talking_state([], False)
             return
         try:
@@ -2094,13 +2210,25 @@ class Plugin:
 
     async def _pip_loop(self) -> None:
         talk_at = 0.0
+        pin_at = 0.0
         while True:
             try:
                 pip = self._settings.get("pip") or {}
                 talk = self._settings.get("talking") or {}
                 pip_on = bool(pip.get("enabled") and pip.get("userId"))
-                talk_pref = talk.get("enabled", True) is not False
+                talk_pref = bool(talk.get("enabled"))
                 now = time.monotonic()
+                pin_iv = 1.0 if now < self._mic_pin_until else 12.0
+                if (self._last_voice_channel or now < self._mic_pin_until) and now - pin_at >= pin_iv:
+                    pin_at = now
+                    try:
+                        await asyncio.to_thread(ensure_mic_not_loopback)
+                    except Exception:
+                        pass
+                    try:
+                        await self._eval("window.__deckscord && window.__deckscord.ensureVoiceProcessing()")
+                    except Exception:
+                        pass
                 talk_iv = 0.25 if self._talk_in_voice else 1.0
                 if talk_pref and now - talk_at >= talk_iv:
                     await self._talking_tick()

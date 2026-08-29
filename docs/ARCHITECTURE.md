@@ -48,6 +48,6 @@ QAM live video copies JPEG tiles from Discord’s media engine after `STREAM_WAT
 
 Watch overlay (Switch 2 GameShare *as a spectator*): A on a live tile focuses that stream — game audio only for them, larger JPEG — then a large Watch view. Party mics stay. We do **not** guest-play a game the watcher doesn’t own. See [GAMESHARE.md](GAMESHARE.md).
 
-PiP is a gamescope external-overlay stamp (`plugin/pip_overlay.py`) of those already-decoded frames. The same overlay process draws a who’s-talking roster (avatar + name, speakers only) so gamescope only needs one overlay plane. Settings tree: [SETTINGS.md](SETTINGS.md).
+PiP is a gamescope external-overlay stamp (`plugin/pip_overlay.py`) of those already-decoded frames. The same overlay process draws a who’s-talking roster (avatar + name, speakers only) so gamescope only needs one overlay plane. Overlay is Game Mode only (gamescope Xwayland, input-empty, `GAMESCOPE_EXTERNAL_OVERLAY` before map) so it cannot cover SDDM/KWin or steal the Steam QAM. Settings tree: [SETTINGS.md](SETTINGS.md).
 
 Outbound **Share game** is a different pipe: gamescope’s PipeWire node → ScreenCast portal shim → Discord’s own 720p30 encoder. Documented in [GO_LIVE.md](GO_LIVE.md). Self screenshare is not JPEG-copied back into the QAM.

@@ -79,6 +79,11 @@ window (`plugin/pip_overlay.py`) draws one JPEG stamp in a corner after the
 QAM closes. Audio stays in Discord (`focusStream`) — the overlay is pixels
 only.
 
+The overlay process refuses to map unless gamescope is the session (no
+KWin) and the X display interned `GAMESCOPE_*` atoms. A fullscreen GTK
+window on desktop `:0` covers login and steals Steam's QAM / Steam-button
+layer — it is not started there. Who's-talking is off until you enable it.
+
 Small = 240p (426×240), large = 480p (854×480), both clamped to a fraction
 of output height so a Deck and a 4K panel stay usable. Opacity is
 compositor alpha.

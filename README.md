@@ -12,8 +12,8 @@ Repository: https://github.com/Memberoffoxhound/Deckscord
   - **Text** — servers / DMs, channel list, read messages, send messages
   - **Share game** — 720p 30 Go Live of the gamescope framebuffer + game audio (not the desktop, not speaker loopback)
   - **Watch** — large spectator overlay of a friend’s Go Live (game audio only while focused; party voice stays). Not Nintendo GameShare: we do not let you play a game you don’t own.
-  - **PiP** — pin a stamp (240p or 480p, any corner, opacity) over the game after you close the QAM
-  - **Who's talking** — avatar + name over Game Mode only while that person speaks
+  - **PiP** — pin a stamp (240p or 480p, any corner, opacity) over the game after you close the QAM (Game Mode / gamescope only; off on desktop)
+  - **Who's talking** — opt-in avatar + name over Game Mode only while that person speaks
   - **Settings** — Vesktop + Discord voice/Go Live tree in the QAM
 - Log in once. Session persists across Game Mode and reboot.
 

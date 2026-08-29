@@ -209,8 +209,10 @@ Restart=on-failure
 RestartSec=8
 KillMode=control-group
 TimeoutStopSec=12
+TimeoutStartSec=200
 Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
 Environment=DECKSCORD_CDP_PORT=${CDP_PORT}
+ExecStartPre=/bin/bash -c 'for i in \$(seq 1 180); do pgrep -x kwin_wayland >/dev/null && exit 0; pgrep -x kwin_x11 >/dev/null && exit 0; pgrep -x gamescope >/dev/null && exit 0; pgrep -x gamescope-wl >/dev/null && exit 0; sleep 1; done; exit 1'
 ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
 ExecStop=/usr/bin/flatpak kill ${FLATPAK_ID}
 
