@@ -1,7 +1,6 @@
 /**
- * Injected into Vesktop's Discord renderer via CDP.
- * Uses Vencord's webpack helpers (Vesktop always ships Vencord).
- * Every public method returns JSON-safe plain objects.
+ * Injected into Discord (Chrome or Vesktop) via CDP.
+ * Uses Vencord.Webpack when present, else Discord's webpackChunk.
  */
 (function () {
   if (!window.__deckscordWorkerHook) {
@@ -21,9 +20,105 @@
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
 
+  function installWebpackShim() {
+    if (window.Vencord && window.Vencord.Webpack && typeof window.Vencord.Webpack.findByProps === "function") {
+      return;
+    }
+    function getReq() {
+      if (window.__deckscordReq) return window.__deckscordReq;
+      var chunk = window.webpackChunkdiscord_app;
+      if (!chunk || typeof chunk.push !== "function") throw new Error("Discord webpack not ready yet");
+      var req;
+      chunk.push([[Symbol.for("deckscord")], {}, function (r) { req = r; }]);
+      if (!req) throw new Error("Discord webpack not ready yet");
+      window.__deckscordReq = req;
+      return req;
+    }
+    var propCache = Object.create(null);
+    var storeCache = Object.create(null);
+    function eachMod(fn) {
+      var c = getReq().c;
+      if (!c) throw new Error("Discord webpack not ready yet");
+      for (var id in c) {
+        try {
+          var exp = c[id] && c[id].exports;
+          if (!exp || exp === window || exp === document) continue;
+          var list = [exp];
+          if (exp.default && exp.default !== exp) list.push(exp.default);
+          if (exp.Z && exp.Z !== exp && exp.Z !== exp.default) list.push(exp.Z);
+          if (exp.ZP && exp.ZP !== exp.Z) list.push(exp.ZP);
+          for (var i = 0; i < list.length; i++) {
+            var hit = fn(list[i], exp);
+            if (hit) return hit;
+          }
+        } catch (eEach) {}
+      }
+      return null;
+    }
+    function findByProps() {
+      var props = Array.prototype.slice.call(arguments);
+      var key = props.join("\0");
+      if (propCache[key]) return propCache[key];
+      var found = eachMod(function (obj) {
+        if (!obj || (typeof obj !== "object" && typeof obj !== "function")) return null;
+        for (var i = 0; i < props.length; i++) {
+          if (!(props[i] in obj)) return null;
+        }
+        return obj;
+      });
+      if (found) propCache[key] = found;
+      return found;
+    }
+    function findStore(name) {
+      if (storeCache[name]) return storeCache[name];
+      var found = eachMod(function (obj) {
+        if (!obj || typeof obj.getName !== "function") return null;
+        try {
+          if (obj.getName() === name) return obj;
+        } catch (eName) {}
+        return null;
+      });
+      if (found) storeCache[name] = found;
+      return found;
+    }
+    function findByCode(snippet) {
+      var req = getReq();
+      var mods = req.m;
+      if (!mods) return null;
+      snippet = String(snippet);
+      for (var id in mods) {
+        try {
+          if (String(mods[id]).indexOf(snippet) === -1) continue;
+          var exp = req.c && req.c[id] && req.c[id].exports;
+          if (!exp) {
+            try { exp = req(id); } catch (eLoad) { continue; }
+          }
+          if (typeof exp === "function") return exp;
+          if (exp && typeof exp.default === "function") return exp.default;
+          if (exp && typeof exp.Z === "function") return exp.Z;
+          if (exp && typeof exp === "object") {
+            var keys = Object.keys(exp);
+            for (var i = 0; i < keys.length; i++) {
+              if (typeof exp[keys[i]] === "function") return exp[keys[i]];
+            }
+          }
+        } catch (eCode) {}
+      }
+      return null;
+    }
+    window.Vencord = window.Vencord || {};
+    window.Vencord.Webpack = {
+      findByProps: findByProps,
+      findStore: findStore,
+      findByCode: findByCode,
+      Common: {},
+    };
+  }
+
   function W() {
+    installWebpackShim();
     var v = window.Vencord;
-    if (!v || !v.Webpack) throw new Error("Vencord is not ready yet");
+    if (!v || !v.Webpack) throw new Error("Discord webpack not ready yet");
     return v.Webpack;
   }
 
@@ -51,7 +146,10 @@
     try {
       if (typeof wp.findStore === "function") {
         s = wp.findStore(name);
-        if (s) return s;
+        if (s) {
+          try { wp.Common[name] = s; } catch (eC) {}
+          return s;
+        }
       }
     } catch (e) {}
     return null;
@@ -828,7 +926,7 @@
     ping: function () {
       try {
         W();
-        return { ok: true, vencord: true };
+        return { ok: true, webpack: true, vencord: !!(window.Vencord && window.Vencord.Plugins) };
       } catch (e) {
         return err(e);
       }

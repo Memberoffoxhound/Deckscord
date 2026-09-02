@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deckscord Decky backend — drives Vesktop over Chrome DevTools Protocol."""
+"""Deckscord Decky backend — drives Discord-in-Chrome over Chrome DevTools Protocol."""
 
 from __future__ import annotations
 
@@ -21,10 +21,32 @@ from urllib.parse import urlparse
 import decky
 
 CDP_PORT = int(os.environ.get("DECKSCORD_CDP_PORT", "9222"))
-SERVICE = "deckscord-vesktop.service"
-FLATPAK_ID = "dev.vencord.Vesktop"
+SERVICE = "deckscord-chrome.service"
+OLD_SERVICE = "deckscord-vesktop.service"
+FLATPAK_ID = "com.google.Chrome"
+ENGINE_CLASS = "deckscord"
 PLUGIN_DIR = Path(getattr(decky, "DECKY_PLUGIN_DIR", Path(__file__).parent))
 BRIDGE_PATH = PLUGIN_DIR / "bridge.js"
+_MEDIA_ORIGINS = (
+    "https://discord.com:443,*",
+    "https://discordapp.com:443,*",
+    "https://canary.discord.com:443,*",
+    "https://ptb.discord.com:443,*",
+)
+_GRANT_PERMS = [
+    "audioCapture",
+    "videoCapture",
+    "displayCapture",
+    "notifications",
+    "idleDetection",
+    "clipboardReadWrite",
+]
+_GRANT_ORIGINS = (
+    "https://discord.com",
+    "https://discordapp.com",
+    "https://canary.discord.com",
+    "https://ptb.discord.com",
+)
 REPO_URL = os.environ.get(
     "DECKSCORD_REPO", "https://github.com/Memberoffoxhound/Deckscord.git"
 )
@@ -443,6 +465,33 @@ def _save_settings(doc: dict[str, Any]) -> None:
         pass
 
 
+def _chrome_profile() -> Path:
+    return _login_home() / ".var" / "app" / "com.google.Chrome" / "config" / "deckscord-profile"
+
+
+def _seed_chrome_prefs() -> None:
+    """Allow Discord mic/cam/notify in the engine profile so Chrome never prompts."""
+    prefs_path = _chrome_profile() / "Default" / "Preferences"
+    if prefs_path.is_file() and _vesktop_pids():
+        return
+    prefs_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = _read_json(prefs_path)
+    profile = doc.setdefault("profile", {})
+    defaults = profile.setdefault("default_content_setting_values", {})
+    for k in ("media_stream_mic", "media_stream_camera", "notifications", "media_stream"):
+        defaults[k] = 1
+    exceptions = profile.setdefault("content_settings", {}).setdefault("exceptions", {})
+    allow = {"last_modified": "0", "setting": 1}
+    for kind in ("media_stream_mic", "media_stream_camera", "media_stream", "notifications", "display_capture"):
+        bag = exceptions.get(kind)
+        if not isinstance(bag, dict):
+            bag = {}
+            exceptions[kind] = bag
+        for origin in _MEDIA_ORIGINS:
+            bag[origin] = dict(allow)
+    _write_json(prefs_path, doc)
+
+
 def _vesktop_config_dir() -> Path:
     home = _login_home()
     cands = [
@@ -491,19 +540,26 @@ def _set_nested(doc: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
 
 def _pick_display() -> Optional[str]:
     raw = os.environ.get("DISPLAY") or ""
-    if raw:
-        n = raw.lstrip(":").split(".")[0]
-        if Path(f"/tmp/.X11-unix/X{n}").exists():
-            return raw if raw.startswith(":") else f":{n}"
-    for n in range(0, 8):
+    def _ok(d: str) -> bool:
+        n = d.lstrip(":").split(".")[0]
+        return Path(f"/tmp/.X11-unix/X{n}").exists()
+    if raw and raw not in (":0", ":0.0") and _ok(raw):
+        return raw if raw.startswith(":") else f":{raw.lstrip(':')}"
+    if Path("/tmp/.X11-unix/X1").exists():
+        return ":1"
+    if raw and _ok(raw):
+        return raw if raw.startswith(":") else f":{raw.lstrip(':')}"
+    for n in range(1, 8):
         if Path(f"/tmp/.X11-unix/X{n}").exists():
             return f":{n}"
+    if Path("/tmp/.X11-unix/X0").exists():
+        return ":0"
     return None
 
 
 def _vesktop_unit_text() -> str:
     return f"""[Unit]
-Description=Deckscord Vesktop (Discord) for Game Mode
+Description=Deckscord Chrome (Discord) for Game Mode
 After=graphical-session.target
 StartLimitIntervalSec=0
 
@@ -514,13 +570,11 @@ RestartSec=8
 KillMode=control-group
 TimeoutStopSec=12
 TimeoutStartSec=200
-CPUQuota=200%
 CPUWeight=20
-Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
 Environment=DECKSCORD_CDP_PORT={CDP_PORT}
+Environment=DISPLAY=:1
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 180); do pgrep -x kwin_wayland >/dev/null && exit 0; pgrep -x kwin_x11 >/dev/null && exit 0; pgrep -x gamescope >/dev/null && exit 0; pgrep -x gamescope-wl >/dev/null && exit 0; sleep 1; done; exit 1'
-ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
-ExecStop=/usr/bin/flatpak kill {FLATPAK_ID}
+ExecStart=%h/.local/share/deckscord/launch-chrome.sh
 
 [Install]
 WantedBy=default.target
@@ -528,13 +582,14 @@ WantedBy=default.target
 
 
 def _install_launch_script() -> None:
-    """Keep systemd's launch-vesktop.sh in sync with the plugin copy."""
-    dest = DATA_DIR / "launch-vesktop.sh"
+    """Keep systemd's launch-chrome.sh in sync with the plugin copy."""
+    dest = DATA_DIR / "launch-chrome.sh"
     srcs = [
-        PLUGIN_DIR / "launch-vesktop.sh",
-        PLUGIN_DIR.parent / "launch-vesktop.sh",
-        Path(__file__).resolve().parents[1] / "launch-vesktop.sh",
-        DATA_DIR / "src" / "launch-vesktop.sh",
+        PLUGIN_DIR / "launch-chrome.sh",
+        PLUGIN_DIR.parent / "launch-chrome.sh",
+        Path(__file__).resolve().parents[1] / "launch-chrome.sh",
+        DATA_DIR / "src" / "plugin" / "launch-chrome.sh",
+        DATA_DIR / "src" / "launch-chrome.sh",
     ]
     src = next((p for p in srcs if p.is_file()), None)
     if src is None:
@@ -562,6 +617,26 @@ def _install_launch_script() -> None:
     decky.logger.info(f"updated {dest} from {src}")
 
 
+def _retire_vesktop() -> None:
+    """Stop the old Electron unit so it cannot sit on CDP 9222 or the CPU."""
+    try:
+        _systemctl("stop", OLD_SERVICE, timeout=15)
+    except Exception:
+        pass
+    try:
+        _systemctl("disable", OLD_SERVICE, timeout=8)
+    except Exception:
+        pass
+    old = _login_home() / ".config" / "systemd" / "user" / OLD_SERVICE
+    try:
+        if old.is_file():
+            old.unlink()
+            _systemctl("daemon-reload", timeout=8)
+            decky.logger.info("retired vesktop unit")
+    except Exception as e:
+        decky.logger.warning(f"retire vesktop: {e}")
+
+
 def _harden_vesktop_unit() -> None:
     """Keep the user unit in sync (compositor wait + CPU cap so Game Mode stays playable)."""
     path = _login_home() / ".config" / "systemd" / "user" / SERVICE
@@ -571,14 +646,19 @@ def _harden_vesktop_unit() -> None:
     except OSError:
         return
     if cur == want:
+        try:
+            _systemctl("enable", SERVICE, timeout=8)
+        except Exception:
+            pass
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(want, encoding="utf-8")
         _systemctl("daemon-reload", timeout=8)
-        decky.logger.info("rewrote vesktop unit")
+        _systemctl("enable", SERVICE, timeout=8)
+        decky.logger.info("rewrote chrome unit")
     except Exception as e:
-        decky.logger.warning(f"vesktop unit: {e}")
+        decky.logger.warning(f"chrome unit: {e}")
 
 
 def _pin_vesktop_x11() -> None:
@@ -588,7 +668,7 @@ def _pin_vesktop_x11() -> None:
     env = _overlay_env()
     try:
         r = subprocess.run(
-            ["xdotool", "search", "--class", "vesktop"],
+            ["xdotool", "search", "--class", ENGINE_CLASS],
             capture_output=True,
             text=True,
             timeout=2,
@@ -1009,9 +1089,14 @@ def _vesktop_pids() -> list[int]:
                 )
             except OSError:
                 continue
+            if "portal_shim" in cmd:
+                continue
+            if "deckscord-profile" in cmd or "--class=deckscord" in cmd:
+                found.append(int(p.name))
+                continue
             if "vesktop" not in cmd and "vencord" not in cmd:
                 continue
-            if "portal_shim" in cmd or "deckscord" in cmd:
+            if "deckscord" in cmd and "chrome" not in cmd:
                 continue
             found.append(int(p.name))
     except OSError:
@@ -1294,22 +1379,31 @@ class Plugin:
         self._go_live_pending = False
         self._go_live_stopped_at = 0.0
         self._capture_env_restarted = False
+        self._perms_at = 0.0
 
     async def _main(self) -> None:
         decky.logger.info("Deckscord backend starting")
         try:
+            _retire_vesktop()
+        except Exception as e:
+            decky.logger.warning(f"retire vesktop: {e}")
+        try:
+            _seed_chrome_prefs()
+        except Exception as e:
+            decky.logger.warning(f"chrome prefs: {e}")
+        try:
             _harden_vesktop_unit()
         except Exception as e:
-            decky.logger.warning(f"vesktop unit: {e}")
+            decky.logger.warning(f"chrome unit: {e}")
         try:
             _install_launch_script()
         except Exception as e:
             decky.logger.warning(f"launch script: {e}")
         try:
             svc = await self._ensure_vesktop(wait=True)
-            decky.logger.info(f"vesktop service: {svc}")
+            decky.logger.info(f"chrome service: {svc}")
         except Exception as e:
-            decky.logger.warning(f"vesktop start: {e}")
+            decky.logger.warning(f"chrome start: {e}")
         try:
             hy = ensure_mic_not_loopback()
             decky.logger.info(f"capture source: {hy}")
@@ -1366,6 +1460,8 @@ class Plugin:
                 if href and want_url and href.split("#")[0] not in want_url and want_url.split("#")[0] not in str(href):
                     await self.cdp.close()
                 else:
+                    await self._grant_permissions()
+                    await self._ensure_discord_url()
                     if inject:
                         try:
                             await self._inject_bridge()
@@ -1382,8 +1478,10 @@ class Plugin:
                 targets = _cdp_targets()
                 t = _pick_target(targets)
                 if not t:
-                    raise ConnectionError("no CDP targets (is Vesktop running / logged in?)")
+                    raise ConnectionError("no CDP targets (is Chrome Discord running?)")
                 await self.cdp.connect(t["webSocketDebuggerUrl"])
+                await self._grant_permissions()
+                await self._ensure_discord_url()
                 if inject:
                     try:
                         await self._inject_bridge()
@@ -1398,6 +1496,56 @@ class Plugin:
                 if i + 1 < attempts:
                     await asyncio.sleep(1.2)
         raise ConnectionError(str(last_err) if last_err else "CDP connect failed")
+
+    async def _grant_permissions(self) -> None:
+        """Approve Discord mic/cam/screen at the browser — no Allow bubble."""
+        now = time.monotonic()
+        if now - self._perms_at < 30:
+            return
+        self._perms_at = now
+        for origin in _GRANT_ORIGINS:
+            try:
+                await self.cdp.call(
+                    "Browser.grantPermissions",
+                    {"origin": origin, "permissions": _GRANT_PERMS},
+                    timeout=3,
+                )
+            except Exception as e:
+                decky.logger.warning(f"grantPermissions {origin}: {e}")
+        try:
+            await self.cdp.call("Browser.grantPermissions", {"permissions": _GRANT_PERMS}, timeout=3)
+        except Exception:
+            pass
+        try:
+            await self._eval(
+                """
+                (function(){
+                  var btns = document.querySelectorAll('button');
+                  for (var i = 0; i < btns.length; i++) {
+                    var t = String(btns[i].innerText || btns[i].textContent || '').trim().toLowerCase();
+                    if (t === 'allow' || t === 'allow microphone' || t === 'allow while visiting the site') {
+                      try { btns[i].click(); } catch (e) {}
+                    }
+                  }
+                  return true;
+                })()
+                """,
+                timeout=2,
+            )
+        except Exception:
+            pass
+
+    async def _ensure_discord_url(self) -> None:
+        try:
+            href = str(await self._eval("location.href", timeout=3) or "").lower()
+        except Exception:
+            href = ""
+        if "discord.com" in href or "discordapp.com" in href:
+            return
+        try:
+            await self.cdp.call("Page.navigate", {"url": "https://discord.com/app"}, timeout=8)
+        except Exception as e:
+            decky.logger.warning(f"discord navigate: {e}")
 
     async def _hide_window(self) -> None:
         try:
@@ -1814,7 +1962,7 @@ class Plugin:
                 pass
 
     async def _restart_vesktop_for_capture(self) -> None:
-        decky.logger.info("restarting Vesktop so Chromium uses the Game Mode ScreenCast portal")
+        decky.logger.info("restarting Chrome so Chromium uses the Game Mode ScreenCast portal")
         try:
             await self.cdp.close()
         except Exception:

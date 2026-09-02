@@ -13,16 +13,17 @@ set -euo pipefail
 # Deckscord installer — Discord in Steam Game Mode (QAM), Xbox/PS5 style.
 # https://github.com/Memberoffoxhound/Deckscord
 #
-# Always installs dependencies (Vesktop, plugin files, user service).
+# Always installs dependencies (Chrome, plugin files, user service).
 # Safe as:  curl -fsSL .../install.sh | bash
 # Prompts go to /dev/tty so a pipe is not consumed.
 
 REPO="https://github.com/Memberoffoxhound/Deckscord.git"
 PLUGIN_DIR="${HOME}/homebrew/plugins/Deckscord"
 DATA_DIR="${HOME}/.local/share/deckscord"
-SERVICE_NAME="deckscord-vesktop.service"
+SERVICE_NAME="deckscord-chrome.service"
+OLD_SERVICE_NAME="deckscord-vesktop.service"
 CDP_PORT="${DECKSCORD_CDP_PORT:-9222}"
-FLATPAK_ID="dev.vencord.Vesktop"
+FLATPAK_ID="com.google.Chrome"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -57,10 +58,11 @@ need_sudo() {
   sudo -v
 }
 
-have_vesktop() {
-  flatpak list --app 2>/dev/null | grep -Fqi "${FLATPAK_ID}" && return 0
-  flatpak list --app 2>/dev/null | grep -Fqi vesktop && return 0
-  command -v vesktop >/dev/null 2>&1 && return 0
+have_chrome() {
+  flatpak list --app 2>/dev/null | grep -Fqi com.google.Chrome && return 0
+  command -v google-chrome-stable >/dev/null 2>&1 && return 0
+  command -v google-chrome >/dev/null 2>&1 && return 0
+  command -v chromium >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -72,8 +74,8 @@ echo "╚═══════════════════════�
 echo -e "${NC}"
 echo
 echo "This installer will:"
-echo "  • Install Vesktop (Discord client that actually works in Game Mode)"
-echo "  • Give it Wayland, PipeWire, and a local DevTools port so the QAM"
+echo "  • Use Google Chrome as the Discord engine (low CPU in Game Mode)"
+echo "  • Give it X11, PipeWire, and a local DevTools port so the QAM"
 echo "    plugin can join voice and send messages"
 echo "  • Create a systemd user service so Discord stays logged in"
 echo "  • Install the Deckscord Decky plugin (Quick Access Menu)"
@@ -110,30 +112,30 @@ else
 fi
 
 echo
-echo -e "${BLUE}[2/6] Vesktop (required)${NC}"
+echo -e "${BLUE}[2/6] Google Chrome (required)${NC}"
 if ! command -v flatpak >/dev/null 2>&1; then
   echo -e "${RED}flatpak is required. Install it, then re-run.${NC}"
   exit 1
 fi
 
-if have_vesktop; then
-  echo "  Vesktop already installed."
+if have_chrome; then
+  echo "  Chrome already installed."
 else
-  echo "  Installing Vesktop from Flathub (this is the Discord client)…"
+  echo "  Installing Google Chrome from Flathub…"
   flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
   if ! flatpak install -y --user flathub "${FLATPAK_ID}"; then
     echo "  User install failed — trying system install with sudo…"
-    need_sudo "install Vesktop system-wide"
+    need_sudo "install Google Chrome system-wide"
     sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || true
     sudo flatpak install -y flathub "${FLATPAK_ID}"
   fi
 fi
 
-if ! have_vesktop; then
-  echo -e "${RED}Vesktop did not install. Check network / Flathub and re-run.${NC}"
+if ! have_chrome; then
+  echo -e "${RED}Google Chrome did not install. Check network / Flathub and re-run.${NC}"
   exit 1
 fi
-echo -e "  ${GREEN}Vesktop OK${NC}"
+echo -e "  ${GREEN}Chrome OK${NC}"
 
 # Discord "default" input is PipeWire's default source. If that source is a
 # speaker monitor, everyone in the call hears game/system audio.
@@ -158,8 +160,7 @@ if command -v pactl >/dev/null 2>&1; then
   fi
 fi
 
-# Permissions Vesktop needs in Game Mode: mic, speakers, X11 (gamescope Wayland
-# SIGSEGVs Electron), home (session).
+# Permissions Chrome needs in Game Mode: mic, speakers, X11, PipeWire, portal.
 # No bash arrays here — SteamOS often runs this via `sh` (POSIX bash).
 if flatpak list --app 2>/dev/null | grep -Fqi "${FLATPAK_ID}"; then
   echo "  Applying Flatpak overrides (X11, PipeWire, devices)..."
@@ -167,14 +168,10 @@ if flatpak list --app 2>/dev/null | grep -Fqi "${FLATPAK_ID}"; then
     # shellcheck disable=SC2068
     "$@" \
       --socket=x11 \
-      --socket=fallback-x11 \
-      --socket=wayland \
       --socket=pulseaudio \
       --socket=session-bus \
       --device=all \
-      --share=network \
-      --share=ipc \
-      --filesystem=home \
+      --talk-name=org.freedesktop.portal.Desktop \
       --filesystem=xdg-run/pipewire-0:ro \
       "${FLATPAK_ID}" || true
   }
@@ -189,21 +186,22 @@ fi
 echo
 echo -e "${BLUE}[3/6] Game Mode systemd service${NC}"
 
-LAUNCH="${DATA_DIR}/launch-vesktop.sh"
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/launch-vesktop.sh" ]]; then
-  cp "${SCRIPT_DIR}/launch-vesktop.sh" "${LAUNCH}"
+LAUNCH="${DATA_DIR}/launch-chrome.sh"
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/plugin/launch-chrome.sh" ]]; then
+  cp "${SCRIPT_DIR}/plugin/launch-chrome.sh" "${LAUNCH}"
+elif [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/launch-chrome.sh" ]]; then
+  cp "${SCRIPT_DIR}/launch-chrome.sh" "${LAUNCH}"
 else
-  curl -fsSL "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/launch-vesktop.sh" -o "${LAUNCH}"
+  curl -fsSL "https://raw.githubusercontent.com/Memberoffoxhound/Deckscord/main/plugin/launch-chrome.sh" -o "${LAUNCH}"
 fi
 chmod +x "${LAUNCH}"
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/startvesktop" ]]; then
-  cp "${SCRIPT_DIR}/startvesktop" "${DATA_DIR}/startvesktop"
-  chmod +x "${DATA_DIR}/startvesktop"
-fi
+
+systemctl --user disable --now "${OLD_SERVICE_NAME}" 2>/dev/null || true
+rm -f "${HOME}/.config/systemd/user/${OLD_SERVICE_NAME}"
 
 cat > "${HOME}/.config/systemd/user/${SERVICE_NAME}" << EOF
 [Unit]
-Description=Deckscord Vesktop (Discord) for Game Mode
+Description=Deckscord Chrome (Discord) for Game Mode
 After=graphical-session.target
 StartLimitIntervalSec=0
 
@@ -214,11 +212,11 @@ RestartSec=8
 KillMode=control-group
 TimeoutStopSec=12
 TimeoutStartSec=200
-Environment=ELECTRON_OZONE_PLATFORM_HINT=x11
+CPUWeight=20
 Environment=DECKSCORD_CDP_PORT=${CDP_PORT}
+Environment=DISPLAY=:1
 ExecStartPre=/bin/bash -c 'for i in \$(seq 1 180); do pgrep -x kwin_wayland >/dev/null && exit 0; pgrep -x kwin_x11 >/dev/null && exit 0; pgrep -x gamescope >/dev/null && exit 0; pgrep -x gamescope-wl >/dev/null && exit 0; sleep 1; done; exit 1'
-ExecStart=%h/.local/share/deckscord/launch-vesktop.sh
-ExecStop=/usr/bin/flatpak kill ${FLATPAK_ID}
+ExecStart=%h/.local/share/deckscord/launch-chrome.sh
 
 [Install]
 WantedBy=default.target
@@ -296,10 +294,10 @@ fi
 echo
 echo -e "${BLUE}[6/6] Verify${NC}"
 ok=1
-if have_vesktop; then
-  echo -e "  ${GREEN}✓${NC} Vesktop"
+if have_chrome; then
+  echo -e "  ${GREEN}✓${NC} Chrome"
 else
-  echo -e "  ${RED}✗${NC} Vesktop missing"
+  echo -e "  ${RED}✗${NC} Chrome missing"
   ok=0
 fi
 if [[ -f "${PLUGIN_DIR}/main.py" && -f "${PLUGIN_DIR}/dist/index.js" && -f "${PLUGIN_DIR}/bridge.js" ]]; then
@@ -327,11 +325,9 @@ else
 fi
 echo
 echo "Next:"
-echo "  1. If this is the first time, open Vesktop in Desktop Mode and log in."
-echo "     (After that the session persists.)"
-echo "  2. Return to Game Mode."
-echo "  3. Quick Access Menu → Deckscord."
-echo "  4. Voice tab: pick a server, join a call, mute/deafen."
+echo "  1. Game Mode → QAM → Deckscord. Scan the login QR once."
+echo "     (Session lives in ~/.var/app/com.google.Chrome/config/deckscord-profile.)"
+echo "  2. Voice tab: pick a server, join a call, mute/deafen."
 echo "     Text tab: pick a channel, read and send messages."
 echo
 echo "Update (git pull + copy, no sudo):"

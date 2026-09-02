@@ -1,6 +1,6 @@
 {
   "name": "deckscord",
-  "version": "0.8.0",
-  "description": "Discord companion for SteamOS / Bazzite Game Mode — chat and voice",
+  "version": "0.9.0",
+  "description": "Discord companion for SteamOS / Bazzite Game Mode — chat and voice (Chrome engine)",
   "type": "module"
 }

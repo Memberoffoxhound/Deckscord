@@ -372,10 +372,10 @@ class Portal:
                 .decode(errors="replace")
                 .lower()
             )
-            if any(k in cmd for k in ("vesktop", "vencord", "discord", "xdg-desktop-portal")):
+            if any(k in cmd for k in ("vesktop", "vencord", "discord", "deckscord-profile", "xdg-desktop-portal", "google-chrome", "chrome")):
                 return True
             cg = Path(f"/proc/{pid}/cgroup").read_text(errors="replace").lower()
-            if any(k in cg for k in ("vesktop", "vencord")):
+            if any(k in cg for k in ("vesktop", "vencord", "chrome", "deckscord")):
                 return True
             log.warning("refused sender %s pid=%s cmd=%r", sender, pid, cmd[:120])
         except Exception as e:
