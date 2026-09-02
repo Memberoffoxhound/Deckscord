@@ -7,7 +7,16 @@ FLATPAK_ID="com.google.Chrome"
 CDP_PORT="${DECKSCORD_CDP_PORT:-9222}"
 PROFILE="${HOME}/.var/app/com.google.Chrome/config/deckscord-profile"
 LOG="${HOME}/.local/share/deckscord/chrome-launch.log"
+EXT="${PROFILE}/deckscord-ext"
 mkdir -p "${PROFILE}" "$(dirname "${LOG}")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for src in "${SCRIPT_DIR}/chrome-ext" "${SCRIPT_DIR}/plugin/chrome-ext" "${HOME}/homebrew/plugins/Deckscord/chrome-ext"; do
+  if [[ -f "${src}/hook.js" && -f "${src}/manifest.json" ]]; then
+    mkdir -p "${EXT}"
+    cp -a "${src}/." "${EXT}/"
+    break
+  fi
+done
 
 x11_socket_for() {
   local n="${1#:}"; n="${n%%.*}"
@@ -43,7 +52,6 @@ fi
 flags=(
   --user-data-dir="${PROFILE}"
   --class=deckscord
-  --app=https://discord.com/app
   --remote-debugging-port="${CDP_PORT}"
   --remote-allow-origins=*
   --no-first-run
@@ -52,6 +60,10 @@ flags=(
   --disable-gpu-sandbox
   --window-size=960,540
 )
+if [[ -f "${EXT}/manifest.json" ]]; then
+  flags+=(--load-extension="${EXT}")
+fi
+flags+=("https://discord.com/app")
 if [[ "${in_gamescope}" == true ]]; then
   flags+=(--force-device-scale-factor=1)
   (

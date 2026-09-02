@@ -24,15 +24,26 @@
     if (window.Vencord && window.Vencord.Webpack && typeof window.Vencord.Webpack.findByProps === "function") {
       return;
     }
+    function cacheSize(req) {
+      var n = 0;
+      if (req && req.c) for (var k in req.c) n++;
+      return n;
+    }
     function getReq() {
-      if (window.__deckscordReq) return window.__deckscordReq;
+      var hooked = window.__deckscordReq;
+      if (hooked && cacheSize(hooked) > 400) return hooked;
       var chunk = window.webpackChunkdiscord_app;
       if (!chunk || typeof chunk.push !== "function") throw new Error("Discord webpack not ready yet");
       var req;
       chunk.push([[Symbol.for("deckscord")], {}, function (r) { req = r; }]);
+      if (hooked && cacheSize(hooked) >= cacheSize(req)) return hooked;
       if (!req) throw new Error("Discord webpack not ready yet");
-      window.__deckscordReq = req;
-      return req;
+      if (cacheSize(req) > cacheSize(hooked)) {
+        window.__deckscordReq = req;
+        window.__deckscordReqN = cacheSize(req);
+      }
+      if (cacheSize(window.__deckscordReq) < 400) throw new Error("Discord webpack not ready yet");
+      return window.__deckscordReq;
     }
     var propCache = Object.create(null);
     var storeCache = Object.create(null);
@@ -933,6 +944,17 @@
     },
 
     snapshot: function () {
+      function sessionUser() {
+        try {
+          var raw = localStorage.getItem("MultiAccountStore");
+          var st = raw && JSON.parse(raw);
+          var u = st && st._state && st._state.users && st._state.users[0];
+          if (u && u.id) {
+            return { id: String(u.id), name: u.username || u.globalName || "Discord", username: u.username || "", avatar: u.avatar || null };
+          }
+        } catch (eS) {}
+        return null;
+      }
       try {
         var UserStore = store("UserStore") || byProps("getCurrentUser", "getUser");
         var GuildStore = store("GuildStore") || byProps("getGuild", "getGuilds");
@@ -953,6 +975,10 @@
           } catch (e2) {}
         }
         if (!me) {
+          var cached = sessionUser();
+          if (cached) {
+            return { ok: true, ready: true, logged_in: true, user: cached, guilds: [], dms: [], webpack: false };
+          }
           return { ok: true, ready: false, logged_in: false, booting: true, authenticated: authed };
         }
 
@@ -1095,6 +1121,10 @@
           },
         };
       } catch (e) {
+        var cached2 = sessionUser();
+        if (cached2) {
+          return { ok: true, ready: true, logged_in: true, user: cached2, guilds: [], dms: [], webpack: false, error: String(e && e.message ? e.message : e) };
+        }
         return err(e);
       }
     },

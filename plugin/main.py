@@ -615,6 +615,27 @@ def _install_launch_script() -> None:
     except OSError:
         pass
     decky.logger.info(f"updated {dest} from {src}")
+    ext_src = next(
+        (
+            p
+            for p in (
+                PLUGIN_DIR / "chrome-ext",
+                PLUGIN_DIR.parent / "chrome-ext",
+                Path(__file__).resolve().parents[1] / "plugin" / "chrome-ext",
+                DATA_DIR / "src" / "plugin" / "chrome-ext",
+            )
+            if (p / "hook.js").is_file()
+        ),
+        None,
+    )
+    if ext_src is not None:
+        ext_dst = DATA_DIR / "chrome-ext"
+        try:
+            ext_dst.mkdir(parents=True, exist_ok=True)
+            for name in ("hook.js", "manifest.json"):
+                (ext_dst / name).write_text((ext_src / name).read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError as e:
+            decky.logger.warning(f"chrome-ext copy: {e}")
 
 
 def _retire_vesktop() -> None:
@@ -1856,7 +1877,10 @@ class Plugin:
             # bounce back to the QR screen.
             out["ready"] = False
             out["phase"] = "loading"
-            out["phase_label"] = "Signing into Discord…"
+            out["phase_label"] = "Loading Discord…"
+            if "/channels" in blob or "/app" in blob:
+                out["logged_in"] = True
+                out["phase_label"] = "Loading servers…"
         else:
             out["ready"] = False
             out["phase"] = "login"
